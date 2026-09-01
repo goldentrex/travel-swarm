@@ -1,0 +1,27 @@
+{
+  "name": "travel-swarm",
+  "version": "1.0.0",
+  "private": false,
+  "description": "A multi-agent system that re-plans a trip when it goes wrong — missed flight, overbooked hotel, storm, strike — against real flight, hotel and activity providers.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev --config workers/swarm-demo/wrangler.jsonc",
+    "deploy": "wrangler deploy --config workers/swarm-demo/wrangler.jsonc",
+    "sim": "node scripts/swarm-sim/run-live-sim.mjs",
+    "sim:preview": "node scripts/swarm-sim/run-live-sim.mjs --preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.106.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.5",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.42.0"
+  }
+}

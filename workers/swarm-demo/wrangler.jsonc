@@ -1,0 +1,96 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "travel-swarm",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-24",
+  // The hackathon API reads process.env and uses Node APIs — nodejs_compat is required.
+  "compatibility_flags": ["nodejs_compat"],
+  // Explicit esbuild aliases for the repo's @/* paths. The top-level
+  // "tsconfig" option cannot reference a parent directory (wrangler strips
+  // "../" segments), and wrangler's alias plugin resolves via require.resolve
+  // against the Worker dir — so each exact import needs an explicit .ts file.
+  "alias": {
+    "@/agents": "../../src/agents/index.ts",
+    "@/agents/activity/ActivityAgent": "../../src/agents/activity/ActivityAgent.ts",
+    "@/agents/finance/TrustLayer": "../../src/agents/finance/TrustLayer.ts",
+    "@/agents/flight/FlightAgent": "../../src/agents/flight/FlightAgent.ts",
+    "@/agents/hotel/HotelAgent": "../../src/agents/hotel/HotelAgent.ts",
+    "@/agents/policy/PolicyAgent": "../../src/agents/policy/PolicyAgent.ts",
+    "@/core/dag": "../../src/core/dag/index.ts",
+    "@/integrations/supabase/client": "../../src/integrations/supabase/client.ts",
+    "@/integrations/supabase/client.server": "../../src/integrations/supabase/client.server.ts",
+    // Shared EUR rate table — the SAME one the timeline, budget and PDF use,
+    // so a converted change fee can never drift from the rest of the app.
+    "@/lib/i18n/translations": "../../src/lib/i18n/translations.ts",
+    "@/providers": "../../src/providers/index.ts",
+    "@/providers/atlas/AtlasFlightProvider": "../../src/providers/atlas/AtlasFlightProvider.ts",
+    "@/providers/interfaces/ActivityProvider": "../../src/providers/interfaces/ActivityProvider.ts",
+    "@/providers/interfaces/FlightProvider": "../../src/providers/interfaces/FlightProvider.ts",
+    "@/providers/interfaces/HotelProvider": "../../src/providers/interfaces/HotelProvider.ts",
+    "@/providers/interfaces/types": "../../src/providers/interfaces/types.ts",
+  },
+
+  // Its OWN Worker, deliberately not a route on the site's Worker (same
+  // reasoning as a separate API host): a bad web deploy must never take the
+  // demo down, and demo traffic must never touch production.
+  // No route by default: `wrangler dev` serves it locally, and `wrangler deploy`
+  // publishes to <name>.<subdomain>.workers.dev. Add your own custom domain here
+  // if you want one:
+  //   "routes": [{ "pattern": "swarm.example.com", "custom_domain": true }],
+
+  // NOTE (subrequest budget): this account is on the Cloudflare FREE plan,
+  // which caps a single Worker invocation at 50 subrequests and rejects a
+  // `limits.subrequests` config field at deploy time (code 100328). Wide
+  // resolves instead keep their outbound call count under budget via the
+  // batched incremental trace persistence in hackathonApi.ts
+  // (TRACE_FLUSH_EVERY). If the account upgrades to Workers Paid, add:
+  //   "limits": { "subrequests": 3000 }
+  // and consider undoing that batching for per-entry Activity Stream flow.
+
+  // Runtime config the shared hackathon modules read from process.env /
+  // integrations. Secrets (names only — values via `wrangler secret`, never
+  // in this file):
+  //   - SWARM_DEMO_TOKEN — MANDATORY; the Worker fail-closes with 503 without it.
+  //   - SUPABASE_SERVICE_ROLE_KEY — MUST be the CURRENT new-format
+  //     `sb_secret_*` service-role key of your project
+  //     (NOT a legacy `eyJ…` JWT — Supabase rotates keys and rejects stale
+  //     ones with "Invalid API key", which turns trip loads into 503s).
+  //     After ANY Supabase key rotation re-run:
+  //       npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY --config workers/swarm-demo/wrangler.jsonc
+  //     then verify via GET /api/hackathon/health → `storeHealthy: true`
+  //     (the live probe catches a stale key; `storePersistent` alone only
+  //     checks env presence). Without the secret sessions run in-memory
+  //     "degraded" and approve returns 409; set it for the bookable showcase
+  //     (REQUIRED for persistent session storage Tier-1 and real-trip
+  //     hydration/settlement).
+  //   - ATLAS_API_KEY / ATLAS_CLIENT_ID (secret; sent as x-atlas-client-secret
+  //     / x-atlas-client-id) + RAPIDAPI_KEY / RAPIDAPI_HOST — optional
+  //     live-provider keys (graceful degradation otherwise). ATLAS_SANDBOX_URL
+  //     is a non-secret var below.
+  // Set any of them with:
+  //   npx wrangler secret put <NAME> --config workers/swarm-demo/wrangler.jsonc
+  "vars": {
+    "SUPABASE_URL": "https://YOUR_PROJECT_REF.supabase.co",
+    // Real-trip swarm missions: "1" lets mission/approve hydrate REAL trips
+    // (uuid tripId → ItineraryGraph) and settle approved plans back into
+    // content_json. Anything else keeps the frozen demo-lisbon showcase.
+    "SWARM_REAL_TRIPS": "1",
+    // Kill switch for the whole swarm feature. Set to "0" and redeploy (~10s)
+    // to withdraw it from every build already in people's hands, with no App
+    // Store round trip: the app hides its entry points and the rails refuse.
+    "SWARM_ENABLED": "1",
+    // Booking.com (RapidAPI) is a METERED key. "1" silences it without
+    // deleting the key, so hotel lines fall back to the trip's own figures
+    // and every other rail is unaffected. Flip to "0" to re-enable.
+    "HOTEL_PROVIDER_DISABLED": "1",
+    // Real Atlas / Atrip sandbox base URL (non-secret; the credentials live
+    // in the ATLAS_API_KEY / ATLAS_CLIENT_ID wrangler secrets).
+    "ATLAS_SANDBOX_URL": "https://sandbox.atriptech.com",
+    // Live Atlas searches take several seconds — generous per-request budget.
+    "ATLAS_TIMEOUT_MS": "15000",
+    "RAPIDAPI_TIMEOUT_MS": "8000",
+    "VIATOR_TIMEOUT_MS": "6000",
+  },
+
+  "observability": { "enabled": true },
+}

@@ -1,0 +1,497 @@
+/**
+ * FlightAgent — specialist agent for flight disruption recovery.
+ *
+ * Depends on the abstract `FlightProvider` interface via dependency
+ * injection, never on a concrete Atlas/Amadeus/Duffel implementation. Given
+ * a disrupted flight, it searches replacement options and prices each one
+ * against the traveller's current booking, returning a fully structured
+ * assessment for the orchestrator.
+ */
+
+import type { FlightProvider } from "@/providers/interfaces/FlightProvider";
+import type {
+  AlternativeFlightsResult,
+  FareDifference,
+  FlightOption,
+  FlightRouteContext,
+  IsoTimestamp,
+} from "@/providers/interfaces/types";
+
+/** One replacement candidate with its priced fare delta. */
+export interface RebookingCandidate {
+  option: FlightOption;
+  fareDifference: FareDifference;
+}
+
+/** Structured output of {@link FlightAgent.assessRebookingOptions}. */
+/**
+ * WHY a search produced no bookable replacement.
+ *
+ * The traveller is told something different in each case, and getting this
+ * wrong is worse than saying nothing: blaming the provider's coverage when our
+ * own rebooking window rejected perfectly good flights is a lie that sends
+ * someone off to book manually for no reason.
+ *
+ *  - `route_not_covered` — the provider ANSWERED on several distinct dates and
+ *    had nothing on any of them. A commercial route has daily service, so an
+ *    entire week of empty answers is a gap in the partner's inventory, not an
+ *    unlucky day. This is the only verdict allowed to name the partner.
+ *  - `no_options_on_date` — the same emptiness, but from a single date. Cannot
+ *    distinguish "not covered" from "nothing flying that day", so it must not
+ *    claim either.
+ *  - `all_options_rejected` — the provider HAD flights and OUR rules removed
+ *    them all (the 48h rebooking horizon, the excluded original departure).
+ *    Nothing to do with coverage.
+ *  - `pricing_unavailable` — usable flights existed but none could be priced.
+ *  - `search_declined` — the provider REFUSED to look (a past date, an upstream
+ *    rejection). It returns an empty list exactly like a genuine no-inventory
+ *    answer, and conflating them told a traveller their partner does not serve
+ *    AMS → LHR when their trip dates had simply already passed.
+ */
+export type NoReplacementReason =
+  | "route_not_covered"
+  | "no_options_on_date"
+  | "all_options_rejected"
+  | "pricing_unavailable"
+  | "search_declined";
+
+export interface FlightRebookingAssessment {
+  originalFlightId: string;
+  requestedTime: IsoTimestamp;
+  candidates: RebookingCandidate[];
+  /** Candidate with the smallest net charge (or largest refund), if any. */
+  bestCandidate: RebookingCandidate | null;
+  /**
+   * NEW (additive) — Atlas sandbox liveness correlation, aggregated from the
+   * provider's additive ids (search id on AlternativeFlightsResult, verify
+   * ids on each FareDifference) and passed through untouched. Present ONLY
+   * when at least one correlation id exists — the Activity Stream emits the
+   * `flight/atlas_liveness` proof row from it; degraded/simulated rails
+   * never carry it.
+   */
+  atlasCorrelation?: { searchRequestId?: string; verifyRequestIds: string[] };
+  /**
+   * NEW (additive) — the calendar dates (yyyy-mm-dd, UTC) the flexible-date
+   * search window attempted, in order. Present ONLY when the window loop ran
+   * (i.e. a routeContext was supplied); the legacy single-search path omits
+   * it entirely.
+   */
+  searchedDates?: string[];
+  /**
+   * Why `candidates` is empty, when it is. Absent whenever a bookable
+   * replacement was found — the callers only ever read it on the empty rail.
+   */
+  noReplacementReason?: NoReplacementReason;
+  /** How many options the PROVIDER returned, before any rule of ours. The
+   *  evidence behind {@link noReplacementReason} — a zero here is the
+   *  partner's answer, a zero after filtering is our own doing. */
+  providerOptionCount?: number;
+  /** The provider's own words when it declined to search — surfaced in the
+   *  trace so a refusal is never silently read as "nothing available". */
+  searchDeclinedReason?: string;
+}
+
+/** Per-call deadline for one fare-pricing call (Phase B robustness). */
+const FARE_PRICING_DEADLINE_MS = 4_000;
+/** Only the cheapest N search results are priced — bounds the provider fan-out. */
+const MAX_PRICED_CANDIDATES = 5;
+/**
+ * How far past the original departure a REBOOKING may still land.
+ *
+ * "I missed my flight, rebook me" and "replan my trip" are different requests,
+ * and only the first one is being asked here. Past this horizon the traveller
+ * is not being rebooked — they are being told to write off the days in
+ * between, which on a week-long holiday means writing off the holiday.
+ *
+ * Found on the first real user test: a traveller who missed a 23 Dec departure
+ * was offered the same flight number on 28 DEC as their leading plan. It broke
+ * no rule, because until now the only rules were "not the flight you missed"
+ * and "leaves after it".
+ *
+ * 48h is the outer edge of what a person would still call a rebooking: today
+ * if possible, tomorrow at worst, the day after only when the route is thin.
+ */
+export const MAX_REBOOKING_WINDOW_HOURS = 48;
+
+/** Default flexible-date search window (one provider search per calendar day). */
+const DEFAULT_SEARCH_WINDOW_DAYS = 4;
+/** Window bounds — the Atlas contract's flexible dates are agent-side. */
+const MIN_SEARCH_WINDOW_DAYS = 1;
+const MAX_SEARCH_WINDOW_DAYS = 7;
+/** Early stop: enough usable replacements surfaced ⇒ no further dates. */
+const EARLY_STOP_USABLE_COUNT = 3;
+
+export interface FlightAgentConfig {
+  /** Per-call fare-pricing deadline override (ms); <= 0 disables the cap. */
+  fareDeadlineMs?: number;
+  /** Max number of candidates priced (cheapest by fare first). */
+  maxPricedCandidates?: number;
+  /**
+   * Flexible-date window length: how many consecutive calendar dates are
+   * searched (one complete provider search per date) when a routeContext is
+   * present. Defaults to {@link DEFAULT_SEARCH_WINDOW_DAYS}, clamped to 1..7.
+   */
+  searchWindowDays?: number;
+  /**
+   * W1 (additive): usable-replacement count that closes the flexible-date
+   * window early. Defaults to {@link EARLY_STOP_USABLE_COUNT}; values below
+   * 1 fall back to the default (an early stop at zero would skip every
+   * date after the first).
+   */
+  earlyStopUsableCount?: number;
+  /**
+   * W1 (additive): WALL-CLOCK budget for the whole flexible-date window
+   * (ms). Before each date beyond the first, the loop checks the elapsed
+   * time and — once the budget is spent — truncates the window, returning
+   * the best-so-far merged options instead of starting another provider
+   * search. <= 0 (the default) disables the budget entirely.
+   */
+  overallDeadlineMs?: number;
+}
+
+/**
+ * Race a promise against a wall-clock deadline. Rejections (incl. the
+ * deadline) propagate so {@link Promise.allSettled} can isolate per-call
+ * failures without sinking the whole fan-out.
+ */
+function withDeadline<T>(promise: Promise<T>, deadlineMs: number): Promise<T> {
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`fare pricing deadline exceeded (${deadlineMs}ms)`)),
+      deadlineMs,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Whether a search result can actually replace the disrupted leg.
+ *
+ * Two rejections, both from the same principle — a replacement the traveller
+ * cannot board is not a replacement:
+ *   • the exact departure being replaced (same flight number AND same
+ *     departure instant). A LATER departure of the same number is fine, which
+ *     is why the time is part of the match.
+ *   • anything departing at or before `earliestDeparture`, set when the flight
+ *     was MISSED: that aircraft has gone, and so has every earlier one.
+ */
+function isUsableReplacement(
+  option: { flightNumber: string; departureTime: string },
+  routeContext?: FlightRouteContext,
+): boolean {
+  const exclude = routeContext?.excludeFlight;
+  if (exclude) {
+    const sameNumber = flightNumbersMatch(option.flightNumber, exclude.flightNumber);
+    const sameDeparture = Date.parse(option.departureTime) === Date.parse(exclude.departureTime);
+    if (sameNumber && sameDeparture) return false;
+  }
+  const departs = Date.parse(option.departureTime);
+  const earliest = routeContext?.earliestDeparture;
+  if (earliest) {
+    const floor = Date.parse(earliest);
+    if (Number.isFinite(departs) && Number.isFinite(floor) && departs <= floor) return false;
+  }
+  // The CEILING. Without it this function had exactly two rules — "not the
+  // flight you missed" and "leaves after it" — and a departure five days later
+  // passed both. Found on the first real user test: a 23 Dec trip was offered a
+  // 28 Dec rebooking as its leading plan.
+  const latest = routeContext?.latestDeparture;
+  if (latest) {
+    const ceiling = Date.parse(latest);
+    if (Number.isFinite(departs) && Number.isFinite(ceiling) && departs > ceiling) return false;
+  }
+  return true;
+}
+
+/** "TR 892" and "TR892" are the same flight, as are "TO4516" and "4516". */
+function flightNumbersMatch(fn1: string, fn2: string): boolean {
+  const norm1 = fn1.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const norm2 = fn2.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (norm1 === norm2) return true;
+  // Fallback: if the digits match and one is a suffix of the other (missing carrier code)
+  return norm1.endsWith(norm2) || norm2.endsWith(norm1);
+}
+
+export class FlightAgent {
+  private readonly fareDeadlineMs: number;
+  private readonly maxPricedCandidates: number;
+  private readonly searchWindowDays: number;
+  private readonly earlyStopUsableCount: number;
+  private readonly overallDeadlineMs: number;
+
+  constructor(
+    private readonly provider: FlightProvider,
+    config: FlightAgentConfig = {},
+  ) {
+    this.fareDeadlineMs = config.fareDeadlineMs ?? FARE_PRICING_DEADLINE_MS;
+    this.maxPricedCandidates = config.maxPricedCandidates ?? MAX_PRICED_CANDIDATES;
+    const windowDays = Math.trunc(config.searchWindowDays ?? DEFAULT_SEARCH_WINDOW_DAYS);
+    this.searchWindowDays = Number.isFinite(windowDays)
+      ? Math.min(MAX_SEARCH_WINDOW_DAYS, Math.max(MIN_SEARCH_WINDOW_DAYS, windowDays))
+      : DEFAULT_SEARCH_WINDOW_DAYS;
+    const earlyStop = Math.trunc(config.earlyStopUsableCount ?? EARLY_STOP_USABLE_COUNT);
+    this.earlyStopUsableCount =
+      Number.isFinite(earlyStop) && earlyStop >= 1 ? earlyStop : EARLY_STOP_USABLE_COUNT;
+    const deadline = config.overallDeadlineMs ?? 0;
+    this.overallDeadlineMs = Number.isFinite(deadline) && deadline > 0 ? deadline : 0;
+  }
+
+  /** Which concrete provider backs this agent (useful for audit trails). */
+  get providerName(): string {
+    return this.provider.providerName;
+  }
+
+  /**
+   * Query the injected provider for alternative flights around `newTime` and
+   * price them against `flightId`.
+   *
+   * NEW (additive): `routeContext` (origin/destination/date of the disrupted
+   * leg) is forwarded to the provider search AND fare-pricing calls — real
+   * route-based APIs (Atlas `search.do`) need it; id-based providers ignore
+   * it.
+   *
+   * Flexible-date window: the Atlas contract searches ONE calendar date per
+   * `search.do` call, so flexible dates are agent-side orchestration — when a
+   * `routeContext` is present this runs ONE complete provider search per
+   * calendar date over offsets 0..searchWindowDays-1 (anchored on
+   * `routeContext.departureDate` ?? `newTime`, UTC-safe day arithmetic).
+   * Options merge deduped by `option.id` (first occurrence wins); a per-date
+   * rejection is skipped and never sinks the search — EXCEPT total failure
+   * (every date rejected), which re-throws so the callers' legacy degrade
+   * path still fires. EARLY STOP: after each date, once
+   * ≥ earlyStopUsableCount options pass {@link isUsableReplacement} against
+   * the ORIGINAL routeContext the window closes. W1 WALL-CLOCK BUDGET: when
+   * `overallDeadlineMs` is set, each date beyond the first is skipped once
+   * the budget is spent — the window truncates and the best-so-far options
+   * are returned. The attempted dates ride along
+   * as the additive `searchedDates`. Without a `routeContext` the legacy
+   * single search runs exactly as before.
+   *
+   * Phase B robustness: only the cheapest {@link MAX_PRICED_CANDIDATES}
+   * options are priced, and the fare-difference calls fan out concurrently
+   * via `Promise.allSettled`, each bounded by a ~4s deadline. A rejected or
+   * timed-out candidate is EXCLUDED, never fatal — a slow sandbox can no
+   * longer stall or sink the rebooking assessment.
+   */
+  async assessRebookingOptions(
+    flightId: string,
+    newTime: IsoTimestamp,
+    routeContext?: FlightRouteContext,
+  ): Promise<FlightRebookingAssessment> {
+    let search: AlternativeFlightsResult;
+    let searchedDates: string[] | undefined;
+    /** Dates the provider genuinely LOOKED at — declines do not count. */
+    let windowAnsweredDates: number | undefined;
+    /** The upstream's own words when it declined, for the trace. */
+    let windowDeclineReason: string | undefined;
+
+    if (routeContext) {
+      // Flexible-date window: one complete provider search per calendar date.
+      const mergedOptions: FlightOption[] = [];
+      const seenIds = new Set<string>();
+      const dates: string[] = [];
+      let searchRequestId: string | undefined;
+      let succeeded = 0;
+      let answeredDates = 0;
+      let declineReason: string | undefined;
+      let lastError: unknown;
+      // UTC-safe day arithmetic: shift the base instant by whole 24h blocks
+      // and re-emit the same ISO representation the provider formats upstream.
+      const baseIso = routeContext.departureDate ?? newTime;
+      const baseMs = Date.parse(baseIso);
+      const dateFor = (offset: number): IsoTimestamp =>
+        Number.isFinite(baseMs) ? new Date(baseMs + offset * 86_400_000).toISOString() : baseIso;
+      // W1: the wall-clock anchor for the optional `overallDeadlineMs` budget.
+      const windowStartedAt = Date.now();
+
+      for (let offset = 0; offset < this.searchWindowDays; offset += 1) {
+        // W1 wall-clock budget: BEFORE each additional date, check the
+        // elapsed time — once spent, truncate the window and return the
+        // best-so-far merged options (the first date always runs so the
+        // search can never silently return nothing on a deadline).
+        if (
+          offset > 0 &&
+          this.overallDeadlineMs > 0 &&
+          Date.now() - windowStartedAt >= this.overallDeadlineMs
+        ) {
+          break;
+        }
+        const datedContext: FlightRouteContext = {
+          ...routeContext,
+          departureDate: dateFor(offset),
+        };
+        dates.push((datedContext.departureDate ?? baseIso).slice(0, 10));
+        try {
+          const dated = await this.provider.searchAlternativeFlights(
+            flightId,
+            newTime,
+            datedContext,
+          );
+          succeeded += 1;
+          // A date the provider DECLINED (past date, upstream refusal) proves
+          // nothing about coverage — count only the dates it actually looked at.
+          if (dated.searchWasAnswered !== false) answeredDates += 1;
+          else if (declineReason === undefined && dated.searchDeclinedReason) {
+            declineReason = dated.searchDeclinedReason;
+          }
+          // Carry the FIRST non-undefined correlation id across dates.
+          if (searchRequestId === undefined && dated.atlasSearchRequestId !== undefined) {
+            searchRequestId = dated.atlasSearchRequestId;
+          }
+          for (const option of dated.options) {
+            if (!seenIds.has(option.id)) {
+              seenIds.add(option.id);
+              mergedOptions.push(option);
+            }
+          }
+        } catch (error) {
+          // Per-date failure never sinks the search — skip the date.
+          lastError = error;
+          continue;
+        }
+        // Early stop: usability is measured against the ORIGINAL routeContext
+        // (the dated clones only shift the search day, not the exclusions).
+        const usableCount = mergedOptions.filter((option) =>
+          isUsableReplacement(option, routeContext),
+        ).length;
+        if (usableCount >= this.earlyStopUsableCount) break;
+      }
+
+      // Total failure (NOT a per-date failure): every date in the window
+      // rejected ⇒ the search itself is unavailable. Re-escalate the last
+      // error so the callers' legacy degrade path fires exactly as it did
+      // for the single-search rail — a silently empty assessment would
+      // masquerade as "found nothing" instead of "provider down".
+      if (succeeded === 0) throw lastError;
+
+      windowAnsweredDates = answeredDates;
+      windowDeclineReason = declineReason;
+      search = {
+        referenceFlightId: flightId,
+        requestedTime: newTime,
+        options: mergedOptions,
+        searchWasAnswered: answeredDates > 0,
+        ...(declineReason !== undefined ? { searchDeclinedReason: declineReason } : {}),
+        ...(searchRequestId !== undefined ? { atlasSearchRequestId: searchRequestId } : {}),
+      };
+      searchedDates = dates;
+    } else {
+      search = await this.provider.searchAlternativeFlights(flightId, newTime, routeContext);
+    }
+
+    // A REPLACEMENT has to be a different departure. Route searches return the
+    // disrupted flight among the results, and nothing downstream removed it —
+    // so a "missed flight" mission proposed the very flight that was missed,
+    // identical number and time, with a change fee attached.
+    // Counted separately on purpose. "The partner had nothing" and "the partner
+    // had flights we rejected" look identical once the array is empty, and the
+    // traveller is owed a different sentence for each.
+    const providerOptionCount = search.options.length;
+    const usableOptions = [...search.options].filter((option) =>
+      isUsableReplacement(option, routeContext),
+    );
+    const options = usableOptions
+      // Cap the fan-out at the cheapest options by published fare.
+      .sort((a, b) => a.price - b.price)
+      .slice(0, Math.max(0, Math.trunc(this.maxPricedCandidates)));
+
+    const settled = await Promise.allSettled(
+      options.map((option) =>
+        withDeadline(
+          this.provider.calculateFareDifference(flightId, option.id, routeContext),
+          this.fareDeadlineMs,
+        ),
+      ),
+    );
+
+    const candidates: RebookingCandidate[] = [];
+    settled.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        candidates.push({ option: options[index], fareDifference: result.value });
+      }
+      // Rejected/timed-out pricings are silently excluded — the assessment
+      // degrades to the remaining candidates instead of failing.
+    });
+
+    // Best = smallest net outlay: charges add, refunds subtract.
+    let bestCandidate: RebookingCandidate | null = null;
+    let bestNet = Number.POSITIVE_INFINITY;
+    for (const candidate of candidates) {
+      const { amount, direction } = candidate.fareDifference;
+      const net = direction === "charge" ? amount : -amount;
+      if (net < bestNet) {
+        bestNet = net;
+        bestCandidate = candidate;
+      }
+    }
+
+    // Additive liveness aggregation (passed through untouched): the search
+    // correlation id plus every fulfilled verify.do id, in candidate order.
+    // Omitted entirely when the provider surfaced no ids (non-Atlas rails,
+    // degraded runs) so the trace proof stays honest.
+    const verifyRequestIds = candidates
+      .map((candidate) => candidate.fareDifference.atlasRequestId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    const searchRequestId = search.atlasSearchRequestId;
+    const atlasCorrelation =
+      searchRequestId !== undefined || verifyRequestIds.length > 0
+        ? {
+            ...(searchRequestId !== undefined ? { searchRequestId } : {}),
+            verifyRequestIds,
+          }
+        : undefined;
+
+    // Only reached when the provider ANSWERED — a search that failed outright
+    // throws above, so an empty result here is a real answer, not an outage.
+    let noReplacementReason: NoReplacementReason | undefined;
+    if (candidates.length === 0) {
+      // Dates the provider actually LOOKED at. `searchedDates` counts dates we
+      // ASKED about, and the two diverge whenever Atlas declines — which is
+      // precisely when a coverage claim would be wrong.
+      const answeredDates =
+        windowAnsweredDates ?? (search.searchWasAnswered === false ? 0 : 1);
+      if (answeredDates === 0) {
+        noReplacementReason = "search_declined";
+      } else if (providerOptionCount === 0) {
+        // Several distinct dates it really examined, every one empty ⇒ the
+        // partner does not serve this route. One date cannot tell coverage from
+        // availability, so it gets the weaker verdict and claims neither.
+        noReplacementReason = answeredDates >= 2 ? "route_not_covered" : "no_options_on_date";
+      } else if (usableOptions.length === 0) {
+        noReplacementReason = "all_options_rejected";
+      } else {
+        noReplacementReason = "pricing_unavailable";
+      }
+    }
+
+    return {
+      originalFlightId: flightId,
+      requestedTime: newTime,
+      candidates,
+      bestCandidate,
+      ...(atlasCorrelation !== undefined ? { atlasCorrelation } : {}),
+      ...(searchedDates !== undefined ? { searchedDates } : {}),
+      ...(noReplacementReason !== undefined
+        ? {
+            noReplacementReason,
+            providerOptionCount,
+            ...(windowDeclineReason !== undefined
+              ? { searchDeclinedReason: windowDeclineReason }
+              : search.searchDeclinedReason !== undefined
+                ? { searchDeclinedReason: search.searchDeclinedReason }
+                : {}),
+          }
+        : {}),
+    };
+  }
+}

@@ -1,0 +1,25 @@
+# Local Worker secrets for `wrangler dev`.
+#   cp .dev.vars.example workers/swarm-demo/.dev.vars
+# For a deployed Worker use `wrangler secret put <NAME>` instead — never commit
+# real values.
+
+# Shared bearer the client must send as `Authorization: Bearer <token>`.
+# Generate one: openssl rand -hex 32
+SWARM_DEMO_TOKEN=
+
+# Supabase service role — the swarm reads and writes trips with it.
+SUPABASE_SERVICE_ROLE_KEY=
+
+# Gemini (the intelligence layer). Without it every agent runs its
+# deterministic rail: plans are still produced, just less clever.
+GEMINI_API_KEY=
+
+# Flight provider (Atlas / atriptech sandbox). Optional.
+ATLAS_API_KEY=
+ATLAS_CLIENT_ID=
+
+# Hotels — Booking.com via RapidAPI. Optional.
+RAPIDAPI_KEY=
+
+# Activities — Viator, through a Supabase Edge Function. Optional.
+VIATOR_API_KEY=

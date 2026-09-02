@@ -17,14 +17,13 @@ instead of pretending.
 Extracted from [GlobePlanner](https://globeplanner.app), where it ships in the iOS app.
 
 > **⚠️ Flights run against Atlas's SANDBOX, not production.** `AtlasFlightProvider`
-> talks to `sandbox.atriptech.com` with a bearer credential — Atlas's own documentation
+> talks to `sandbox.atriptech.com` with a bearer credential. Atlas's own documentation
 > describes this environment as test inventory for rehearsing the booking flow, not real
-> availability, and its route coverage is genuinely partial (verified live: London, Tokyo,
-> Amsterdam, Istanbul, Dubai all return real flights; Rome, Milan, Paris, Frankfurt,
-> Munich, Barcelona and Doha return **none**, on every date tried). This is not a bug to
-> fix in this codebase — it is the environment the credential is scoped to. See
-> **[Flight coverage is honest, not complete](#flight-coverage-is-honest-not-complete)**
-> below for how the swarm handles it and what a full integration would need.
+> availability — and its coverage is a **sampled set of route pairs, not a geography**.
+> This is not a bug to fix in this codebase; it is the environment the credential is
+> scoped to. See **[What Atlas actually covers](#what-atlas-actually-covers)** for the
+> measured map and **[Flight coverage is honest, not complete](#flight-coverage-is-honest-not-complete)**
+> for how the swarm reports a gap without blaming the wrong thing.
 
 ---
 
@@ -74,6 +73,28 @@ trip. `src/core/dag/tripConsequence.ts` checks every candidate against what is s
 ahead (nights, activities) before it is offered, and a plan that survives carries a plain
 sentence saying what it costs: *"You arrive 1 day late: 1 night and 11 activities you had
 planned."*
+
+## What Atlas actually covers
+
+Measured live on 2026-09-02 across 57 origin–destination pairs, one search each. The
+result is not "these cities work and those don't" — it is a **sample of specific route
+pairs**, and direction matters:
+
+| | |
+|---|---|
+| **Strong** | Intra-Asia-Pacific. `SIN→CGK` 39 routings, `SIN→BOM` 49, `SIN→DPS` 32, `SIN→KUL` 22, plus `HND/NRT/BKK/HKG/TPE/MNL/ICN/SYD` both ways. |
+| **Good** | Intra-Europe. `FCO→CDG` 10, `CDG→FCO` 9, `LIS→CDG` 9, `LGW→BCN` 8, `MUC→FCO` 6, `BCN→CDG` 6, `CDG→BCN` 5, `LHR→FCO` 5, `FCO→LHR` 4. |
+| **Thin** | Asia ↔ Europe. Only `SIN↔LHR` (3 each way) and `SIN↔DXB` (12/13). `SIN→CDG`, `SIN→FCO`, `SIN→AMS`, `SIN→FRA`, `SIN→BCN`, `SIN→DOH`, `SIN→IST` are all empty. |
+| **Absent** | Transatlantic. `JFK→LHR`, `JFK→CDG`, `JFK→FLR` — nothing. US domestic is near-empty too (`JFK→MIA`, `MIA→JFK` empty). |
+
+**Direction is not symmetric**, which is the clearest proof this is route sampling rather
+than geography: `JFK→LAX` returns 1 routing, `LAX→JFK` returns 0. Likewise `FCO→LHR`
+returns 4 while `CDG→LHR`, `AMS→LHR` and `FRA→LHR` return 0 — London is covered, just not
+from those origins.
+
+The practical consequence: **you cannot predict coverage from the cities involved.** A
+trip between two well-covered airports can still hit a gap on its particular leg. That is
+why the swarm reports the reason per-search rather than maintaining a city allowlist.
 
 ## Flight coverage is honest, not complete
 
@@ -187,6 +208,14 @@ ios-client/          the SwiftUI client, as reference (not a buildable target)
   so it is the file to change for another backend.
 - **Trip shape.** `swarmTripContext.ts` hydrates GlobePlanner's `content_json`. That is
   the seam to adapt for a different trip model.
+- **Never fan out `verify.do`.** The sandbox rate-limits per QPS: five concurrent
+  re-price calls return HTTP 429 — all five — while the same calls made one at a time
+  each succeed in ~90ms. `FlightAgent` prices sequentially with a 120ms gap for exactly
+  this reason. A parallel `Promise.allSettled` here manufactures the "we found flights
+  but couldn't price them" failure it then reports, and it is not obvious from local
+  testing because a single sequential probe always works. When the re-price is throttled
+  anyway, the candidate is kept at the price the *search* published, flagged
+  `basis: "search_reference"` so the UI can say it is unconfirmed.
 - **Atlas is the only flight provider, and it's sandbox-scoped.** No amount of code can
   return a flight absent from that dataset. A production integration needs either Atlas's
   OAuth/production credential path (see their `atlas-flight` CLI docs) or a second

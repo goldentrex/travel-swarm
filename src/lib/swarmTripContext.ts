@@ -828,6 +828,16 @@ export function applySettlementToContent(
   const changes: string[] = [];
   let flightRewriteLanded = false;
   let flightSkipReason: "already_settled" | "leg_not_found" | undefined;
+  /** The disrupted leg's arrival BEFORE the rewrite (NaN when unknown). */
+  let previousArrivalMs = Number.NaN;
+  /** "dayIndex:itemIndex" of every entry an EXPLICIT step already repositioned.
+   *  The arrival cascade is a backstop, not a second opinion — it defers to
+   *  these unless the placement is outright impossible. */
+  const settledItemKeys = new Set<string>();
+  /** The day entries that RESTATE the flight itself. These are never cascaded:
+   *  the flight's own row sits at its DEPARTURE time, which is before the
+   *  arrival by definition, and "moving it after landing" is nonsense. */
+  const legRestatementKeys = new Set<string>();
 
   const itinerary = Array.isArray(next.itinerary) ? (next.itinerary as unknown[]) : [];
   const transitGroups = Array.isArray(next.transit_groups)
@@ -862,6 +872,10 @@ export function applySettlementToContent(
       leg.booking_reference === operational.bookingCode;
     if (leg && !alreadySettled) {
       const oldReference = asString(leg.reference);
+      // Captured BEFORE the overwrite — step 4 needs to know which itinerary
+      // entries used to sit after the old landing, because those are exactly
+      // the ones that depend on arriving.
+      previousArrivalMs = parseEpoch(leg.arrive) ?? Number.NaN;
       leg.reference = newFlight.reference;
       if (newFlight.carrier) leg.carrier = newFlight.carrier;
       // Write the canonical wall-clock form so this leg reads like every
@@ -938,6 +952,8 @@ export function applySettlementToContent(
         const departMs = Date.parse(newFlight.depart);
         if (Number.isFinite(departMs)) item.time = hhmmOf(departMs);
         if (oldReference) {
+          settledItemKeys.add(`${match.dayIndex}:${match.itemIndex}`);
+          legRestatementKeys.add(`${match.dayIndex}:${match.itemIndex}`);
           const retitled = restateTitle(item.title, oldReference, newFlight.reference);
           if (retitled !== null) item.title = retitled;
         }
@@ -965,6 +981,7 @@ export function applySettlementToContent(
     if (typeof ref.dayIndex !== "number" || typeof ref.itemIndex !== "number") continue;
     const item = asRecord(itemsAt(ref.dayIndex)?.[ref.itemIndex]);
     if (!item) continue;
+    settledItemKeys.add(`${ref.dayIndex}:${ref.itemIndex}`);
 
     if (action.newCheckIn) {
       const shiftedMs = Date.parse(action.newCheckIn);
@@ -1112,6 +1129,119 @@ export function applySettlementToContent(
       ? (targetDay.items as unknown[])
       : (targetDay.items = []);
     targetItems.push(move.item);
+  }
+
+  // ── 4. Arrival cascade → everything that depends on landing follows ──────
+  //
+  // The steps above only write what the agents explicitly LISTED. When the
+  // hotel provider is unavailable there are no `hotel_actions`, and when the
+  // day reorganizer had nothing to say there are no `activity_moves` — so a
+  // settlement could rewrite the flight and leave the rest of the day exactly
+  // where it was. A real trip came back with the replacement landing at 23:40
+  // while the hotel check-in still read 04:15 and the airport transfer 18:30,
+  // both hours before the plane touched down.
+  //
+  // This is the backstop: whatever the agents produced, the written trip has
+  // to be internally consistent.
+  //
+  // The rule is deliberately narrow — move ONLY what was already after the OLD
+  // arrival. Something that sat before the old landing (breakfast at the origin
+  // on a departure day) was never waiting on this flight and must stay put;
+  // something that sat after it plainly was, and is now impossible.
+  const cascadeArrivalMs = newFlight ? (parseEpoch(newFlight.arrive) ?? Number.NaN) : Number.NaN;
+  if (flightRewriteLanded && Number.isFinite(cascadeArrivalMs) && Number.isFinite(previousArrivalMs)) {
+    // Time to clear the airport and reach the first stop of the day.
+    const ARRIVAL_BUFFER_MIN = 90;
+    let cursorMs = cascadeArrivalMs + ARRIVAL_BUFFER_MIN * MINUTE_MS;
+    let movedCount = 0;
+
+    // Every entry, across every day — matched on its TRUE instant rather than
+    // on the day it happens to be filed under. A stay carries its own
+    // `check_in` date, which can differ from its day's `date`; hydration reads
+    // `check_in` first, so anything scoped by day index alone would judge the
+    // wrong moment.
+    interface Scheduled {
+      item: Record<string, unknown>;
+      key: string;
+      atMs: number;
+      isStay: boolean;
+    }
+    const scheduled: Scheduled[] = [];
+    for (const [dayIndex, rawDay] of itinerary.entries()) {
+      const day = asRecord(rawDay);
+      const items = itemsAt(dayIndex);
+      if (!day || !items) continue;
+      const dayStartMs = Date.parse(`${asString(day.date) ?? ""}T00:00:00Z`);
+      for (const [itemIndex, raw] of items.entries()) {
+        const item = asRecord(raw);
+        if (!item) continue;
+        const itemType = asString(item.type)?.toLowerCase() ?? "";
+        const isStay = itemType === "stay" || itemType === "hotel";
+        // Mirror hydration exactly: a stay is anchored on its check-in date.
+        const checkInMs = isStay
+          ? Date.parse(`${asString(item.check_in) ?? ""}T00:00:00Z`)
+          : Number.NaN;
+        const baseMs = Number.isFinite(checkInMs) ? checkInMs : dayStartMs;
+        if (!Number.isFinite(baseMs)) continue;
+        const minutes = timeStringToMinutes(item.time);
+        if (minutes === null) continue; // untimed entries are not "stranded"
+        scheduled.push({
+          item,
+          key: `${dayIndex}:${itemIndex}`,
+          atMs: baseMs + minutes * MINUTE_MS,
+          isStay,
+        });
+      }
+    }
+    scheduled.sort((a, b) => a.atMs - b.atMs);
+
+    for (const entry of scheduled) {
+      // An explicit placement is respected — but only when it is POSSIBLE.
+      //
+      // The hotel action's new check-in comes from the graph propagation of the
+      // NOMINAL delay, not from the replacement the traveller actually chose.
+      // Live proof: an agent moved a check-in to 01:00 for a flight that lands
+      // at 01:05, five minutes after the room was supposedly taken. Deferring
+      // to an impossible instruction is not respect, it is just a slower way of
+      // writing a broken trip.
+      // The flight's own row is not a thing that waits for the flight.
+      if (legRestatementKeys.has(entry.key)) continue;
+      const explicitlyPlaced = settledItemKeys.has(entry.key);
+      if (explicitlyPlaced && entry.atMs >= cascadeArrivalMs) {
+        if (entry.atMs >= cursorMs) cursorMs = entry.atMs;
+        continue;
+      }
+      // Was it already waiting on the old landing, and is it now impossible?
+      //
+      // The trigger is the ARRIVAL itself, not the arrival plus the buffer:
+      // settling a plan must fix what the new flight broke, not re-plan a day
+      // that still works. A replacement landing at the same time as the
+      // original leaves a tight transfer exactly as tight as the traveller
+      // already accepted, and shifting it would be a change nobody asked for.
+      const wasWaitingOnTheOldLanding = entry.atMs >= previousArrivalMs;
+      const isNowImpossible = entry.atMs < cascadeArrivalMs;
+      // For an explicitly-placed entry the first half no longer applies: the
+      // agent already decided it belongs after the flight, so being before the
+      // new arrival is enough on its own.
+      if (!isNowImpossible || !(wasWaitingOnTheOldLanding || explicitlyPlaced)) {
+        if (entry.atMs >= cursorMs) cursorMs = entry.atMs;
+        continue;
+      }
+      entry.item.time = hhmmOf(cursorMs);
+      if (entry.isStay) {
+        // The stay's own check-in date moves with it, or hydration snaps the
+        // room straight back on the next load.
+        entry.item.check_in = isoDateOf(cursorMs);
+      }
+      movedCount += 1;
+      cursorMs += 45 * MINUTE_MS;
+    }
+
+    if (movedCount > 0) {
+      changes.push(
+        `Arrival cascade: ${movedCount} item${movedCount > 1 ? "s" : ""} moved after the new landing`,
+      );
+    }
   }
 
   return {

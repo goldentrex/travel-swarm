@@ -1347,6 +1347,225 @@ describe("transit restatements are not reschedulable activities", () => {
   });
 });
 
+describe("everything that depends on landing moves with the flight", () => {
+  // Reported from a real settled trip: the swarm rebooked the flight to land
+  // at 23:40 and wrote it correctly — while the hotel check-in still read
+  // 04:15 and the airport transfer 18:30, both hours BEFORE the plane touched
+  // down. The flight was the only thing the operational layer listed, so the
+  // flight was the only thing that moved.
+  //
+  // The agents cannot be relied on to list everything: with the hotel provider
+  // unavailable there are no `hotel_actions` at all. The settlement itself has
+  // to leave the written trip internally consistent.
+
+  /** Arrival day holding a stay, a transfer and an activity — all after the
+   *  original 11:30 landing, all impossible after a 20:00 one. */
+  function arrivalDayContent() {
+    return {
+      title: { en: "Lisbon Surf Week" },
+      destination: { en: "Lisbon" },
+      local_currency_code: "EUR",
+      transit_groups: [
+        {
+          id: "tg0",
+          method: "flight",
+          origin: { code: "CDG", city: "Paris" },
+          destination: { code: "LIS", city: "Lisbon" },
+          carrier: "TAP Air Portugal",
+          reference: "TP437",
+          depart: at(day1Start, 9, 0),
+          arrive: at(day1Start, 11, 30),
+          price: { amount: 280, currency: "EUR" },
+          booked: true,
+        },
+      ],
+      itinerary: [
+        {
+          day: 1,
+          date: day1Date,
+          place: "Lisbon",
+          items: [
+            { type: "stay", title: "Hotel Lisboa", time: "13:00", check_in: day1Date },
+            { type: "activity", title: "Metro from the airport", time: "12:30" },
+            { type: "dining", title: "Dinner in Alfama", time: "19:00" },
+          ],
+        },
+      ],
+    } as Record<string, unknown>;
+  }
+
+  it("pushes the stay, the transfer and the meal behind the new landing", () => {
+    const content = arrivalDayContent();
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const { content: next, changes } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      replacementOperational(), // lands 20:00, no hotel_actions, no activity_moves
+    );
+
+    const items = (next.itinerary as any[])[0].items;
+    const timeOf = (title: string) =>
+      items.find((i: any) => i.title === title).time as string;
+
+    // Nothing may still sit before the 20:00 arrival.
+    for (const t of ["Hotel Lisboa", "Metro from the airport", "Dinner in Alfama"]) {
+      expect(timeOf(t) >= "20:00").toBe(true);
+    }
+    // Order is preserved — the transfer was earliest, so it stays earliest.
+    expect(timeOf("Metro from the airport") < timeOf("Hotel Lisboa")).toBe(true);
+    expect(timeOf("Hotel Lisboa") < timeOf("Dinner in Alfama")).toBe(true);
+    // The change is reported, not silent.
+    expect(changes.some((c) => c.includes("Arrival cascade"))).toBe(true);
+  });
+
+  it("re-dates the stay's check_in, or hydration snaps the room back", () => {
+    const content = arrivalDayContent();
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      replacementOperational(),
+    );
+    const stay = (next.itinerary as any[])[0].items.find((i: any) => i.type === "stay");
+    expect(stay.check_in).toBe(day1Date);
+    expect(stay.time >= "20:00").toBe(true);
+  });
+
+  it("leaves entries that were ALREADY before the old landing alone", () => {
+    // Breakfast at the ORIGIN on a departure day was never waiting on this
+    // flight. Pushing it past the arrival would be inventing a change the
+    // traveller never asked for — this is why the rule keys off the OLD
+    // arrival rather than simply "anything earlier than the new one".
+    const content = arrivalDayContent();
+    (content.itinerary as any[])[0].items.unshift({
+      type: "dining",
+      title: "Breakfast before the airport",
+      time: "07:00", // before the 11:30 original arrival
+    });
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      replacementOperational(),
+    );
+    const breakfast = (next.itinerary as any[])[0].items.find(
+      (i: any) => i.title === "Breakfast before the airport",
+    );
+    expect(breakfast.time).toBe("07:00");
+  });
+
+  it("corrects an agent's check-in that lands BEFORE the flight it waits for", () => {
+    // Seen live: the hotel agent moved a check-in to 01:00 for a replacement
+    // that lands at 01:05 — the room taken five minutes before the plane
+    // touched down. Its instruction comes from propagating the NOMINAL delay,
+    // not the replacement the traveller actually chose, so deferring to it
+    // blindly just writes a broken trip more politely.
+    const content = arrivalDayContent();
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const stayNodeId = Object.entries(hydrated.nodeRefs).find(
+      ([, ref]) => ref.kind === "hotel",
+    )![0];
+
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      {
+        ...replacementOperational(), // lands 20:00
+        hotel_actions: [
+          {
+            nodeId: stayNodeId,
+            action: "late_check_in",
+            note: "deferred",
+            // Impossible: 19:00 is before the 20:00 landing.
+            newCheckIn: at(day1Start, 19, 0),
+          },
+        ],
+      },
+    );
+    const stay = (next.itinerary as any[])[0].items.find((i: any) => i.type === "stay");
+    expect(stay.time >= "20:00").toBe(true);
+  });
+
+  it("leaves a POSSIBLE agent placement exactly where the agent put it", () => {
+    // The backstop must not become a second opinion: an instruction that works
+    // is respected to the minute.
+    const content = arrivalDayContent();
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const stayNodeId = Object.entries(hydrated.nodeRefs).find(
+      ([, ref]) => ref.kind === "hotel",
+    )![0];
+
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      {
+        ...replacementOperational(), // lands 20:00
+        hotel_actions: [
+          {
+            nodeId: stayNodeId,
+            action: "late_check_in",
+            note: "deferred",
+            newCheckIn: at(day1Start, 22, 30), // comfortably after the landing
+          },
+        ],
+      },
+    );
+    const stay = (next.itinerary as any[])[0].items.find((i: any) => i.type === "stay");
+    expect(stay.time).toBe("22:30");
+  });
+
+  it("anchors a stay on its own check_in date, not the day it is filed under", () => {
+    // Real trips carry stays whose `check_in` differs from the itinerary day
+    // holding them — hydration reads `check_in` first, so a cascade that
+    // judged the day's date would move the wrong night (or miss it entirely).
+    const content = arrivalDayContent();
+    const items = (content.itinerary as any[])[0].items;
+    // Filed under day 1, but the room is actually for the NEXT night.
+    items.find((i: any) => i.type === "stay").check_in = day2Date;
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      replacementOperational(), // lands 20:00 on day 1
+    );
+    const stay = (next.itinerary as any[])[0].items.find((i: any) => i.type === "stay");
+    // 13:00 on day 2 is comfortably after a day-1 20:00 landing — untouched.
+    expect(stay.time).toBe("13:00");
+    expect(stay.check_in).toBe(day2Date);
+  });
+
+  it("does nothing at all when the replacement lands no later", () => {
+    // A same-time rebooking must not shuffle a perfectly good day.
+    const content = arrivalDayContent();
+    const hydrated = hydrateTripFromContent("t", "", "Lisbon", content)!;
+    const sameTime = {
+      ...replacementOperational(),
+      new_flight: {
+        reference: "IB3125",
+        depart: at(day1Start, 9, 0),
+        arrive: at(day1Start, 11, 30),
+        carrier: "Iberia",
+      },
+    };
+    const { content: next, changes } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      pricedPlan(),
+      sameTime,
+    );
+    const items = (next.itinerary as any[])[0].items;
+    expect(items.find((i: any) => i.type === "stay").time).toBe("13:00");
+    expect(items.find((i: any) => i.title === "Dinner in Alfama").time).toBe("19:00");
+    expect(changes.some((c) => c.includes("Arrival cascade"))).toBe(false);
+  });
+});
+
 describe("settlement keeps money and the day view in step with the leg", () => {
   it("stamps the replacement fare on the rewritten leg", () => {
     const content = contentWithRestatedFlight();

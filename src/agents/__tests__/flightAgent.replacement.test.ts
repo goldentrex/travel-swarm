@@ -150,6 +150,173 @@ describe("why there was no replacement — and who to blame for it", () => {
   });
 });
 
+describe("fare pricing must not stampede the provider", () => {
+  // The bug this pins cost a user every single test they ran. Verified against
+  // the live Atlas sandbox on 2026-09-02: FIVE concurrent `verify.do` calls
+  // return HTTP 429 — all five. Every candidate was then dropped as
+  // unpriceable and the traveller was told "we found flights but couldn't
+  // price them", route after route, while the identical calls made ONE AT A
+  // TIME each succeeded in ~90ms.
+  //
+  // The provider rate-limits per QPS, so the parallel fan-out was manufacturing
+  // the very failure it reported.
+
+  const HOUR = 3_600_000;
+  const at = (h: number) => new Date(Date.parse(ORIGINAL_DEPARTURE) + h * HOUR).toISOString();
+
+  /** Records how many pricing calls are in flight at the same moment. */
+  class ConcurrencyProbe extends Provider {
+    inFlight = 0;
+    peak = 0;
+    async calculateFareDifference(oldFlightId: string, newFlightId: string) {
+      this.inFlight += 1;
+      this.peak = Math.max(this.peak, this.inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      this.inFlight -= 1;
+      return {
+        oldFlightId,
+        newFlightId,
+        amount: 10,
+        currency: "USD",
+        direction: "charge" as const,
+      };
+    }
+  }
+
+  it("prices candidates ONE AT A TIME, never as a fan-out", async () => {
+    const provider = new ConcurrencyProbe([
+      option("a", "TR900", at(2), 100),
+      option("b", "TR901", at(3), 110),
+      option("c", "TR902", at(4), 120),
+      option("d", "TR903", at(5), 130),
+      option("e", "TR904", at(6), 140),
+    ]);
+    const agent = new FlightAgent(provider, { fareDeadlineMs: 5_000 });
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+    expect(assessment.candidates.length).toBe(5);
+    // The whole point: never more than one verify in flight.
+    expect(provider.peak).toBe(1);
+  }, 20000);
+
+  it("retries a rate-limited pricing instead of dropping the flight", async () => {
+    // 429 has been flagged `retryable` in the provider's error taxonomy all
+    // along — nothing ever acted on the flag, so one transient refusal lost a
+    // perfectly bookable flight.
+    class RateLimitedOnce extends Provider {
+      attempts = 0;
+      async calculateFareDifference(oldFlightId: string, newFlightId: string) {
+        this.attempts += 1;
+        if (this.attempts === 1) {
+          throw Object.assign(new Error("Atlas request to /verify.do failed with HTTP 429."), {
+            name: "AtlasApiError",
+            retryable: true,
+          });
+        }
+        return {
+          oldFlightId,
+          newFlightId,
+          amount: 42,
+          currency: "USD",
+          direction: "charge" as const,
+        };
+      }
+    }
+    const provider = new RateLimitedOnce([option("a", "TR900", at(2), 100)]);
+    const agent = new FlightAgent(provider, { fareDeadlineMs: 5_000 });
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+    expect(provider.attempts).toBe(2);
+    expect(assessment.candidates.length).toBe(1);
+    expect(assessment.noReplacementReason).toBeUndefined();
+  }, 20000);
+
+  it("keeps the flight at its LISTED price when the re-price is rate-limited", async () => {
+    // The whole point of the fix. Atlas publishes a real price in the search
+    // results; a rate-limited `verify.do` says "ask again later", not "this
+    // flight is wrong". Dropping it was how a traveller got told no flight
+    // existed while the provider was listing fifteen.
+    class AlwaysRateLimited extends Provider {
+      async calculateFareDifference(): Promise<never> {
+        throw Object.assign(new Error("Atlas request to /verify.do failed with HTTP 429."), {
+          name: "AtlasApiError",
+          retryable: true,
+        });
+      }
+    }
+    const provider = new AlwaysRateLimited([option("a", "TR900", at(2), 275)]);
+    const agent = new FlightAgent(provider, { fareDeadlineMs: 5_000 });
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+
+    expect(assessment.candidates.length).toBe(1);
+    const fare = assessment.candidates[0]!.fareDifference;
+    expect(fare.amount).toBe(275);
+    // Flagged as UNCONFIRMED so the Trust Layer can say so — an unverified
+    // number presented as a quote would be the dishonesty this codebase
+    // exists to avoid.
+    expect(fare.basis).toBe("search_reference");
+  }, 20000);
+
+  it("still drops a flight the provider rejected PERMANENTLY", async () => {
+    // A permanent rejection is the provider telling us something real about
+    // that flight; keeping it at a stale listed price would be inventing a
+    // bookable option.
+    class PermanentlyBad extends Provider {
+      async calculateFareDifference(): Promise<never> {
+        throw Object.assign(new Error("routing no longer available"), {
+          name: "AtlasApiError",
+          retryable: false,
+        });
+      }
+    }
+    const provider = new PermanentlyBad([option("a", "TR900", at(2), 275)]);
+    const agent = new FlightAgent(provider, { fareDeadlineMs: 5_000 });
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+    expect(assessment.candidates).toEqual([]);
+    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
+  }, 20000);
+
+  it("does NOT retry a failure the provider called permanent", async () => {
+    // Retrying a malformed routing or a rejected credential just burns the
+    // deadline and delays the honest answer.
+    class HardFail extends Provider {
+      attempts = 0;
+      async calculateFareDifference(): Promise<never> {
+        this.attempts += 1;
+        throw Object.assign(new Error("Atlas rejected the configured credentials."), {
+          name: "AtlasApiError",
+          retryable: false,
+        });
+      }
+    }
+    const provider = new HardFail([option("a", "TR900", at(2), 100)]);
+    const agent = new FlightAgent(provider, { fareDeadlineMs: 5_000 });
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+    expect(provider.attempts).toBe(1);
+    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
+    // And the reason is quoted, not swallowed — this was invisible before.
+    expect(assessment.pricingFailureDetail).toContain("credentials");
+  }, 20000);
+});
+
 describe("how LATE a replacement may be", () => {
   // Found on the first real user test, and it is the worst plan the swarm has
   // produced: a traveller whose trip began 23 Dec said "I missed my flight" and

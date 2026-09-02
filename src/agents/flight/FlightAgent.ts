@@ -89,6 +89,10 @@ export interface FlightRebookingAssessment {
   /** The provider's own words when it declined to search — surfaced in the
    *  trace so a refusal is never silently read as "nothing available". */
   searchDeclinedReason?: string;
+  /** Why the fare pricings failed, when they did. Present only alongside
+   *  `pricing_unavailable`; the Activity Stream quotes it so a support
+   *  question has an answer without re-running anything. */
+  pricingFailureDetail?: string;
 }
 
 /** Per-call deadline for one fare-pricing call (Phase B robustness). */
@@ -147,6 +151,40 @@ export interface FlightAgentConfig {
    * search. <= 0 (the default) disables the budget entirely.
    */
   overallDeadlineMs?: number;
+}
+
+/** Gap between sequential fare-pricing calls — keeps us under the provider's
+ *  QPS limit without making a five-candidate assessment feel slow (~90ms per
+ *  call, so five land in well under a second even with the spacing). */
+const FARE_PRICING_GAP_MS = 120;
+/** Backoff before the single retry of a retryable pricing failure. */
+const FARE_PRICING_RETRY_MS = 400;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** `Promise.allSettled` semantics for ONE promise. */
+async function settle<T>(promise: Promise<T>): Promise<PromiseSettledResult<T>> {
+  try {
+    return { status: "fulfilled", value: await promise };
+  } catch (reason) {
+    return { status: "rejected", reason };
+  }
+}
+
+/**
+ * Is this failure worth one more try?
+ *
+ * The provider's structured errors carry `retryable` (429/503/timeouts set it);
+ * anything else — a malformed routing, a credential rejection — will fail
+ * identically the second time and retrying only burns the deadline.
+ */
+function isRetryableFailure(reason: unknown): boolean {
+  return (
+    typeof reason === "object" &&
+    reason !== null &&
+    "retryable" in reason &&
+    (reason as { retryable?: unknown }).retryable === true
+  );
 }
 
 /**
@@ -405,23 +443,94 @@ export class FlightAgent {
       .sort((a, b) => a.price - b.price)
       .slice(0, Math.max(0, Math.trunc(this.maxPricedCandidates)));
 
-    const settled = await Promise.allSettled(
-      options.map((option) =>
+    // SEQUENTIAL, not a fan-out. Verified against the live Atlas sandbox on
+    // 2026-09-02: five concurrent `verify.do` calls return HTTP 429 — all five
+    // of them. Every candidate was then dropped as unpriceable, and the
+    // traveller was told "we found flights but couldn't price them" on route
+    // after route, while the very same calls made one at a time all succeeded
+    // in ~90ms each. The provider rate-limits per QPS (its own error taxonomy
+    // documents a `110 QPS` business status), so the parallel `allSettled`
+    // fan-out was guaranteeing the failure it then reported.
+    //
+    // One retry on a retryable failure, too: `RETRYABLE_HTTP_STATUSES` has
+    // flagged 429 as retryable all along and nothing ever acted on the flag.
+    const settled: Array<PromiseSettledResult<FareDifference>> = [];
+    for (const [index, option] of options.entries()) {
+      // Space the calls out enough to stay under the provider's rate limit.
+      if (index > 0) await delay(FARE_PRICING_GAP_MS);
+      let attempt: PromiseSettledResult<FareDifference> = await settle(
         withDeadline(
           this.provider.calculateFareDifference(flightId, option.id, routeContext),
           this.fareDeadlineMs,
         ),
-      ),
-    );
+      );
+      if (attempt.status === "rejected" && isRetryableFailure(attempt.reason)) {
+        await delay(FARE_PRICING_RETRY_MS);
+        attempt = await settle(
+          withDeadline(
+            this.provider.calculateFareDifference(flightId, option.id, routeContext),
+            this.fareDeadlineMs,
+          ),
+        );
+      }
+      settled.push(attempt);
+    }
 
     const candidates: RebookingCandidate[] = [];
+    /** Why each pricing failed — see the logging note below. */
+    const pricingFailures: string[] = [];
+    /** How many candidates fell back to the search's published price. */
+    let referencePriced = 0;
     settled.forEach((result, index) => {
+      const option = options[index];
       if (result.status === "fulfilled") {
-        candidates.push({ option: options[index], fareDifference: result.value });
+        candidates.push({ option, fareDifference: result.value });
+        return;
       }
-      // Rejected/timed-out pricings are silently excluded — the assessment
-      // degrades to the remaining candidates instead of failing.
+      // The re-price failed — but the SEARCH already published a real price for
+      // this flight, and throwing the flight away over a rate-limited
+      // confirmation call is how a traveller ended up being told no flight
+      // existed while the provider was listing fifteen.
+      //
+      // Only for RETRYABLE failures (429, timeouts): those say "ask again
+      // later", not "this flight is wrong". A permanent rejection still drops
+      // the candidate, because there the provider is telling us something real.
+      if (option && isRetryableFailure(result.reason) && option.price > 0) {
+        referencePriced += 1;
+        candidates.push({
+          option,
+          fareDifference: {
+            oldFlightId: flightId,
+            newFlightId: option.id,
+            amount: option.price,
+            currency: option.currency,
+            direction: "charge",
+            // NOT verified. The Trust Layer must say so.
+            basis: "search_reference",
+            adults: routeContext?.adults ?? 1,
+          },
+        });
+      }
+      // A rejected pricing still degrades to the remaining candidates rather
+      // than failing the assessment — but it is no longer SILENT. When every
+      // pricing rejects, the traveller is told "we found flights but couldn't
+      // price them", and with nothing logged there was no way to tell whether
+      // that meant a provider outage, a deadline, or the Worker's subrequest
+      // cap. That question cost a full debugging session; the answer belongs
+      // in the logs the first time it happens.
+      const reason = result.reason;
+      pricingFailures.push(
+        `${option?.flightNumber ?? option?.id ?? `#${index}`}: ` +
+          `${reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)}`,
+      );
     });
+    if (pricingFailures.length > 0) {
+      console.warn(
+        `[flight] ${pricingFailures.length}/${options.length} fare pricings failed ` +
+          `(${referencePriced} kept at the search's published price) — ` +
+          pricingFailures.slice(0, 5).join(" | "),
+      );
+    }
 
     // Best = smallest net outlay: charges add, refunds subtract.
     let bestCandidate: RebookingCandidate | null = null;
@@ -490,6 +599,9 @@ export class FlightAgent {
               : search.searchDeclinedReason !== undefined
                 ? { searchDeclinedReason: search.searchDeclinedReason }
                 : {}),
+            ...(pricingFailures.length > 0
+              ? { pricingFailureDetail: pricingFailures.slice(0, 3).join(" | ") }
+              : {}),
           }
         : {}),
     };

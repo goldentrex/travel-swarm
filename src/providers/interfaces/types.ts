@@ -193,7 +193,7 @@ export interface FareDifference {
    *   currency), so `amount` is the FULL verified re-price charged as-is.
    * Absent on legacy/pre-extension providers (treat like `full_fare`).
    */
-  basis?: "fare_difference" | "full_fare";
+  basis?: "fare_difference" | "full_fare" | "search_reference";
   /** NEW (additive) — the original fare subtracted, only on `fare_difference` basis. */
   originalFare?: number;
   /** NEW (additive) — passenger count the quote was computed for (>= 1). */

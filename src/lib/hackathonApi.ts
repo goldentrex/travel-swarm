@@ -1356,7 +1356,10 @@ function noReplacementDetail(assessment: FlightRebookingAssessment): string | nu
         `qualify as a rebooking — every one departs beyond the ${MAX_REBOOKING_WINDOW_HOURS}h horizon`
       );
     case "pricing_unavailable":
-      return `${assessment.providerOptionCount ?? 0} option(s) found, but none could be priced`;
+      return (
+        `${assessment.providerOptionCount ?? 0} option(s) found, but none could be priced` +
+        (assessment.pricingFailureDetail ? ` — ${assessment.pricingFailureDetail}` : "")
+      );
     case "search_declined":
       return (
         `provider declined the search — ` +
@@ -2101,6 +2104,15 @@ function buildPresentation(input: {
     // refundable. Stating what the amount IS holds in both cases.
     if (fare.basis !== "fare_difference") {
       lines.push("This is the full ticket price, not a difference — no fare on file to refund");
+    }
+    // A price we could not confirm must never read like one we did. This is
+    // the figure the provider PUBLISHED in its search results, kept because
+    // the confirmation call was rate-limited — dropping the flight over that
+    // is what told travellers no flight existed while fifteen were listed.
+    if (fare.basis === "search_reference") {
+      lines.push(
+        "Listed price — we could not confirm it with the airline just now, so it may change",
+      );
     }
   }
   const policyVerdict = plan.proposed_resolution.policy_verdict;

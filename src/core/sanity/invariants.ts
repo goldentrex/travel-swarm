@@ -126,7 +126,8 @@ export function isSleepingHour(ms: number): boolean {
   return m >= SLEEP_WINDOW.startMinutes || m < SLEEP_WINDOW.endMinutes;
 }
 
-function utcDayIndex(ms: number): number {
+/** Which calendar day (UTC) an instant falls on — days apart = difference. */
+export function utcDayIndex(ms: number): number {
   return Math.floor(ms / DAY_MS);
 }
 
@@ -249,6 +250,37 @@ export function earliestAfterLanding(
 ): number {
   const acceptedGapMs = Math.max(0, itemMs - previousArrivalMs);
   return newArrivalMs + Math.min(acceptedGapMs, bufferMinutes * MINUTE_MS);
+}
+
+/**
+ * A hotel night is named for the day it STARTS, and it does not end at
+ * midnight. Someone who booked the night of the 19th and walks in at 01:00 on
+ * the 20th has used that night — late, but used. Someone who walks in at 19:00
+ * on the 20th has not.
+ *
+ * So nights are counted on a clock rolled back to early morning rather than on
+ * the calendar. Six is the usual pivot: reception treats an arrival before it
+ * as last night's guest, and after it as today's.
+ */
+const HOTEL_NIGHT_ROLLOVER_HOUR = 6;
+
+function hotelNightIndex(ms: number): number {
+  return utcDayIndex(ms - HOTEL_NIGHT_ROLLOVER_HOUR * 60 * MINUTE_MS);
+}
+
+/**
+ * How many booked nights the traveller will not sleep in, when a replacement
+ * flight moves check-in onto a later night.
+ *
+ * A late arrival is a time change; an arrival a NIGHT later is a night of a
+ * paid reservation that nobody will use. The engine used to render both the
+ * same way — "check-in moves to 19:15" — which is true and useless: it never
+ * said that 19:15 was on a different date, or that the night before was gone.
+ * Counting it is the first step to disclosing it.
+ */
+export function unstayedNights(bookedCheckInMs: number, newCheckInMs: number): number {
+  if (!Number.isFinite(bookedCheckInMs) || !Number.isFinite(newCheckInMs)) return 0;
+  return Math.max(0, hotelNightIndex(newCheckInMs) - hotelNightIndex(bookedCheckInMs));
 }
 
 // ------------------------------------------------------ displaced placement

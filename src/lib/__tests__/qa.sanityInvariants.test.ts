@@ -69,12 +69,14 @@ vi.mock("@/lib/swarmTripContext", async (importOriginal) => {
 });
 
 import {
+  SemanticCritic,
   arrivalBuffer,
   classifyItem,
   earliestAfterLanding,
   enforceMoveSanity,
   isSleepingHour,
   placeDisplacedItem,
+  unstayedNights,
   yieldsTo,
 } from "@/core/sanity";
 import { ItineraryGraph } from "@/core/dag";
@@ -85,6 +87,7 @@ import {
 } from "@/agents/orchestrator/OrchestratorAgent";
 import type { FlightAgent, RebookingCandidate } from "@/agents/flight/FlightAgent";
 import type { ActivityAgent, ActivityRescheduleProposal } from "@/agents/activity/ActivityAgent";
+import type { HotelAgent } from "@/agents/hotel/HotelAgent";
 import { validateResolutionPlan } from "@/agents/finance/TrustLayer";
 import type { ResolutionPlan } from "@/agents";
 import { handleHackathonRequest } from "@/lib/hackathonApi";
@@ -433,6 +436,243 @@ describe("the orchestrator never shows an absurd reschedule", () => {
   });
 });
 
+// ────────────────────────── 2b. the multi-day shift (semantic critic)
+
+/**
+ * The failure the critic exists for, end to end.
+ *
+ * A traveller books SIN → NRT on 5 Nov. Every flight that day is gone; the
+ * replacement lands on the SIXTH at 17:15. Narita is 75 minutes from town and
+ * the arrival is international, so they are not in Tokyo until about 20:00 —
+ * the next day.
+ *
+ * Everything on the 5th is therefore over: the room they booked for that night,
+ * the 20:00 shrine visit. The engine used to re-time the shrine to 20:00 on the
+ * 6th and call the room "late check-in at 20:00", both of which read as
+ * perfectly reasonable and neither of which is true.
+ */
+describe("a replacement flight that lands the NEXT DAY", () => {
+  const BOOKED = "2026-11-05";
+  const LANDS = "2026-11-06";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse(`${BOOKED}T06:00:00Z`));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function tokyoGraph(): ItineraryGraph {
+    const graph = new ItineraryGraph();
+    graph.addNode({
+      id: "flight-0",
+      type: "flight",
+      flightNumber: "SQ632",
+      origin: "SIN",
+      destination: "NRT",
+      departureTime: Date.parse(`${BOOKED}T08:00:00Z`),
+      arrivalTime: Date.parse(`${BOOKED}T14:30:00Z`),
+      scheduledTime: Date.parse(`${BOOKED}T08:00:00Z`),
+      status: "on_track",
+      dependsOn: [],
+      arrivalLocationId: "NRT",
+    });
+    graph.addNode({
+      id: "hotel-0",
+      type: "hotel_check_in",
+      hotelName: "Hotel Ryumeikan Tokyo",
+      scheduledTime: Date.parse(`${BOOKED}T15:00:00Z`),
+      status: "on_track",
+      dependsOn: ["flight-0"],
+    });
+    graph.addNode({
+      id: "activity-shrine",
+      type: "activity",
+      name: "Meiji Jingu Shrine",
+      durationMinutes: 90,
+      scheduledTime: Date.parse(`${BOOKED}T20:00:00Z`),
+      status: "on_track",
+      dependsOn: ["flight-0"],
+    });
+    return graph;
+  }
+
+  /** The replacement: same route, landing 6 Nov 17:15. */
+  const nextDayCandidate: RebookingCandidate = {
+    option: {
+      id: "NH-844",
+      airline: "ANA",
+      flightNumber: "NH844",
+      origin: "SIN",
+      destination: "NRT",
+      departureTime: `${LANDS}T09:05:00.000Z`,
+      arrivalTime: `${LANDS}T17:15:00.000Z`,
+      price: 480,
+      currency: "USD",
+    },
+    fareDifference: {
+      oldFlightId: "flight-0",
+      newFlightId: "NH-844",
+      amount: 120,
+      currency: "USD",
+      direction: "charge",
+    },
+  };
+
+  const flightAgent = {
+    assessRebookingOptions: async (flightId: string, newTime: string) => ({
+      originalFlightId: flightId,
+      requestedTime: newTime,
+      candidates: [nextDayCandidate],
+      bestCandidate: nextDayCandidate,
+    }),
+  } as unknown as FlightAgent;
+
+  /** Proposes the shrine for the SAME hour on the arrival day — the naive move. */
+  const activityAgent = {
+    proposeRescheduling: async (
+      requests: Array<{ activityNodeId: string; activityName: string }>,
+    ) =>
+      requests.map(
+        (request): ActivityRescheduleProposal => ({
+          activityNodeId: request.activityNodeId,
+          activityName: request.activityName,
+          action: "reschedule",
+          newTime: `${LANDS}T20:00:00.000Z`,
+          penalty: 0,
+          currency: "USD",
+        }),
+      ),
+  } as unknown as ActivityAgent;
+
+  const hotelAgent = {
+    assessHotelImpact: async (request: { hotelNodeId: string; hotelName: string }) => ({
+      hotelNodeId: request.hotelNodeId,
+      lateCheckInAvailable: true,
+      cancellationFee: 0,
+      currency: "USD",
+      alternativeRooms: [],
+      recommendation: "keep_late_checkin" as const,
+      feeDelta: 0,
+      note: "Late Check-in (confirmed)",
+    }),
+  } as unknown as HotelAgent;
+
+  function orchestrator(critic: SemanticCritic | null) {
+    return new OrchestratorAgent(
+      tokyoGraph(),
+      flightAgent,
+      null,
+      hotelAgent,
+      activityAgent,
+      null,
+      null,
+      null,
+      critic,
+    );
+  }
+
+  const disruption = {
+    nodeId: "flight-0",
+    delay: 26 * 60 + 45,
+    description: "Flight SQ632 SIN → NRT cancelled",
+  };
+
+  it("drops the shrine instead of quietly moving it to the day you actually land", async () => {
+    // No key ⇒ the pure rules alone, which is exactly how CI and every
+    // offline deployment runs.
+    const { plans } = await orchestrator(new SemanticCritic({ apiKey: "" })).resolveDisruptionMulti(
+      disruption,
+    );
+    const shrine = plans[0].proposed_resolution.rescheduled_activities.find((a) =>
+      a.name.includes("Meiji Jingu"),
+    );
+    expect(shrine?.action).toBe("drop");
+    // …and the reason is the real one, not a schedule artefact.
+    expect(shrine?.reason ?? "").toMatch(/another day|its own plan/i);
+  });
+
+  it("states the booked night that will not be used, without inventing what it costs", async () => {
+    const { plans } = await orchestrator(new SemanticCritic({ apiKey: "" })).resolveDisruptionMulti(
+      disruption,
+    );
+    const hotel = plans[0].proposed_resolution.hotel_adjustments?.[0];
+    expect(hotel?.nights_unstayed).toBe(1);
+    // Disclosure is NOT a charge: the property's terms for an unused night are
+    // unknown to us, and a number we made up would land in a ledger the
+    // traveller is asked to approve.
+    expect(hotel?.fee).toBe(0);
+    const fd = plans[0].financial_delta;
+    expect(Math.abs(fd.total_new_charges - fd.total_refund - fd.net_payable)).toBeLessThan(1e-9);
+    expect(validateResolutionPlan(plans[0])).toBe(true);
+  });
+
+  it("the model can add a venue ruling the rules cannot reach — and still not touch the money", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      is_sane: false,
+                      criticisms: [
+                        {
+                          node_id: "activity-shrine",
+                          issue_type: "CLOSED_VENUE",
+                          explanation:
+                            "Meiji Jingu closes at sunset, about 16:30 in November.",
+                          suggested_action: "DROP",
+                        },
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+
+    const withModel = orchestrator(new SemanticCritic({ apiKey: "k", fetchImpl }));
+    const { plans } = await withModel.resolveDisruptionMulti(disruption);
+    expect(withModel.lastCriticVerdicts[0]?.source).toBe("gemini");
+    const shrine = plans[0].proposed_resolution.rescheduled_activities.find((a) =>
+      a.name.includes("Meiji Jingu"),
+    );
+    expect(shrine?.action).toBe("drop");
+    const fd = plans[0].financial_delta;
+    expect(Math.abs(fd.total_new_charges - fd.total_refund - fd.net_payable)).toBeLessThan(1e-9);
+  });
+
+  it("produces the SAME plan whether or not the model was reachable", async () => {
+    const offline = await orchestrator(new SemanticCritic({ apiKey: "" })).resolveDisruptionMulti(
+      disruption,
+    );
+    const broken = await orchestrator(
+      new SemanticCritic({
+        apiKey: "k",
+        fetchImpl: vi.fn(async () => {
+          throw new Error("ECONNRESET");
+        }) as unknown as typeof fetch,
+      }),
+    ).resolveDisruptionMulti(disruption);
+    const noCriticAtAll = await orchestrator(null).resolveDisruptionMulti(disruption);
+
+    const shape = (plan: ResolutionPlan) => ({
+      flight: plan.proposed_resolution.new_flight?.id,
+      activities: plan.proposed_resolution.rescheduled_activities.map((a) => [a.name, a.action]),
+      nights: plan.proposed_resolution.hotel_adjustments?.[0]?.nights_unstayed,
+      net: plan.financial_delta.net_payable,
+    });
+    expect(shape(broken.plans[0])).toEqual(shape(offline.plans[0]));
+    expect(shape(noCriticAtAll.plans[0])).toEqual(shape(offline.plans[0]));
+  });
+});
+
 // ───────────────────────────────────────────── 3. the settlement writer
 
 function romeTrip(): Record<string, unknown> {
@@ -624,6 +864,75 @@ describe("the settlement never writes an absurd trip", () => {
     expect(stay?.time).toBe("20:40");
     // Either the dinner waits for the bags, or it honestly cannot happen.
     if (dinner) expect(dinner.time >= "21:10").toBe(true);
+  });
+
+  it("names the booked night that goes unused when the landing slips past it", () => {
+    // The replacement lands on the 15th; the room was booked for the night of
+    // the 14th. That night is gone, and saying "late check-in at 20:00" would
+    // hide it behind a time.
+    const { changes, followUps, item } = settle(`2031-03-15T18:00:00Z`, {}, {
+      hotel_actions: [
+        {
+          nodeId: "hotel-0-5",
+          action: "late_check_in",
+          note: "Check-in deferred to the replacement arrival.",
+          newCheckIn: "2031-03-15T20:00:00.000Z",
+        },
+      ],
+    });
+    const stay = item("Hotel Campo de' Fiori");
+    expect(stay?.nights_unstayed).toBe(1);
+    expect(stay?.unstayed_from).toBe(DAY);
+    // The date is IN the words, not implied by a bare clock time.
+    expect(changes.some((c) => /will not be used/.test(c))).toBe(true);
+    expect(changes.some((c) => /check-in moves to \w{3} \d+ \w{3} at 20:00/.test(c))).toBe(true);
+    // …and the traveller is told to settle it with the property. We do not
+    // know their rate's terms and will not invent a refund.
+    const unused = followUps.find((f) => f.kind === "confirm_unused_night");
+    expect(unused?.message).toMatch(/goes unused/);
+  });
+
+  it("does not put the unused night on top of the night that IS booked", () => {
+    // Rome is a two-night stay: day 1 (the 14th) and day 2 (the 15th) each
+    // carry their own row. Re-dating the 14th forward onto the 15th would
+    // leave two rows for one night — the room shown twice, one of them a
+    // phantom. The unused night keeps its own date and says what it is.
+    const { next, item } = settle(`2031-03-15T18:00:00Z`, {}, {
+      hotel_actions: [
+        {
+          nodeId: "hotel-0-5",
+          action: "late_check_in",
+          note: "Check-in deferred to the replacement arrival.",
+          newCheckIn: "2031-03-15T20:00:00.000Z",
+        },
+      ],
+    });
+    const stays = next.itinerary.flatMap((d) => d.items).filter((i) => i.type === "stay");
+    expect(stays).toHaveLength(2);
+    // Exactly ONE room for the night of the 15th.
+    const forThe15th = stays.filter((s) => (s.check_in ?? "2031-03-15") === "2031-03-15");
+    expect(forThe15th).toHaveLength(1);
+    // …and the 14th's row is still the 14th's, flagged as the night nobody uses.
+    const unused = item("Hotel Campo de' Fiori");
+    expect(unused?.check_in).toBe(DAY);
+    expect(unused?.unstayed).toBe(true);
+  });
+
+  it("a merely late arrival is still a late check-in, not a lost night", () => {
+    // 01:00 on the 15th is the night of the 14th in every hotel's book.
+    const { changes, followUps, item } = settle(`${DAY}T23:10:00Z`, {}, {
+      hotel_actions: [
+        {
+          nodeId: "hotel-0-5",
+          action: "late_check_in",
+          note: "arrival pushed back",
+          newCheckIn: "2031-03-15T01:00:00.000Z",
+        },
+      ],
+    });
+    expect(item("Hotel Campo de' Fiori")?.nights_unstayed).toBeUndefined();
+    expect(changes.some((c) => /late check-in at 01:00/.test(c))).toBe(true);
+    expect(followUps.some((f) => f.kind === "confirm_unused_night")).toBe(false);
   });
 
   it("a same-time rebooking changes nothing on the day", () => {

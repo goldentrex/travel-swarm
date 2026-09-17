@@ -38,7 +38,25 @@ import type {
   ItineraryNode,
 } from "@/core/dag";
 import { ItineraryGraph } from "@/core/dag";
-import { arrivalBuffer, classifyItem, describeDropReason, isSensibleStart, minutesOfDay } from "@/core/sanity";
+import {
+  arrivalBuffer,
+  arrivalWindows,
+  classifyItem,
+  criticCategoryOf,
+  describeDropReason,
+  deterministicCriticisms,
+  isSensibleStart,
+  minutesOfDay,
+  rulingsFor,
+  unstayedNights,
+  utcDayIndex,
+} from "@/core/sanity";
+import type {
+  CriticContext,
+  CriticItem,
+  CriticVerdict,
+  SemanticCritic,
+} from "@/core/sanity";
 import type {
   FlightAgent,
   FlightRebookingAssessment,
@@ -599,6 +617,14 @@ export class OrchestratorAgent {
      * rail — the reorganizer never sinks a plan.
      */
     private readonly dayReorganizer: DayReorganizer | null = null,
+    /**
+     * The LLM sanity critic (additive, optional). It sits between candidate
+     * selection and the plans the traveller is shown, and it may only ever
+     * DROP or RE-TIME nodes — never price anything. Absent, unreachable or
+     * degraded ⇒ {@link deterministicCriticisms} alone, which is exactly what
+     * every offline test and CI run exercises.
+     */
+    private readonly semanticCritic: SemanticCritic | null = null,
   ) {}
 
   // Task 20 — rederive context captured by runDisruptionPipeline: the
@@ -608,6 +634,16 @@ export class OrchestratorAgent {
   private redriveBaseline: ItineraryGraph | null = null;
   private redriveEvent: DisruptionEvent | null = null;
   private redriveNominalMinutes: number | null = null;
+
+  /** Every criticism acted on during the last resolve, for the session trace. */
+  private criticVerdicts: CriticVerdict[] = [];
+  /** Per-plan lost-night count keyed by the selection's arrival ISO. */
+  private criticNightsUnstayed = new Map<string, number>();
+
+  /** What the critic found on the last {@link resolveDisruptionMulti} call. */
+  get lastCriticVerdicts(): readonly CriticVerdict[] {
+    return this.criticVerdicts;
+  }
 
   /**
    * Run the full disruption-recovery pipeline and emit a TrustLayer plan.
@@ -696,6 +732,8 @@ export class OrchestratorAgent {
   ): Promise<MultiPlanOutcome> {
     const pipeline = await this.runDisruptionPipeline(event, constraints);
     const trace: string[] = [];
+    this.criticVerdicts = [];
+    this.criticNightsUnstayed = new Map();
     // ONE timestamp for every plan assembled below: the per-plan TTL stamps
     // must be identical so the canonical-JSON dedup can collapse profiles
     // that select the same candidate (a ticking millisecond clock between
@@ -845,6 +883,14 @@ export class OrchestratorAgent {
           constraints,
           candidate.option.destination,
         );
+        // ── The semantic critic, at the ONE point where its verdict can
+        //    still change the plan without touching the ledger. It reads the
+        //    proposal SET, not the assembled plan: what it drops or re-times
+        //    here is what `assembleResolutionPlan` then prices, so every
+        //    amount the traveller sees is computed by the deterministic engine
+        //    from the post-critique itinerary. Nothing downstream of this
+        //    point asks the model anything.
+        proposals = await this.applySemanticCritique(candidate, proposals, trace);
         rederivedByArrival.set(arrivalIso, proposals);
       }
       return proposals;
@@ -874,7 +920,7 @@ export class OrchestratorAgent {
       // into the plan body (undefined ⇒ the shared pipeline set, unchanged).
       const selectionProposals = await proposalsForCandidate(chosen);
       const plan = this.assembleResolutionPlan(event, pipeline, chosen, {
-        hotelAdjustments,
+        hotelAdjustments: this.discloseUnstayedNights(hotelAdjustments, chosen),
         includeTransferRequote,
         stampMs: now,
         ...(selectionProposals !== undefined ? { activityProposals: selectionProposals } : {}),
@@ -923,7 +969,7 @@ export class OrchestratorAgent {
       // set too (reuses the hoisted arrival-deduped map when present).
       const fallbackProposals = await proposalsForCandidate(fallbackChosen);
       const fallback = this.assembleResolutionPlan(event, pipeline, fallbackChosen, {
-        hotelAdjustments,
+        hotelAdjustments: this.discloseUnstayedNights(hotelAdjustments, fallbackChosen),
         includeTransferRequote: pipeline.spatialTransferReport !== null,
         stampMs: now,
         ...(fallbackProposals !== undefined ? { activityProposals: fallbackProposals } : {}),
@@ -1361,6 +1407,184 @@ export class OrchestratorAgent {
     };
   }
 
+  // -------------------------------------------------------- semantic critic
+
+  /**
+   * Run the semantic critic over ONE candidate's re-planned day and enact its
+   * verdict on the PROPOSALS, before any plan is assembled from them.
+   *
+   * The placement is the whole design. The critic is the last thing that can
+   * change WHAT is in a plan and the first thing that is forbidden from
+   * touching what it COSTS: `assembleResolutionPlan` runs afterwards and
+   * recomputes `financial_delta` from the surviving proposals with the same
+   * deterministic ledger rule it always used. A dropped activity keeps its own
+   * penalty and currency, so the identity
+   * `net_payable = total_new_charges − total_refund` is maintained by
+   * construction, not by asking a model to respect it.
+   *
+   * TOTAL: the critic itself never throws, and this method treats any
+   * shortfall (no critic wired, no arrival, nothing to judge) as "no
+   * criticisms" — the proposals pass through untouched.
+   */
+  private async applySemanticCritique(
+    candidate: RebookingCandidate,
+    proposals: ActivityRescheduleProposal[],
+    trace: string[],
+  ): Promise<ActivityRescheduleProposal[]> {
+    const context = this.buildCriticContext(candidate, proposals);
+    if (context === null) return proposals;
+
+    const verdict = this.semanticCritic
+      ? await this.semanticCritic.review(context)
+      : { is_sane: true, criticisms: deterministicCriticisms(context), source: "deterministic" as const };
+    const settled: CriticVerdict = {
+      ...verdict,
+      is_sane: verdict.criticisms.length === 0,
+    };
+    this.criticVerdicts.push(settled);
+    if (settled.criticisms.length === 0) return proposals;
+
+    const rulings = rulingsFor(settled, context);
+
+    // The hotel ruling is a DISCLOSURE, not a money move: the check-in anchor
+    // is already deferred deterministically by the arrival-floor sweep, so all
+    // that is recorded here is how many booked nights that costs the traveller
+    // — which the plan then states in words instead of hiding behind a time.
+    if (context.hotel) {
+      const hotelRuling = rulings.get(context.hotel.node_id);
+      if (hotelRuling && hotelRuling.action !== "drop") {
+        const anchorMs = hotelRuling.action === "shift_date" ? hotelRuling.toMs : hotelRuling.atMs;
+        const nights = unstayedNights(Date.parse(context.hotel.booked_check_in), anchorMs);
+        if (nights > 0) {
+          this.criticNightsUnstayed.set(candidate.option.arrivalTime, nights);
+          trace.push(
+            `critic: arrival on a later day — ${nights} booked night(s) at ${context.hotel.name} will not be used`,
+          );
+        }
+      }
+    }
+
+    const critiqued = proposals.map((proposal) => {
+      const ruling = rulings.get(proposal.activityNodeId);
+      if (!ruling || proposal.action === "swap") return proposal;
+      if (ruling.action === "drop") {
+        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} dropped`);
+        return {
+          ...proposal,
+          action: "drop" as const,
+          // Frozen shape: a drop keeps the original slot as its newTime, and
+          // its penalty, so the ledger is recomputed from unchanged terms.
+          newTime: proposal.newTime,
+          rationale: ruling.reason,
+        };
+      }
+      if (ruling.action === "retime") {
+        const iso = new Date(ruling.atMs).toISOString();
+        if (iso === proposal.newTime) return proposal;
+        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} re-timed`);
+        return { ...proposal, newTime: iso, rationale: ruling.reason };
+      }
+      return proposal;
+    });
+    return critiqued;
+  }
+
+  /**
+   * The facts the critic is allowed to see for ONE candidate: where and when
+   * it lands, the buffers that follow from that route, the hotel check-in it
+   * implies, and each proposed slot beside the slot it was booked for.
+   *
+   * `null` when there is nothing to judge — no flight source, an unparseable
+   * arrival, or a day with neither an activity nor a hotel on it.
+   */
+  private buildCriticContext(
+    candidate: RebookingCandidate,
+    proposals: ActivityRescheduleProposal[],
+  ): CriticContext | null {
+    const baseline = this.redriveBaseline;
+    const event = this.redriveEvent;
+    if (!baseline || !event) return null;
+    const source = baseline.getNode(event.nodeId);
+    if (!source || source.type !== "flight") return null;
+    const arrivalMs = Date.parse(candidate.option.arrivalTime);
+    if (!Number.isFinite(arrivalMs)) return null;
+    // Graph nodes carry epoch ms, not ISO (see core/dag types).
+    const originalArrivalMs = source.arrivalTime;
+
+    const { readyForPickupMs, readyInCityMs } = arrivalWindows(
+      candidate.option.origin,
+      candidate.option.destination,
+      arrivalMs,
+    );
+
+    const items: CriticItem[] = [];
+    for (const proposal of proposals) {
+      if (proposal.action === "drop") continue;
+      const node = baseline.getNode(proposal.activityNodeId);
+      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
+      if (!name) continue;
+      items.push({
+        node_id: proposal.activityNodeId,
+        name,
+        proposed_start: proposal.newTime,
+        ...(node ? { original_start: new Date(node.scheduledTime).toISOString() } : {}),
+        category: criticCategoryOf("activity", name),
+      });
+    }
+
+    // The hotel the traveller is heading to: its BOOKED check-in, and the one
+    // this candidate implies (the arrival-floor rule — a room is reached when
+    // they are really in town, never earlier than booked).
+    let hotel: CriticContext["hotel"];
+    for (const node of baseline.getDownstream(event.nodeId)) {
+      if (node.type !== "hotel_check_in") continue;
+      hotel = {
+        node_id: node.id,
+        name: node.hotelName,
+        booked_check_in: new Date(node.scheduledTime).toISOString(),
+        proposed_check_in: new Date(Math.max(node.scheduledTime, readyInCityMs)).toISOString(),
+      };
+      break;
+    }
+    if (items.length === 0 && !hotel) return null;
+
+    return {
+      incident: event.description ?? "Disrupted flight",
+      arrival: {
+        ...(candidate.option.origin ? { origin: candidate.option.origin } : {}),
+        ...(candidate.option.destination ? { airport: candidate.option.destination } : {}),
+        iso: new Date(arrivalMs).toISOString(),
+        ready_in_city_iso: new Date(readyInCityMs).toISOString(),
+        ready_for_pickup_iso: new Date(readyForPickupMs).toISOString(),
+        is_next_day:
+          Number.isFinite(originalArrivalMs) && utcDayIndex(arrivalMs) > utcDayIndex(originalArrivalMs),
+        ...(Number.isFinite(originalArrivalMs)
+          ? { original_arrival_iso: new Date(originalArrivalMs).toISOString() }
+          : {}),
+      },
+      ...(hotel ? { hotel } : {}),
+      items,
+    };
+  }
+
+  /**
+   * Stamp the lost-night count this candidate implies onto its hotel
+   * adjustments. Disclosure only — `fee` is untouched, because the property's
+   * terms for a night nobody sleeps in are not ours to guess, and a number we
+   * invented would land in a ledger the traveller is asked to approve.
+   */
+  private discloseUnstayedNights(
+    adjustments: HotelAdjustment[],
+    chosen: RebookingCandidate | null,
+  ): HotelAdjustment[] {
+    if (chosen === null || adjustments.length === 0) return adjustments;
+    const nights = this.criticNightsUnstayed.get(chosen.option.arrivalTime);
+    if (nights === undefined || nights <= 0) return adjustments;
+    return adjustments.map((adjustment) =>
+      adjustment.action === "late_check_in" ? { ...adjustment, nights_unstayed: nights } : adjustment,
+    );
+  }
+
   /**
    * Task 20 — arrival-floor sweep (single documented rule): after a
    * real-arrival re-propagation, ANY downstream `activity` /
@@ -1746,6 +1970,30 @@ export class OrchestratorAgent {
       if (!Number.isFinite(proposedMs)) return proposal;
       const originalMs = originalMsOf.get(proposal.activityNodeId) ?? proposedMs;
       const atMs = readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
+      // An arrival that pushes the only remaining slot onto ANOTHER CALENDAR
+      // DAY is a drop, not a move: tomorrow already has its own plan. This is
+      // the rule `placeDisplacedItem` enforces on the settlement cascade, and
+      // the proposal path could slip past it — a 20:00 activity on the 5th,
+      // with a replacement landing on the 6th, quietly became a 19:15 activity
+      // on the 6th and was shown as a re-time.
+      //
+      // A proposal that CHOSE another day on its own is untouched: the weather
+      // rail deliberately moves a rained-off walk to tomorrow, and that is a
+      // decision rather than a side effect.
+      const clampCrossedDay =
+        atMs !== proposedMs &&
+        utcDayIndex(proposedMs) === utcDayIndex(originalMs) &&
+        utcDayIndex(atMs) !== utcDayIndex(originalMs);
+      if (clampCrossedDay) {
+        return {
+          ...proposal,
+          action: "drop" as const,
+          newTime: new Date(originalMs).toISOString(),
+          rationale: `Cancelled — ${describeDropReason("would_move_to_another_day")}.${
+            proposal.rationale ? ` ${proposal.rationale}` : ""
+          }`,
+        };
+      }
       const verdict = isSensibleStart(
         classifyItem({ type: "activity", title: name }),
         name,

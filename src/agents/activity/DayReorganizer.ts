@@ -31,23 +31,16 @@
 import type { IsoTimestamp } from "@/providers/interfaces/types";
 import {
   configuredGeminiModel,
-  emitGeminiUsage,
-  readGeminiUsage,
-  type GeminiUsageEvent,
   type GeminiUsageObserver,
   type GeminiCallBudget,
 } from "../geminiUsage";
-import {
-  GEMINI_MODEL_CASCADE,
-  modelLadder,
-  noteModelExhausted,
-  noteModelHealthy,
-} from "@/agents/geminiCascade";
+import { GEMINI_MODEL_CASCADE } from "@/agents/geminiCascade";
 import {
   GEMINI_CALLS_PER_MISSION,
   type GeminiCallResult,
   type GeminiDegradeReason,
 } from "../geminiDegrade";
+import { GeminiJsonClient, parseGeminiJson } from "@/agents/geminiJsonClient";
 
 // ------------------------------------------------------------------ contract
 
@@ -580,47 +573,42 @@ export function validateReorgDecisions(
 // ------------------------------------------------------------------ the agent
 
 export class DayReorganizer {
-  private readonly apiKey: string | undefined;
-  private readonly timeoutMs: number;
-  private model: string;
-  private readonly fetchImpl: typeof fetch;
-  private readonly onUsage: GeminiUsageObserver | undefined;
-  private readonly sharedBudget: GeminiCallBudget | undefined;
-  private readonly maxRetries: number;
-  private readonly retryDelayMs: number;
-  private readonly callBudget: number;
+  /** The shared schema-constrained transport (see geminiJsonClient.ts). */
+  private readonly client: GeminiJsonClient;
 
-  /** Task 21 — per-instance Gemini calls consumed this mission
-   *  (same counter pattern as ActivityAgent.viatorConsultsUsed). */
-  private geminiCallsUsedCount = 0;
   /** Task 21 — classify of the most recent degrade (undefined = none yet). */
   private degradeReason: GeminiDegradeReason | undefined;
   private degradeDetail: string | undefined;
 
   constructor(config: DayReorganizerConfig = {}) {
-    this.apiKey =
-      config.apiKey !== undefined && config.apiKey.length > 0
-        ? config.apiKey
-        : typeof process !== "undefined" && typeof process.env?.GEMINI_API_KEY === "string"
-          ? process.env.GEMINI_API_KEY
-          : undefined;
-    this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.model = config.model ?? configuredGeminiModel("dayReorg", DEFAULT_MODEL);
-    this.onUsage = config.onUsage;
-    this.sharedBudget = config.sharedBudget;
-    this.maxRetries = Math.max(0, Math.floor(config.maxRetries ?? 0));
-    this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-    this.callBudget = config.callBudget ?? GEMINI_CALLS_PER_MISSION;
-    // Workers' `fetch` is brand-checked against its receiver — same fix as
-    // GeminiLiaisonAgent: pinning `globalThis` avoids the silent
-    // "Illegal invocation" degradation class.
-    this.fetchImpl = config.fetchImpl ?? fetch.bind(globalThis);
+    this.client = new GeminiJsonClient({
+      label: "day-reorg",
+      ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
+      model: config.model ?? configuredGeminiModel("dayReorg", DEFAULT_MODEL),
+      timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      ...(config.fetchImpl ? { fetchImpl: config.fetchImpl } : {}),
+      ...(config.onUsage ? { onUsage: config.onUsage } : {}),
+      ...(config.sharedBudget ? { sharedBudget: config.sharedBudget } : {}),
+      maxRetries: Math.max(0, Math.floor(config.maxRetries ?? 0)),
+      retryDelayMs: config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
+      callBudget: config.callBudget ?? GEMINI_CALLS_PER_MISSION,
+      // Task 25 (#11) — budget priority semantics: the SHARED pipeline walk
+      // has priority over the per-plan rederive walks (the orchestrator
+      // consumes this instance's budget in pipeline order first); which day
+      // degrades under concurrent reorgs is intentionally not guaranteed.
+      onDegrade: (reason, message) => this.degrade(reason, message),
+    });
   }
 
   /** Task 21 (additive): Gemini calls consumed so far this mission
    *  (test/audit feed, mirrors ActivityAgent.viatorConsultsUsed). */
   get geminiCallsUsed(): number {
-    return this.geminiCallsUsedCount;
+    return this.client.callsUsed;
+  }
+
+  /** Is an API key configured at all? (`!this.apiKey` at the old call site.) */
+  private get apiKey(): string | undefined {
+    return this.client.apiKey;
   }
 
   /** Task 21 (additive): WHY the agent last degraded — undefined when it
@@ -657,7 +645,7 @@ export class DayReorganizer {
       }
       const result = await this.callGemini(request);
       if (!result.ok) return deterministic(result.reason);
-      const parsed = parseReorgJson(result.text);
+      const parsed = parseGeminiJson(result.text);
       const decisionsPayload = isRecord(parsed) ? parsed.decisions : parsed;
       let rejection = "unspecified";
       let validated = validateReorgDecisions(decisionsPayload, request, (reason) => {
@@ -805,210 +793,20 @@ export class DayReorganizer {
   }
 
   /**
-   * One schema-constrained Gemini generateContent conversation under a tight
-   * deadline, classified via the shared {@link GeminiDegradeReason} taxonomy
-   * (Task 21; same pattern as GeminiLiaisonAgent.callGemini). Budget gate →
-   * single attempt → at most `maxRetries` retries on a `quota_429` classify
-   * (429/503) — the shared deadline bounds the WHOLE sequence. Never throws.
+   * One schema-constrained Gemini conversation through the shared transport
+   * ({@link GeminiJsonClient}): budget gate → laddered attempts, each with its
+   * own deadline → classification through the frozen
+   * {@link GeminiDegradeReason} taxonomy. Never throws.
    */
   private async callGemini(request: DayReorgRequest): Promise<GeminiCallResult> {
-    // Per-mission budget gate (same pattern as ActivityAgent's
-    // viatorConsultsUsed): exhaustion skips the call and classifies as the
-    // closest taxonomy value — `quota_429` (the union stays frozen at 6).
-    // Task 25 (#11) — budget priority semantics: the SHARED pipeline walk
-    // has budget priority over the per-plan rederive walks (the orchestrator
-    // consumes this instance's budget in pipeline order first); which day
-    // degrades under concurrent reorgs is intentionally not guaranteed.
-    if (this.geminiCallsUsedCount >= this.callBudget) {
-      this.degrade(
-        "quota_429",
-        `Gemini call skipped — per-mission budget exhausted (${this.callBudget} calls)`,
-      );
-      return { ok: false, reason: "quota_429" };
-    }
-
-    /** One attempt against `model`, with a deadline of its own. Sharing one
-     *  deadline let a saturated primary starve the retry, which then degraded
-     *  as `timeout` instead of actually reaching the lighter model. */
-    let budgetExhausted = false;
-    const attempt = async (model: string): Promise<GeminiCallResult> => {
-      // Recheck AFTER any retry backoff: another concurrent day can consume
-      // the last slot while this call is waiting. Reserve before the next await.
-      if (
-        this.geminiCallsUsedCount >= this.callBudget ||
-        (this.sharedBudget && !this.sharedBudget.tryReserve())
-      ) {
-        budgetExhausted = true;
-        this.degradeReason = "quota_429";
-        return { ok: false, reason: "quota_429" };
-      }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      try {
-        this.geminiCallsUsedCount += 1;
-        return await this.callGeminiOnce(request, controller.signal, model);
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
-    // Same ladder as the liaison — see `geminiCascade.ts`.
-    const ladder = modelLadder(this.model);
-    let result = await attempt(ladder[0]);
-    if (result.ok) noteModelHealthy(ladder[0]);
-
-    // Walk the ladder on ANY failure that is about the model rather than about
-    // us. `quota_429` was the only trigger, so a plain HTTP failure — a 500, or
-    // a 4xx specific to one model — dropped the mission straight to the
-    // deterministic rail without ever asking the next model. Measured on the
-    // live matrix of 2026-09-01: 8 of 9 degradations were `http_error`, and
-    // not one of them tried a second model.
-    //
-    // A genuinely bad request fails on every rung and still ends at the
-    // deterministic rail, so the cost of being wrong here is one extra call.
-    let rung = 0;
-    while (
-      !result.ok &&
-      !budgetExhausted &&
-      (result.reason === "quota_429" || result.reason === "http_error") &&
-      rung < this.maxRetries &&
-      rung + 1 < ladder.length &&
-      this.geminiCallsUsedCount < this.callBudget
-    ) {
-      // Only a QUOTA refusal earns a cooldown: a one-off 500 must not sideline
-      // a healthy model for the next five minutes.
-      if (result.reason === "quota_429") noteModelExhausted(ladder[rung]);
-      rung += 1;
-      await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
-      console.warn(
-        `[day-reorg] ${ladder[rung - 1]} failed (${result.reason}) — trying ${ladder[rung]}`,
-      );
-      result = await attempt(ladder[rung]);
-      if (result.ok) noteModelHealthy(ladder[rung]);
-    }
-    if (!result.ok) {
-      if (!budgetExhausted && result.reason === "quota_429") noteModelExhausted(ladder[rung]);
-      this.degradeReason = result.reason;
-    }
+    const result = await this.client.requestJson({
+      systemInstruction: this.buildSystemInstruction(request),
+      userPrompt: this.buildUserPrompt(request),
+      responseSchema: REORG_RESPONSE_SCHEMA,
+      temperature: 0.2,
+      maxOutputTokens: 2400,
+    });
+    if (!result.ok) this.degradeReason = result.reason;
     return result;
-  }
-
-  /** ONE fetch attempt with the full degrade taxonomy classification. */
-  private async callGeminiOnce(
-    request: DayReorgRequest,
-    signal: AbortSignal,
-    /** Defaults to the primary; the overload retry passes the lighter tier. */
-    model: string = this.model,
-  ): Promise<GeminiCallResult> {
-    const startedAt = Date.now();
-    let usage: GeminiUsageEvent["usage"] = null;
-    let outcome: GeminiUsageEvent["outcome"] = "exception";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
-    try {
-      const response = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: this.buildSystemInstruction(request) }] },
-          contents: [{ role: "user", parts: [{ text: this.buildUserPrompt(request) }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            responseSchema: REORG_RESPONSE_SCHEMA,
-            temperature: 0.2,
-            maxOutputTokens: 2400,
-            thinkingConfig: { thinkingLevel: "low" },
-          },
-        }),
-      });
-      if (!response.ok) {
-        const bodyText = await response.text().catch(() => "");
-        const reason: GeminiDegradeReason =
-          response.status === 429 || response.status === 503 ? "quota_429" : "http_error";
-        console.error(
-          `[day-reorg] Gemini HTTP ${response.status} (${response.statusText}): ${bodyText.slice(0, 500)} (degrade: ${reason})`,
-        );
-        outcome = reason;
-        return { ok: false, reason };
-      }
-      const data = (await response.json()) as {
-        candidates?: Array<{
-          content?: { parts?: Array<{ text?: unknown }> };
-          /** "STOP" | "MAX_TOKENS" | … — distinguishes a truncation from a bad model. */
-          finishReason?: string;
-        }>;
-        error?: { message?: unknown };
-        usageMetadata?: unknown;
-      };
-      usage = readGeminiUsage(data?.usageMetadata);
-      if (data?.error) {
-        console.error(
-          `[day-reorg] Gemini error payload: ${String(data.error.message ?? "unknown")} (degrade: http_error)`,
-        );
-        outcome = "http_error";
-        return { ok: false, reason: "http_error" };
-      }
-      const finishReason = data?.candidates?.[0]?.finishReason;
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (typeof text !== "string" || text.trim().length === 0) {
-        // `MAX_TOKENS` is a BUDGET failure, not a bad model: a reasoning model
-        // spends `maxOutputTokens` on its thinking tokens first, so a tight
-        // ceiling returns an empty or truncated part. It used to be logged as
-        // a generic invalid_output, which hid the cause across 14 of 49 live
-        // missions.
-        console.error(
-          finishReason === "MAX_TOKENS"
-            ? `[day-reorg] Gemini hit maxOutputTokens before emitting JSON — raise the budget (degrade: invalid_output)`
-            : `[day-reorg] Gemini response carried no text part (finishReason=${String(
-                finishReason ?? "none",
-              )}) (degrade: invalid_output)`,
-        );
-        outcome = "invalid_output";
-        return { ok: false, reason: "invalid_output" };
-      }
-      outcome = "text_received";
-      return { ok: true, text };
-    } catch (error) {
-      const aborted = error instanceof Error && error.name === "AbortError";
-      const reason: GeminiDegradeReason = aborted ? "timeout" : "exception";
-      console.error(
-        `[day-reorg] Gemini call failed${aborted ? " (timeout)" : ""} (degrade: ${reason}):`,
-        error,
-      );
-      outcome = reason;
-      return { ok: false, reason };
-    } finally {
-      emitGeminiUsage(this.onUsage, {
-        model,
-        durationMs: Math.max(0, Date.now() - startedAt),
-        maxOutputTokens: 2400,
-        outcome,
-        usage,
-      });
-    }
-  }
-}
-
-// --------------------------------------------------------------- json parsing
-
-/** Tolerant JSON extraction: strips code fences, then parses; null on junk. */
-function parseReorgJson(raw: string): unknown {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = (fenced ? fenced[1] : raw).trim();
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    // Last chance: the model wrapped the payload in prose — try the outermost
-    // balanced braces.
-    const start = candidate.indexOf("{");
-    const end = candidate.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      try {
-        return JSON.parse(candidate.slice(start, end + 1));
-      } catch {
-        return null;
-      }
-    }
-    return null;
   }
 }

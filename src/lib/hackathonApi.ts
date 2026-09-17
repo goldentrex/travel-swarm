@@ -166,9 +166,20 @@ import {
   probeAtlasReachable,
   probeHotelReachable,
 } from "./swarmReachability";
-import { applySettlementToContent, loadSwarmTrip, settlePlanOnTrip } from "./swarmTripContext";
+import {
+  applySettlementToContent,
+  checkInDateLabel,
+  loadSwarmTrip,
+  settlePlanOnTrip,
+} from "./swarmTripContext";
 import type { SettlementEffects, SettlementFollowUp } from "./swarmTripContext";
-import { AIRPORTS, arrivalBuffer, classifyItem } from "@/core/sanity";
+import {
+  AIRPORTS,
+  SemanticCritic,
+  arrivalBuffer,
+  classifyItem,
+  unstayedNights,
+} from "@/core/sanity";
 import { checkTripAccess, resolveSwarmActor, USER_TOKEN_HEADER } from "./swarmAuth";
 import { buildBookingPreview, type PreviewLineRequest } from "./swarmBookingPreview";
 import { hotelQuotaNote } from "@/providers/rapidapi/hotelQuota";
@@ -1264,6 +1275,22 @@ function buildSwarmOrchestrator(
           ...(flags?.geminiRetry ? { maxRetries: GEMINI_QUOTA_RETRIES } : {}),
         })
       : null;
+  // The semantic critic reviews each candidate's re-planned day for real-world
+  // absurdity (a shut shrine, a bed reached a day before the plane) between
+  // candidate selection and the plans the traveller reads. It shares the
+  // mission's Gemini budget with the reorganizer and degrades to the pure
+  // rules on its own — so it is wired on the resolve rail only, where the
+  // network is allowed, and is simply never asked on assess.
+  const semanticCritic = flags?.dayReorg
+    ? new SemanticCritic({
+        callBudget: GEMINI_CALLS_PER_MISSION,
+        sharedBudget: flags?.geminiBudget,
+        ...(flags?.usageResolutionId
+          ? { onUsage: geminiUsageLogger(flags.usageResolutionId, "activity") }
+          : {}),
+        ...(flags?.geminiRetry ? { maxRetries: GEMINI_QUOTA_RETRIES } : {}),
+      })
+    : null;
   if (!options.fareRule) {
     // Honest wording: this is a PLACEHOLDER, and it is replaced the moment the
     // provider publishes a rule for the fare actually being quoted (see the
@@ -1305,6 +1332,7 @@ function buildSwarmOrchestrator(
     weatherProvider,
     eventProvider,
     dayReorganizer,
+    semanticCritic,
   );
   return { orchestrator, graph, fareRule };
 }
@@ -2145,13 +2173,22 @@ function mirrorOperationalHotels(
     if (mirrored.some((entry) => entry.hotel_name === name)) continue;
     if (action.action !== "late_check_in" && action.action !== "rebook") continue;
     const checkInMs = action.newCheckIn ? Date.parse(action.newCheckIn) : Number.NaN;
+    // The BOOKED check-in, so a shift onto a later date can be named as one.
+    // Stating only the hour ("check-in moves to 19:15") reads as tonight even
+    // when the replacement lands tomorrow — the traveller approved a lost
+    // night without ever being told there was one.
+    const bookedMs = hydrated.nodeRefs[action.nodeId]?.time ?? Number.NaN;
+    const nightsLost = unstayedNights(bookedMs, checkInMs);
     mirrored.push({
       hotel_name: name,
       action: action.action,
       fee: 0,
+      ...(nightsLost > 0 ? { nights_unstayed: nightsLost } : {}),
       note:
         action.action === "late_check_in" && Number.isFinite(checkInMs)
-          ? `Check-in moves to ${new Date(checkInMs).toISOString().slice(11, 16)} to match your new arrival.`
+          ? nightsLost > 0
+            ? `Check-in moves to ${checkInDateLabel(checkInMs)} at ${new Date(checkInMs).toISOString().slice(11, 16)} — your new flight lands the next day, so ${nightsLost === 1 ? "the night" : `${nightsLost} nights`} from ${checkInDateLabel(bookedMs)} will not be used.`
+            : `Check-in moves to ${new Date(checkInMs).toISOString().slice(11, 16)} to match your new arrival.`
           : action.note,
     });
   }
@@ -2879,6 +2916,31 @@ async function runMultiResolution(
         allReorgProposals.length > 0 ? allReorgProposals : outcome.activityProposals,
         pushTrace,
       );
+
+      // The semantic critic, in the session trace: which rail ruled, and every
+      // absurdity it pruned. A degraded critic says so rather than going
+      // quiet — an operator reading the trace must be able to tell "the model
+      // found nothing" from "the model was never asked".
+      for (const verdict of orchestrator.lastCriticVerdicts) {
+        if (verdict.degradeReason !== undefined) {
+          pushTrace(
+            "critic",
+            "gemini_degraded",
+            `semantic critic degraded (${verdict.degradeReason}) — deterministic sanity rules only`,
+          );
+        }
+        if (verdict.criticisms.length === 0) {
+          pushTrace("critic", "verdict", `plan passed the ${verdict.source} sanity review`);
+          continue;
+        }
+        for (const criticism of verdict.criticisms) {
+          pushTrace(
+            "critic",
+            criticism.issue_type.toLowerCase(),
+            `${criticism.node_id}: ${criticism.explanation} → ${criticism.suggested_action}`,
+          );
+        }
+      }
 
       // Per-plan enrichment: match each plan's new_flight back to the
       // rebooking candidate it selected (drives the presentation ledger

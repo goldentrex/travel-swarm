@@ -24,23 +24,16 @@
 
 import {
   configuredGeminiModel,
-  emitGeminiUsage,
-  readGeminiUsage,
-  type GeminiUsageEvent,
   type GeminiUsageObserver,
   type GeminiCallBudget,
 } from "../geminiUsage";
-import {
-  GEMINI_MODEL_CASCADE,
-  modelLadder,
-  noteModelExhausted,
-  noteModelHealthy,
-} from "@/agents/geminiCascade";
+import { GEMINI_MODEL_CASCADE } from "@/agents/geminiCascade";
 import {
   GEMINI_CALLS_PER_MISSION,
   type GeminiCallResult,
   type GeminiDegradeReason,
 } from "../geminiDegrade";
+import { GeminiJsonClient } from "@/agents/geminiJsonClient";
 
 /** One selectable answer option of a trade-off question (frozen contract). */
 export interface TradeoffOption {
@@ -1543,24 +1536,13 @@ const CONSTRAINTS_RESPONSE_SCHEMA = {
 };
 
 export class GeminiLiaisonAgent {
-  private readonly apiKey: string | undefined;
-  private readonly timeoutMs: number;
-  private model: string;
-  private readonly fetchImpl: typeof fetch;
+  /** The shared schema-constrained transport (see geminiJsonClient.ts). */
+  private readonly client: GeminiJsonClient;
   private readonly constraintRouting: "model" | "deterministic_known";
   private constraintRoute: "model" | "deterministic" = "model";
   get lastConstraintRoute(): "model" | "deterministic" {
     return this.constraintRoute;
   }
-  private readonly onUsage: GeminiUsageObserver | undefined;
-  private readonly sharedBudget: GeminiCallBudget | undefined;
-  private readonly maxRetries: number;
-  private readonly retryDelayMs: number;
-  private readonly callBudget: number;
-
-  /** Task 21 — per-instance Gemini calls consumed this mission
-   *  (same counter pattern as ActivityAgent.viatorConsultsUsed). */
-  private geminiCallsUsedCount = 0;
   /** Task 21 — classify of the most recent degrade (undefined = none yet). */
   private degradeReason: GeminiDegradeReason | undefined;
 
@@ -1571,27 +1553,21 @@ export class GeminiLiaisonAgent {
       process.env.SWARM_CONSTRAINT_ROUTING === "deterministic_known"
         ? "deterministic_known"
         : "model");
-    this.apiKey =
-      config.apiKey !== undefined && config.apiKey.length > 0
-        ? config.apiKey
-        : typeof process !== "undefined" && typeof process.env?.GEMINI_API_KEY === "string"
-          ? process.env.GEMINI_API_KEY
-          : undefined;
-    this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.model = config.model ?? configuredGeminiModel("liaison", DEFAULT_MODEL);
-    this.onUsage = config.onUsage;
-    this.sharedBudget = config.sharedBudget;
-    this.maxRetries = Math.max(0, Math.floor(config.maxRetries ?? 0));
-    this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-    this.callBudget = config.callBudget ?? GEMINI_CALLS_PER_MISSION;
-    // Workers' `fetch` is brand-checked against its receiver: storing the
-    // bare function on `this.fetchImpl` and later calling it as
-    // `this.fetchImpl(...)` invokes it with `this` = the agent instance, and
-    // Cloudflare's runtime rejects that as "Illegal invocation" — silently,
-    // since `callGemini` catches it and degrades to the deterministic
-    // fallback. `.bind(globalThis)` pins the receiver Workers expects, the
-    // same fix Cloudflare's own docs give for this exact error class.
-    this.fetchImpl = config.fetchImpl ?? fetch.bind(globalThis);
+    this.client = new GeminiJsonClient({
+      label: "liaison",
+      ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
+      model: config.model ?? configuredGeminiModel("liaison", DEFAULT_MODEL),
+      timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      ...(config.fetchImpl ? { fetchImpl: config.fetchImpl } : {}),
+      ...(config.onUsage ? { onUsage: config.onUsage } : {}),
+      ...(config.sharedBudget ? { sharedBudget: config.sharedBudget } : {}),
+      maxRetries: Math.max(0, Math.floor(config.maxRetries ?? 0)),
+      retryDelayMs: config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
+      callBudget: config.callBudget ?? GEMINI_CALLS_PER_MISSION,
+      // The budget gate is the one classification site inside the transport
+      // the agent cannot see for itself — it skips the call before any HTTP.
+      onDegrade: (reason, message) => this.degrade(reason, message),
+    });
   }
 
   /** Task 21 (additive): WHY the agent last degraded — undefined when it
@@ -1603,7 +1579,12 @@ export class GeminiLiaisonAgent {
   /** Task 21 (additive): Gemini calls consumed so far this mission
    *  (test/audit feed, mirrors ActivityAgent.viatorConsultsUsed). */
   get geminiCallsUsed(): number {
-    return this.geminiCallsUsedCount;
+    return this.client.callsUsed;
+  }
+
+  /** Is an API key configured at all? (`!this.apiKey` at the old call sites.) */
+  private get apiKey(): string | undefined {
+    return this.client.apiKey;
   }
 
   /** Record a degrade (classification site) and keep console.error honest. */
@@ -1761,17 +1742,14 @@ export class GeminiLiaisonAgent {
   }
 
   /**
-   * ONE Gemini exchange, budget-gated and deadline-bounded, classified via the
-   * shared {@link GeminiDegradeReason} taxonomy (Task 21). Budget gate →
-   * primary attempt → at most `maxRetries` retries on a `quota_429` classify
-   * (429/503), backoff included. Never throws; failures are logged.
+   * ONE Gemini exchange through the shared transport
+   * ({@link GeminiJsonClient}): budget gate → laddered attempts, each with
+   * its own deadline → classification through the frozen
+   * {@link GeminiDegradeReason} taxonomy. Never throws.
    *
-   * Each attempt gets its OWN deadline. They used to share one: a saturated
-   * primary that sat on the request for most of the window left the retry with
-   * no time, so a live 503 degraded as `timeout` and the traveler silently got
-   * the deterministic derivation. The retry also targets a DIFFERENT model —
-   * `quota_429` means this model has no capacity, so re-asking it is asking
-   * the same saturated pool.
+   * Only the agent-level bookkeeping stays here — the transport itself is
+   * shared with the day reorganizer and the semantic critic, so a lesson
+   * learned about Gemini is learned once.
    */
   private async callGemini(
     systemInstruction: string,
@@ -1780,187 +1758,14 @@ export class GeminiLiaisonAgent {
     temperature: number,
     maxOutputTokens: number,
   ): Promise<GeminiCallResult> {
-    // Per-mission budget gate (same pattern as ActivityAgent's
-    // viatorConsultsUsed): exhaustion skips the call and classifies as the
-    // closest taxonomy value — `quota_429` (the union stays frozen at 6).
-    if (this.geminiCallsUsedCount >= this.callBudget) {
-      this.degrade(
-        "quota_429",
-        `Gemini call skipped — per-mission budget exhausted (${this.callBudget} calls)`,
-      );
-      return { ok: false, reason: "quota_429" };
-    }
-
-    /** One attempt against `model`, with a deadline of its own. */
-    let budgetExhausted = false;
-    const attempt = async (model: string): Promise<GeminiCallResult> => {
-      // Recheck AFTER any retry backoff: another concurrent day can consume
-      // the last slot while this call is waiting. Reserve before the next await.
-      if (
-        this.geminiCallsUsedCount >= this.callBudget ||
-        (this.sharedBudget && !this.sharedBudget.tryReserve())
-      ) {
-        budgetExhausted = true;
-        this.degradeReason = "quota_429";
-        return { ok: false, reason: "quota_429" };
-      }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      try {
-        this.geminiCallsUsedCount += 1;
-        return await this.callGeminiOnce(
-          systemInstruction,
-          userPrompt,
-          responseSchema,
-          temperature,
-          maxOutputTokens,
-          controller.signal,
-          model,
-        );
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
-    // Walk the ladder: the most capable model first, then tiers that are still
-    // within quota. The ladder moves down on any failure that is about the
-    // MODEL rather than about us: a capacity answer (429/503), or a plain HTTP
-    // failure. It used to move only on 429/503, on the reasoning that anything
-    // else "is this request's own problem and a different model would repeat
-    // it" — the live matrix of 2026-09-01 disproved that: 8 of 9 degradations
-    // were `http_error` and none of them ever asked a second model. A request
-    // that really is malformed fails on every rung and still lands on the
-    // deterministic rail, so being wrong here costs one extra call.
-    const ladder = modelLadder(this.model);
-    let result = await attempt(ladder[0]);
-    if (result.ok) noteModelHealthy(ladder[0]);
-
-    let rung = 0;
-    while (
-      !result.ok &&
-      !budgetExhausted &&
-      (result.reason === "quota_429" || result.reason === "http_error") &&
-      rung < this.maxRetries &&
-      rung + 1 < ladder.length &&
-      this.geminiCallsUsedCount < this.callBudget
-    ) {
-      // Only a QUOTA refusal earns a cooldown — a one-off 500 must not
-      // sideline a healthy model for minutes afterwards.
-      if (result.reason === "quota_429") noteModelExhausted(ladder[rung]);
-      rung += 1;
-      await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
-      console.warn(
-        `[liaison] ${ladder[rung - 1]} failed (${result.reason}) — trying ${ladder[rung]}`,
-      );
-      result = await attempt(ladder[rung]);
-      if (result.ok) noteModelHealthy(ladder[rung]);
-    }
-    if (!result.ok) {
-      if (!budgetExhausted && result.reason === "quota_429") noteModelExhausted(ladder[rung]);
-      this.degradeReason = result.reason;
-    }
+    const result = await this.client.requestJson({
+      systemInstruction,
+      userPrompt,
+      responseSchema,
+      temperature,
+      maxOutputTokens,
+    });
+    if (!result.ok) this.degradeReason = result.reason;
     return result;
-  }
-
-  /** ONE fetch attempt with the full degrade taxonomy classification. */
-  private async callGeminiOnce(
-    systemInstruction: string,
-    userPrompt: string,
-    responseSchema: unknown,
-    temperature: number,
-    maxOutputTokens: number,
-    signal: AbortSignal,
-    /** Defaults to the primary; the overload retry passes the lighter tier. */
-    model: string = this.model,
-  ): Promise<GeminiCallResult> {
-    const startedAt = Date.now();
-    let usage: GeminiUsageEvent["usage"] = null;
-    let outcome: GeminiUsageEvent["outcome"] = "exception";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
-    try {
-      const response = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            responseSchema,
-            temperature,
-            maxOutputTokens,
-            thinkingConfig: { thinkingLevel: "low" },
-          },
-        }),
-      });
-      if (!response.ok) {
-        // The body carries the ACTUAL rejection reason (bad schema field,
-        // quota, model id) — status + statusText alone made every failure
-        // mode here indistinguishable in the logs.
-        const bodyText = await response.text().catch(() => "");
-        const reason: GeminiDegradeReason =
-          response.status === 429 || response.status === 503 ? "quota_429" : "http_error";
-        console.error(
-          `[liaison] Gemini HTTP ${response.status} (${response.statusText}): ${bodyText.slice(0, 500)} (degrade: ${reason})`,
-        );
-        outcome = reason;
-        return { ok: false, reason };
-      }
-      const data = (await response.json()) as {
-        candidates?: Array<{
-          content?: { parts?: Array<{ text?: unknown }> };
-          /** "STOP" | "MAX_TOKENS" | … — distinguishes a truncation from a bad model. */
-          finishReason?: string;
-        }>;
-        error?: { message?: unknown };
-        usageMetadata?: unknown;
-      };
-      usage = readGeminiUsage(data?.usageMetadata);
-      if (data?.error) {
-        console.error(
-          `[liaison] Gemini error payload: ${String(data.error.message ?? "unknown")} (degrade: http_error)`,
-        );
-        outcome = "http_error";
-        return { ok: false, reason: "http_error" };
-      }
-      const finishReason = data?.candidates?.[0]?.finishReason;
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (typeof text !== "string" || text.trim().length === 0) {
-        // `MAX_TOKENS` is a BUDGET failure, not a bad model: a reasoning model
-        // spends `maxOutputTokens` on its thinking tokens first, so a tight
-        // ceiling returns an empty or truncated part. It used to be logged as
-        // a generic invalid_output, which hid the cause across 14 of 49 live
-        // missions.
-        console.error(
-          finishReason === "MAX_TOKENS"
-            ? `[liaison] Gemini hit maxOutputTokens before emitting JSON — raise the budget (degrade: invalid_output)`
-            : `[liaison] Gemini response carried no text part (finishReason=${String(
-                finishReason ?? "none",
-              )}) (degrade: invalid_output)`,
-        );
-        outcome = "invalid_output";
-        return { ok: false, reason: "invalid_output" };
-      }
-      outcome = "text_received";
-      return { ok: true, text };
-    } catch (error) {
-      const aborted = error instanceof Error && error.name === "AbortError";
-      const reason: GeminiDegradeReason = aborted ? "timeout" : "exception";
-      console.error(
-        `[liaison] Gemini call failed${aborted ? " (timeout)" : ""} (degrade: ${reason}):`,
-        error,
-      );
-      outcome = reason;
-      return { ok: false, reason };
-    } finally {
-      emitGeminiUsage(this.onUsage, {
-        model,
-        durationMs: Math.max(0, Date.now() - startedAt),
-        maxOutputTokens: maxOutputTokens,
-        outcome,
-        usage,
-      });
-    }
   }
 }

@@ -131,6 +131,14 @@ export interface HotelAdjustment {
   fee: number;
   /** NEW (additive) — best alternative room, feeds the presentation layer. */
   alternative?: HotelAlternative;
+  /**
+   * NEW (additive) — booked nights the traveller will NOT use, because the
+   * replacement flight lands on a later date. Disclosure only: it carries no
+   * money (the property's terms for an unused night are unknown to us, and
+   * inventing them would break the ledger's honesty rule), and the traveller
+   * gets a `confirm_unused_night` follow-up to settle it with the hotel.
+   */
+  nights_unstayed?: number;
 }
 
 /**
@@ -496,7 +504,9 @@ function isHotelAdjustment(value: unknown): value is HotelAdjustment {
     value.fee >= 0 &&
     (value.requires_confirmation === undefined || typeof value.requires_confirmation === "boolean") &&
     (value.note === undefined || typeof value.note === "string") &&
-    (value.alternative === undefined || isHotelAlternative(value.alternative))
+    (value.alternative === undefined || isHotelAlternative(value.alternative)) &&
+    (value.nights_unstayed === undefined ||
+      (isFiniteNumber(value.nights_unstayed) && value.nights_unstayed >= 0))
   );
 }
 

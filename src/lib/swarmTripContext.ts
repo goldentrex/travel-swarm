@@ -34,6 +34,7 @@ import {
   isSensibleStart,
   minutesOfDay,
   placeDisplacedItem,
+  unstayedNights,
 } from "@/core/sanity";
 
 // -------------------------------------------------------------------- types
@@ -97,7 +98,14 @@ export interface SettlementEffects {
 }
 
 export interface SettlementFollowUp {
-  kind: "book_replacement_flight" | "retime_pickup_with_provider" | "claim_refund";
+  kind:
+    | "book_replacement_flight"
+    | "retime_pickup_with_provider"
+    | "claim_refund"
+    /** A booked night the traveller will not use, because they now land the
+     *  next day. We do not know the property's terms for it and will not
+     *  invent them — the traveller is told to ask, and no money moves. */
+    | "confirm_unused_night";
   /** One sentence the traveller can act on. */
   message: string;
 }
@@ -880,13 +888,65 @@ export function hotelChangeLabel(name: string): string {
   return `Hotel ${trimmed}`;
 }
 
-/** A hotel action in words: "late check-in at 21:20", not "late_check_in". */
-export function hotelActionPhrase(action: string, newCheckInMs?: number): string {
+/**
+ * Is there ANOTHER day of the trip already holding a room at `label` for
+ * `date`? A stay is filed one row per night, and its own `check_in` wins over
+ * the day it sits under (real trips carry both), so the comparison is against
+ * the row's effective date rather than its day's.
+ */
+function staysOnDate(
+  itinerary: unknown[],
+  label: string,
+  date: string,
+  exceptDayIndex: number,
+): boolean {
+  for (let dayIndex = 0; dayIndex < itinerary.length; dayIndex += 1) {
+    if (dayIndex === exceptDayIndex) continue;
+    const day = asRecord(itinerary[dayIndex]);
+    const items = Array.isArray(day?.items) ? (day.items as unknown[]) : [];
+    const dayDate = asString(day?.date);
+    for (const raw of items) {
+      const entry = asRecord(raw);
+      if (!entry || asString(entry.type) !== "stay") continue;
+      if (textOf(entry.title) !== label) continue;
+      if ((asString(entry.check_in) ?? dayDate) === date) return true;
+    }
+  }
+  return false;
+}
+
+/** "Fri 6 Nov", the date part of a check-in that moved off its booked day. */
+export function checkInDateLabel(ms: number): string {
+  return new Date(ms).toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    timeZone: "UTC",
+  });
+}
+
+/**
+ * A hotel action in words: "late check-in at 21:20", not "late_check_in".
+ *
+ * When the replacement flight lands on a LATER DATE, the time alone is a lie
+ * by omission — "check-in moves to 19:15" reads as tonight. `bookedCheckInMs`
+ * turns it into "check-in moves to Fri 6 Nov at 19:15", which is the fact the
+ * traveller needs to understand that the night before is gone.
+ */
+export function hotelActionPhrase(
+  action: string,
+  newCheckInMs?: number,
+  bookedCheckInMs?: number,
+): string {
   switch (action) {
-    case "late_check_in":
-      return newCheckInMs !== undefined && Number.isFinite(newCheckInMs)
-        ? `late check-in at ${hhmmOf(newCheckInMs)}`
-        : "late check-in";
+    case "late_check_in": {
+      if (newCheckInMs === undefined || !Number.isFinite(newCheckInMs)) return "late check-in";
+      const nights =
+        bookedCheckInMs !== undefined ? unstayedNights(bookedCheckInMs, newCheckInMs) : 0;
+      return nights > 0
+        ? `check-in moves to ${checkInDateLabel(newCheckInMs)} at ${hhmmOf(newCheckInMs)}`
+        : `late check-in at ${hhmmOf(newCheckInMs)}`;
+    }
     case "rebook":
       return "room needs rebooking";
     case "none":
@@ -1156,7 +1216,28 @@ export function applySettlementToContent(
     settledItemKeys.add(`${ref.dayIndex}:${ref.itemIndex}`);
 
     const shiftedCheckInMs = action.newCheckIn ? Date.parse(action.newCheckIn) : Number.NaN;
-    if (action.newCheckIn) {
+    // What the traveller actually booked — the anchor a lost night is counted
+    // from. `ref.time` is the hydrated check-in; the stored `check_in` date is
+    // the fallback when the node was never given an hour.
+    const bookedCheckInMs = Number.isFinite(ref.time)
+      ? ref.time
+      : Date.parse(`${asString(item.check_in) ?? ""}T00:00:00.000Z`);
+    // A check-in pushed onto a LATER NIGHT is a booked night nobody will sleep
+    // in. It is recorded on the stay, stated as its own change line, and
+    // handed to the traveller as a follow-up — never quietly folded into a
+    // time change, and never turned into money we have no right to promise.
+    const nightsLost = unstayedNights(bookedCheckInMs, shiftedCheckInMs);
+    // Does the trip ALREADY hold a room for the night the traveller now
+    // arrives on? A multi-night stay is one row per night, so re-dating the
+    // first row forward would put two rows on the same night and the timeline
+    // would show the room twice — the "phantom" day-one card. When the later
+    // night is already covered, the first row keeps its own date and is marked
+    // unused instead of being moved on top of its own successor.
+    const successorCoversTheNight =
+      nightsLost > 0 &&
+      Number.isFinite(shiftedCheckInMs) &&
+      staysOnDate(itinerary, ref.label, isoDateOf(shiftedCheckInMs), ref.dayIndex);
+    if (action.newCheckIn && !successorCoversTheNight) {
       const shiftedMs = shiftedCheckInMs;
       if (Number.isFinite(shiftedMs)) {
         item.check_in = isoDateOf(shiftedMs);
@@ -1167,7 +1248,23 @@ export function applySettlementToContent(
         item.time = hhmmOf(shiftedMs);
       }
     }
-    const phrase = hotelActionPhrase(action.action, shiftedCheckInMs);
+    if (nightsLost > 0) {
+      // The row stands for a night that will not be slept in. The journey
+      // views read this to render it as unused rather than as a booking the
+      // traveller still has to honour.
+      item.unstayed = true;
+      item.nights_unstayed = nightsLost;
+      item.unstayed_from = isoDateOf(bookedCheckInMs);
+      const nightWord = nightsLost === 1 ? "night" : "nights";
+      changes.push(
+        `${hotelChangeLabel(ref.label)}: ${nightsLost} booked ${nightWord} from ${checkInDateLabel(bookedCheckInMs)} will not be used — you now land on ${checkInDateLabel(shiftedCheckInMs)}.`,
+      );
+      followUps.push({
+        kind: "confirm_unused_night",
+        message: `You arrive a day later, so ${nightsLost} ${nightWord} at ${hotelChangeLabel(ref.label)} from ${checkInDateLabel(bookedCheckInMs)} goes unused — ask the property whether it can be released or credited before you travel.`,
+      });
+    }
+    const phrase = hotelActionPhrase(action.action, shiftedCheckInMs, bookedCheckInMs);
     const note = `Swarm settlement (${phrase}): ${action.note || plan.incident}`;
     // Idempotent append (clarity pass): a repeated settlement of the same
     // plan (same booking code / note) never duplicates the swarm_note.

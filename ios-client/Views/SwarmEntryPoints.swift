@@ -112,15 +112,31 @@ struct SwarmTripAttachment: ViewModifier {
     /// True while the trip's content has not decoded yet.
     var contentPending: Bool
 
-    var onApply: ([String: Any]) -> Bool
+    /// Adopts a settled trip (show + cache + rev). Returns false when the
+    /// payload cannot be decoded.
+    var onApplySettlement: ([String: Any], Int?) -> Bool
     var onRefreshNeeded: () -> Void
-    var onNoteRev: () -> Void
     var onConsumeBookingRequest: () -> Void
 
     func body(content view: Content) -> some View {
         view
             .environment(\.isSwarmActive, model.glowActive)
-            .onAppear { onConsumeBookingRequest() }
+            // Wired with the trip screen, not with the sheet: a settlement can
+            // close after the sheet is dismissed (the status poll keeps
+            // running), and it must still land on this timeline.
+            .onAppear {
+                wireSettlement()
+                onConsumeBookingRequest()
+            }
+            #if DEBUG
+            .onReceive(NotificationCenter.default.publisher(for: .swarmHarnessSettlement)) { note in
+                guard let data = note.object as? Data,
+                      let receipt = try? JSONDecoder().decode(SwarmService.ApproveResponse.self, from: data)
+                else { return }
+                wireSettlement()
+                model.debugApplySettlementReceipt(receipt)
+            }
+            #endif
             .onChange(of: bookingRequested) { onConsumeBookingRequest() }
             .onChange(of: contentPending) { onConsumeBookingRequest() }
             .task { model.startMonitoring(tripId: tripId) }
@@ -133,22 +149,31 @@ struct SwarmTripAttachment: ViewModifier {
                        content: content,
                        tripId: tripId,
                        rawContent: rawContent) { updated in
-            _ = onApply(updated)
+            _ = onApplySettlement(updated, nil)
         }
-        .onAppear {
-            model.onTripUpdated = { updated in
-                // A settled payload we cannot decode must never leave the
-                // timeline silently stale: the worker's CAS write already
-                // landed, so re-read it from the server instead.
-                guard onApply(updated) else {
-                    onRefreshNeeded()
-                    return
-                }
-                onNoteRev()
-            }
-            // Settlement reported trip_updated but returned no content — one
-            // network refresh picks the write up.
-            model.onTripRefreshNeeded = onRefreshNeeded
+        .onAppear { wireSettlement() }
+    }
+
+    private func wireSettlement() {
+        let model = model
+        let apply = onApplySettlement
+        let refresh = onRefreshNeeded
+        model.onTripUpdated = { updated in
+            // A settled payload we cannot decode must never leave the timeline
+            // silently stale: the Worker's CAS write already landed, so re-read
+            // it from the server instead.
+            if !apply(updated, model.lastSettlement?.contentRev) { refresh() }
         }
+        // Settlement reported trip_updated but returned no content — one
+        // network refresh picks the write up.
+        model.onTripRefreshNeeded = refresh
     }
 }
+
+#if DEBUG
+extension Notification.Name {
+    /// Screenshot harness: carries an encoded approve receipt to feed through
+    /// the real settlement path of the trip screen that is on display.
+    static let swarmHarnessSettlement = Notification.Name("swarm.harness.settlement")
+}
+#endif

@@ -68,9 +68,9 @@ function parseTimeoutMs(raw: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
-function resolveEnvConfig(): PredictHQProviderConfig {
+function resolveEnvConfig(explicitToken?: string): PredictHQProviderConfig {
   const env = typeof process !== "undefined" ? process.env : undefined;
-  const apiToken = env?.PREDICTHQ_API_TOKEN;
+  const apiToken = explicitToken ?? env?.PREDICTHQ_API_TOKEN;
   if (!apiToken) {
     throw new Error(
       "PredictHQProvider: PREDICTHQ_API_TOKEN is not set. Check predictHQConfigured() before constructing the provider to degrade gracefully.",
@@ -99,7 +99,7 @@ export class PredictHQProvider implements EventDisruptionContextProvider {
   private readonly config: PredictHQProviderConfig;
 
   constructor(config?: Partial<PredictHQProviderConfig>) {
-    const fromEnv = resolveEnvConfig();
+    const fromEnv = resolveEnvConfig(config?.apiToken);
     const explicitTimeout = config?.timeoutMs;
     const timeoutMs =
       explicitTimeout !== undefined && Number.isFinite(explicitTimeout) && explicitTimeout > 0

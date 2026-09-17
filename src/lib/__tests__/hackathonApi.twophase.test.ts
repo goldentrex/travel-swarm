@@ -354,16 +354,16 @@ describe("POST /mission/resolve — phase 2 (sync rail)", () => {
     expect(typeof body.message).toBe("string");
   });
 
-  it("a session already past gathering_preferences → 400 invalid_resolution_id", async () => {
+  it("replaying identical choices returns the existing proposal", async () => {
     const { assess, resolveResponse } = await assessThenResolve([]);
-    await resolveResponse.json();
+    const original = await resolveResponse.json();
 
     const replay = await handleHackathonRequest(
       post("mission/resolve", { resolution_id: assess.resolution_id, answers: [] }),
     );
-    expect(replay.status).toBe(400);
-    const body = (await replay.json()) as { error: string };
-    expect(body.error).toBe("invalid_resolution_id");
+    expect(replay.status).toBe(200);
+    const body = await replay.json();
+    expect(body.plans).toEqual(original.plans);
   });
 });
 
@@ -736,5 +736,115 @@ describe("Gemini liveness — resolve rail (Task 21)", () => {
     );
     expect(row).toBeDefined();
     expect(row!.detail).toContain("quota_429");
+  });
+});
+
+describe("resolve operation identity", () => {
+  it("concurrent identical submissions schedule only one continuation", async () => {
+    const assessed = await handleHackathonRequest(
+      post("mission/assess", { intent: "reroute TP437 by 4h", tripId: REAL_TRIP_UUID }),
+    );
+    const { resolution_id } = await assessed.json();
+    const pending: Promise<unknown>[] = [];
+    const ctx: HackathonContext = {
+      waitUntil(promise) {
+        pending.push(promise);
+      },
+    };
+    const responses = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        handleHackathonRequest(post("mission/resolve", { resolution_id, answers: [] }), ctx),
+      ),
+    );
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200, 200, 200]);
+    expect(pending).toHaveLength(1);
+    await Promise.all(pending);
+    expect(store.__sessions.get(resolution_id)?.state).toBe("proposal_ready");
+  });
+  it("rejects changed choices on an existing operation", async () => {
+    const { assess } = await assessThenResolve([]);
+    const response = await handleHackathonRequest(
+      post("mission/resolve", {
+        resolution_id: assess.resolution_id,
+        answers: [{ question_id: "budget_cap", option_id: "changed" }],
+      }),
+    );
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toBe("resolution_input_conflict");
+  });
+  it("a synchronous resolve cannot overwrite cancellation during translation", async () => {
+    const assessed = await handleHackathonRequest(
+      post("mission/assess", { intent: "reroute TP437 by 4h", tripId: REAL_TRIP_UUID }),
+    );
+    const { resolution_id } = await assessed.json();
+    const original = GeminiLiaisonAgent.prototype.translateAnswersToConstraints;
+    const spy = vi
+      .spyOn(GeminiLiaisonAgent.prototype, "translateAnswersToConstraints")
+      .mockImplementationOnce(async function (this: GeminiLiaisonAgent, questions, answers) {
+        await store.cancelSwarmSession(resolution_id);
+        return original.call(this, questions, answers);
+      });
+    try {
+      const response = await handleHackathonRequest(
+        post("mission/resolve", { resolution_id, answers: [] }),
+      );
+      expect(response.status).toBe(409);
+      expect(store.__sessions.get(resolution_id)?.state).toBe("expired");
+      expect(store.__sessions.get(resolution_id)?.plans).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("settlement response recovery", () => {
+  it("replays a receipt without booking again and exposes it after quote expiry", async () => {
+    const { AtlasFlightProvider } = await import("@/providers/atlas/AtlasFlightProvider");
+    const book = vi.spyOn(AtlasFlightProvider.prototype, "bookFlight");
+    try {
+      const { assess } = await assessThenResolve([]);
+      const approve = () =>
+        handleHackathonRequest(
+          post("approve-resolution", {
+            resolutionId: assess.resolution_id,
+            approved: true,
+            planIndex: 0,
+          }),
+        );
+      const first = await approve();
+      expect(first.status).toBe(200);
+      const original = await first.json();
+      store.__sessions.get(assess.resolution_id)!.expires_at = new Date(
+        Date.now() - 1000,
+      ).toISOString();
+      const repeated = await approve();
+      expect(repeated.status).toBe(200);
+      expect((await repeated.json()).booking).toEqual(original.booking);
+      expect(book).toHaveBeenCalledTimes(1);
+      const status = await handleHackathonRequest(get(`swarm-status/${assess.resolution_id}`));
+      expect(status.status).toBe(200);
+      expect((await status.json()).receipt.booking).toEqual(original.booking);
+    } finally {
+      book.mockRestore();
+    }
+  });
+  it("does not accept a different plan after approval", async () => {
+    const { assess } = await assessThenResolve([]);
+    await handleHackathonRequest(
+      post("approve-resolution", {
+        resolutionId: assess.resolution_id,
+        approved: true,
+        planIndex: 0,
+      }),
+    );
+    const changed = await handleHackathonRequest(
+      post("approve-resolution", {
+        resolutionId: assess.resolution_id,
+        approved: true,
+        planIndex: 1,
+      }),
+    );
+    expect(changed.status).toBe(409);
+    expect((await changed.json()).error).toBe("approval_input_conflict");
   });
 });

@@ -168,13 +168,23 @@ export interface FakeSwarmSessionStore {
   saveSwarmSessionIfState(
     input: Record<string, unknown>,
     allowedStates?: readonly string[],
+    requireLiveExisting?: boolean,
   ): Promise<boolean>;
   getSwarmSession(id: string): Promise<FakeSessionRecord | null>;
   getSwarmSessionIgnoringExpiry(
     id: string,
   ): Promise<{ record: FakeSessionRecord } | { error: string } | null>;
   cancelSwarmSession(id: string): Promise<Record<string, unknown>>;
-  claimSwarmSessionForBooking(id: string): Promise<FakeSessionRecord | null>;
+  claimSwarmSessionForResolve(
+    id: string,
+    candidates?: unknown,
+  ): Promise<{ claimed: boolean; error?: string }>;
+  claimSwarmSessionForBooking(id: string, candidates?: unknown): Promise<FakeSessionRecord | null>;
+  settlementOperation(record: FakeSessionRecord): unknown;
+  saveSwarmSettlementReceipt(
+    entry: FakeSessionRecord,
+    receipt: Record<string, unknown>,
+  ): Promise<boolean>;
   markSwarmSessionSettled(id: string): Promise<void>;
   updateSwarmSession(id: string, patch: Record<string, unknown>): Promise<boolean>;
   listSwarmAlerts(): Promise<never[]>;
@@ -252,8 +262,11 @@ export function makeSwarmSessionStoreMock(
     async saveSwarmSessionIfState(
       input: Record<string, unknown>,
       allowedStates: readonly string[] = ["processing", "gathering_preferences"],
+      requireLiveExisting = false,
     ): Promise<boolean> {
       const existing = sessions.get(input.id as string);
+      if (requireLiveExisting && (!existing || existing.expires_at <= new Date().toISOString()))
+        return false;
       if (existing && !allowedStates.includes(existing.state)) return false;
       sessions.set(input.id as string, {
         id: input.id as string,
@@ -293,14 +306,48 @@ export function makeSwarmSessionStoreMock(
       record.state = "expired";
       return { cancelled: true, state: "expired" };
     },
-    async claimSwarmSessionForBooking(id: string): Promise<FakeSessionRecord | null> {
+    async claimSwarmSessionForResolve(id: string, candidates?: unknown) {
+      const record = sessions.get(id);
+      if (
+        !record ||
+        record.state !== "gathering_preferences" ||
+        record.expires_at <= new Date().toISOString()
+      ) {
+        return { claimed: false };
+      }
+      record.state = "processing";
+      if (candidates !== undefined) record.candidates = candidates;
+      return { claimed: true };
+    },
+    async claimSwarmSessionForBooking(
+      id: string,
+      candidates?: unknown,
+    ): Promise<FakeSessionRecord | null> {
       const record = sessions.get(id);
       if (!record || (record.state !== "proposal_ready" && record.state !== "awaiting_approval")) {
         return null;
       }
       if (record.expires_at <= new Date().toISOString()) return null;
       record.state = "approved";
+      if (candidates !== undefined) record.candidates = candidates;
       return record;
+    },
+    settlementOperation(record: FakeSessionRecord) {
+      return (
+        (record.candidates as { settlement_operation?: unknown } | undefined)
+          ?.settlement_operation ?? null
+      );
+    },
+    async saveSwarmSettlementReceipt(entry: FakeSessionRecord, receipt: Record<string, unknown>) {
+      const record = sessions.get(entry.id);
+      if (!record || record.state !== "approved") return false;
+      const candidates = entry.candidates as Record<string, unknown>;
+      record.candidates = {
+        ...candidates,
+        settlement_operation: { ...(candidates.settlement_operation as object), receipt },
+      };
+      record.state = "settled";
+      return true;
     },
     async markSwarmSessionSettled(id: string): Promise<void> {
       const record = sessions.get(id);
@@ -433,6 +480,8 @@ export function makeSwarmTripContextMock(
         // Deterministic stand-in for the post-write content_rev (the real
         // DB trigger bumps the rev; the RETURNING clause returns it).
         contentRev: 2,
+        // Mirrors the real settlePlanOnTrip: itemized follow-ups ride along.
+        followUps: result.followUps,
       };
     },
   };

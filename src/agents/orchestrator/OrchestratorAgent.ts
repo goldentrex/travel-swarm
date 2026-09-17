@@ -37,14 +37,14 @@ import type {
   HotelCheckInNode,
   ItineraryNode,
 } from "@/core/dag";
-import { ItineraryGraph, evaluateTripConsequence } from "@/core/dag";
+import { ItineraryGraph } from "@/core/dag";
+import { arrivalBuffer, classifyItem, describeDropReason, isSensibleStart, minutesOfDay } from "@/core/sanity";
 import type {
   FlightAgent,
   FlightRebookingAssessment,
   NoReplacementReason,
   RebookingCandidate,
 } from "@/agents/flight/FlightAgent";
-import { MAX_REBOOKING_WINDOW_HOURS } from "@/agents/flight/FlightAgent";
 import type { FlightOption, FlightRouteContext } from "@/providers/interfaces/types";
 import type {
   WeatherContextProvider,
@@ -395,6 +395,22 @@ export function noReplacementHeadline(reason: NoReplacementReason | undefined): 
   }
 }
 
+/**
+ * Collapse the provider's pricing basis into the three things a traveller
+ * needs told apart: a provider-verified fare, a search price nobody re-checked,
+ * and an estimate nobody sold.
+ */
+export function fareBasisOf(candidate: RebookingCandidate): "verified" | "search_reference" | "synthetic_estimate" {
+  if (
+    candidate.fareDifference.basis === "synthetic_estimate" ||
+    candidate.option.inventorySource === "synthetic_recovery"
+  ) {
+    return "synthetic_estimate";
+  }
+  if (candidate.fareDifference.basis === "search_reference") return "search_reference";
+  return "verified";
+}
+
 export function nonDominatedCandidates(candidates: RebookingCandidate[]): RebookingCandidate[] {
   return candidates.filter((b) => {
     const chargeB = candidateNetCharge(b);
@@ -710,49 +726,11 @@ export class OrchestratorAgent {
     );
     trace.push(...filterNotes);
 
-    // ── Coherence gate: does the traveller still HAVE a trip on arrival? ───
-    //
-    // A departure ceiling stops the absurd cases; this catches the ones inside
-    // it that are still not solutions. If a replacement lands after everything
-    // left in the itinerary, the traveller would fly out to a holiday that has
-    // already finished. That is not a cheaper plan, it is a different (empty)
-    // trip, and offering it as a rebooking is the failure this whole pass
-    // exists to end.
-    //
-    // Deliberately NOT covered by the "never offer nothing" rule that governs
-    // max_price: when every candidate lands too late, the honest output is the
-    // flight-less plan the degraded rail already produces — it says plainly
-    // that no replacement was found and the trip needs replanning.
-    const disruptedNodeId = pipeline.source?.id;
-    const disruptedDepartureMs =
-      pipeline.source && pipeline.source.type === "flight"
-        ? pipeline.source.scheduledTime
-        : undefined;
-    let candidates = constrained;
-    if (disruptedDepartureMs !== undefined && constrained.length > 0) {
-      const survivors = constrained.filter((candidate) => {
-        const arrivalMs = Date.parse(candidate.option.arrivalTime);
-        if (!Number.isFinite(arrivalMs)) return true;
-        // `pipeline.baseline`, NOT the live graph: by this point the live
-        // graph has already absorbed a propagation, and a previous candidate's
-        // simulation has re-timed the hotel to match ITS late arrival. Asking
-        // the mutated graph what a late arrival costs gets the answer "nothing"
-        // — it has already moved the trip to fit.
-        return !evaluateTripConsequence(
-          pipeline.baseline,
-          arrivalMs,
-          disruptedDepartureMs,
-          disruptedNodeId,
-        ).arrivesAfterTripEnds;
-      });
-      const dropped = constrained.length - survivors.length;
-      if (dropped > 0) {
-        trace.push(
-          `dropped ${dropped} replacement${dropped > 1 ? "s" : ""} landing after the rest of the trip is over`,
-        );
-      }
-      candidates = survivors;
-    }
+    // Continuous-reflow policy: arrival time never vetoes a real flight. The
+    // per-candidate rederive below moves or drops downstream activities and
+    // protects hotel check-in around the selected arrival, even when that
+    // means rebuilding the remainder of the trip.
+    const candidates = constrained;
 
     // ── Plan selection (W1 per-candidate carousel) ────────────────────────
     const originalArrivalLocation =
@@ -1106,13 +1084,14 @@ export class OrchestratorAgent {
         // (already-spent) date — route APIs only sell future-dated seats, so
         // "I missed my flight" intents anchor the search on the next calendar
         // day (UTC). Future departures keep their own date.
-        const departureIsPast = source.departureTime < Date.now();
-        const nextDayUtc = (() => {
-          const now = new Date();
-          return new Date(
-            Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1),
-          ).toISOString();
-        })();
+        // Use the untouched booked departure for this decision. `source` has
+        // already been shifted by handleDisruption above, so a large nominal
+        // delay can otherwise make a departed flight look future-dated.
+        const nowMs = Date.now();
+        const originalDepartureMs =
+          originalDepartureTime !== undefined ? originalDepartureTime : source.departureTime;
+        const departureIsPast = originalDepartureMs < nowMs;
+        const futureRecoveryAnchor = new Date(nowMs + 2 * 3600_000).toISOString();
         // ROOT CAUSE (found live, reproduced against real Atlas): `newTime` is
         // `source.departureTime` AFTER `handleDisruption` already shifted it
         // forward by the mission's delay — a "missed flight" mission with no
@@ -1132,17 +1111,23 @@ export class OrchestratorAgent {
           originalDepartureTime !== undefined
             ? new Date(originalDepartureTime).toISOString()
             : newTime;
-        let earliestDepartureIso = originalDepartureIso;
+        // Historical/demo fixtures are searched on a sellable future date.
+        // Their eligibility window MUST move with that search anchor: keeping
+        // the floor/ceiling on the stale itinerary date guarantees that every
+        // real provider result is classified as "too late". For a genuinely
+        // upcoming trip, preserve the booked departure as the anchor.
+        const recoveryAnchorIso = departureIsPast ? futureRecoveryAnchor : originalDepartureIso;
+        let earliestDepartureIso = recoveryAnchorIso;
         if (constraints?.min_departure_delay_hours !== undefined) {
-          const delayMs = Date.now() + constraints.min_departure_delay_hours * 3600_000;
-          const originalMs = Date.parse(originalDepartureIso);
-          earliestDepartureIso = new Date(Math.max(delayMs, originalMs)).toISOString();
+          const delayMs = nowMs + constraints.min_departure_delay_hours * 3600_000;
+          const recoveryAnchorMs = Date.parse(recoveryAnchorIso);
+          earliestDepartureIso = new Date(Math.max(delayMs, recoveryAnchorMs)).toISOString();
         }
 
         const routeContext: FlightRouteContext = {
           origin: source.origin,
           destination: source.destination,
-          departureDate: departureIsPast ? nextDayUtc : newTime,
+          departureDate: departureIsPast ? futureRecoveryAnchor : newTime,
           // Additive booking facts from hydration: party size + the leg's
           // known fare feed the true fare-delta math inside the provider
           // (absent fields ⇒ the provider quotes the full verified re-price).
@@ -1161,34 +1146,19 @@ export class OrchestratorAgent {
             : event.tripContext?.currency !== undefined
               ? { currency: event.tripContext.currency }
               : {}),
-          // Keep the traveller in the cabin they booked — searching economy
-          // for a business ticket is a downgrade, and prices the delta
-          // against the wrong product.
-          ...(source.cabin !== undefined ? { cabin: source.cabin } : {}),
+          // Cabin is intentionally not forwarded for disruption recovery.
+          // Atlas's LCC inventory often has no RBD/cabin metadata; pinning the
+          // original cabin can erase every viable replacement.
           // Never offer the disrupted departure back as its own replacement —
           // anchored on the flight's TRUE original departure (see above).
           excludeFlight: {
             flightNumber: source.flightNumber,
             departureTime: originalDepartureIso,
           },
-          // Nothing at or before the ORIGINAL departure is ever a usable
-          // replacement, in ANY disruption flavor: whatever triggered this
-          // search, the itinerary as booked is already compromised, so an
-          // option that would have needed to leave earlier than (or exactly
-          // when) the traveler's own flight offers nothing. Unconditional —
-          // it no longer depends on classifying "missed" vs. "delayed", which
-          // is what let this floor go silently unset for the explicit-node
-          // mission path.
+          // Nothing at or before the recovery anchor is usable. For a future
+          // trip this is the original departure; for a historical/demo fixture
+          // it is the sellable future date sent to the provider.
           earliestDeparture: earliestDepartureIso,
-          // …and the CEILING, measured from the departure that was lost. The
-          // floor alone let a rebooking land arbitrarily far in the future:
-          // the first real user test produced a replacement FIVE DAYS after the
-          // flight the traveller missed, as the leading plan, because it was
-          // the cheapest option that happened to depart "after" the original.
-          // Past this horizon the honest answer is that no rebooking works.
-          latestDeparture: new Date(
-            Date.parse(originalDepartureIso) + MAX_REBOOKING_WINDOW_HOURS * 3600_000,
-          ).toISOString(),
         };
         // Null-guard (clarity pass): missions wired without a flight agent
         // (non-flight missions running live without Atlas) skip the call and
@@ -1678,6 +1648,8 @@ export class OrchestratorAgent {
       const bestAlternative = assessment.alternativeRooms[0];
       adjustments.push({
         hotel_name: hotelNode.hotelName,
+        ...(assessment.degraded ? { requires_confirmation: true } : {}),
+        ...(assessment.note ? { note: assessment.note } : {}),
         action:
           assessment.recommendation === "keep_late_checkin"
             ? "late_check_in"
@@ -1728,7 +1700,74 @@ export class OrchestratorAgent {
    * buildProposedResolution/buildFinancialDelta path, and zero-cost
    * (non-flight) sources keep `net_payable` consistent.
    */
+  /**
+   * Every activity proposal passes the common-sense invariants before any plan
+   * is built from it — the ONE choke point shared by the main pipeline and
+   * every per-plan rederive, so no carousel page can carry a slot the others
+   * would have refused.
+   *
+   * A retime into sleeping hours, past the item's sensible window (a 13:00
+   * lunch at 21:20), or before the traveller can physically be in town becomes
+   * an honest drop, keeping the SAME penalty and rationale so the ledger is
+   * untouched. Swaps are left alone: their price delta is already folded into
+   * the ledger, and a weather swap keeps its own slot by design.
+   */
   private async proposeActivityRescheduling(
+    disruption: DisruptionResult,
+    event: DisruptionEvent,
+    constraints?: ResolutionConstraints,
+    newArrivalIso?: string,
+    graph: ItineraryGraph = this.graph,
+  ): Promise<ActivityRescheduleProposal[]> {
+    const proposals = await this.proposeActivityReschedulingUnchecked(
+      disruption,
+      event,
+      constraints,
+      newArrivalIso,
+      graph,
+    );
+    if (proposals.length === 0) return proposals;
+
+    const source = graph.getNode(disruption.sourceNodeId);
+    const arrivalMs = newArrivalIso ? Date.parse(newArrivalIso) : Number.NaN;
+    const readyInCityMs =
+      Number.isFinite(arrivalMs) && source && source.type === "flight"
+        ? arrivalMs + arrivalBuffer(source.origin, source.destination).readyInCityMinutes * 60_000
+        : undefined;
+    const originalMsOf = new Map(
+      disruption.affected.map((report) => [report.nodeId, report.previousScheduledTime]),
+    );
+
+    return proposals.map((proposal) => {
+      if (proposal.action !== "reschedule") return proposal;
+      const node = graph.getNode(proposal.activityNodeId);
+      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
+      const proposedMs = Date.parse(proposal.newTime);
+      if (!Number.isFinite(proposedMs)) return proposal;
+      const originalMs = originalMsOf.get(proposal.activityNodeId) ?? proposedMs;
+      const atMs = readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
+      const verdict = isSensibleStart(
+        classifyItem({ type: "activity", title: name }),
+        name,
+        atMs,
+        minutesOfDay(originalMs),
+      );
+      if (!verdict.ok) {
+        return {
+          ...proposal,
+          action: "drop" as const,
+          // Frozen shape: a drop keeps the original slot as its newTime.
+          newTime: new Date(originalMs).toISOString(),
+          rationale: `Cancelled — ${describeDropReason(verdict.reason)}.${
+            proposal.rationale ? ` ${proposal.rationale}` : ""
+          }`,
+        };
+      }
+      return atMs === proposedMs ? proposal : { ...proposal, newTime: new Date(atMs).toISOString() };
+    });
+  }
+
+  private async proposeActivityReschedulingUnchecked(
     disruption: DisruptionResult,
     event: DisruptionEvent,
     /** W2 (additive): liaison constraints — `activity_priority`/`notes`
@@ -1766,11 +1805,22 @@ export class OrchestratorAgent {
         ];
       });
 
-    // W2: whether the impact surface produced ANY timing-disrupted activity
-    // BEFORE the day reorganizer (below) may consume them — the proactive
-    // synthesis block must gate on the ORIGINAL state so a reorg that eats
-    // every request never silently triggers proactive synthesis.
-    const hadInitialRequests = requests.length > 0;
+    // Bug fix (disrupted activity itself silently unresolved): `disruption.affected`
+    // — the source of `requests` above — only ever lists DOWNSTREAM nodes;
+    // `ItineraryGraph.handleDisruption` excludes the disrupted node itself
+    // (see its docs). So a direct activity cancellation whose node ALSO has an
+    // in-graph dependent (a later same-day activity) produced a real request
+    // for that dependent — making `requests` non-empty — while the cancelled
+    // activity itself never got a request synthesized below, because the old
+    // gate ("only synthesize when NOTHING else was requested") treated the
+    // sibling's request as proof the direct target was already handled. Live
+    // symptom: "Activity cancelled — Lau Pa Sat" produced a plan that only
+    // mentioned Night Safari (a downstream reschedule) and said nothing about
+    // Lau Pa Sat at all. The correct gate is per-node: only skip synthesis
+    // when THIS node specifically already has a request, not when the day had
+    // any requests at all.
+    const targetAlreadyRequested = (nodeId: string): boolean =>
+      requests.some((request) => request.activityNodeId === nodeId);
 
     const isActivityCancellation =
       event.origin === "reactive" && classifyDisruptionKind(event.description) === "cancellation";
@@ -1824,7 +1874,7 @@ export class OrchestratorAgent {
     const isProactiveUserReport =
       event.origin === "proactive" && event.evidence?.kind === "user_report";
     if (
-      !hadInitialRequests &&
+      !targetAlreadyRequested(event.nodeId) &&
       ((event.origin === "proactive" && event.evidence?.kind === "weather") ||
         isActivityCancellation ||
         isProactiveUserReport)
@@ -1862,11 +1912,24 @@ export class OrchestratorAgent {
     // swap-first indoor replacement behaviour. Those requests stay on the
     // legacy rail; the DayReorganizer remains the rail for timing-driven
     // (missed-flight / delay) multi-activity days.
+    //
+    // Bug fix (direct activity cancellation silently dropped): a cancelled
+    // activity's synthesized request (above) asks for a slot 24-48h LATER —
+    // a different day than `originalTime`. The DayReorganizer only resequences
+    // ONE calendar day, so bucketing this request by `originalTime`'s date put
+    // it in a same-day reorg it structurally cannot satisfy; the model had no
+    // in-window slot to offer it, emitted no decision for it, and the item was
+    // left silently unchanged in the itinerary — the traveler who reported it
+    // cancelled saw a plan that talked about a DIFFERENT activity and never
+    // mentioned the one they asked about. A cross-day window request goes to
+    // the legacy per-item rail instead, which searches its own real window.
     if (this.dayReorganizer) {
       const byDay = new Map<string, ActivityRescheduleRequest[]>();
       const legacyRequests: ActivityRescheduleRequest[] = [];
       for (const request of requests) {
-        if (request.weatherHint === "rain" || request.weatherHint === "storm") {
+        const isCrossDayWindow =
+          request.windowStart.slice(0, 10) !== request.originalTime.slice(0, 10);
+        if (request.weatherHint === "rain" || request.weatherHint === "storm" || isCrossDayWindow) {
           legacyRequests.push(request);
           continue;
         }
@@ -2038,6 +2101,9 @@ export class OrchestratorAgent {
             // number, so the settled recap can render "Vueling 8243 · …"
             // instead of the opaque provider routing identifier.
             flight_number: best.option.flightNumber,
+            // How the price was established — the approval sheet badges an
+            // estimate, and the settlement never books one.
+            fare_basis: fareBasisOf(best),
             // Additive comparison facts: emitted only when the provider
             // described the segments, so the card never claims "Non-stop"
             // about a routing it could not read.

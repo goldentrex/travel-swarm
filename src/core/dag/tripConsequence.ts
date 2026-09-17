@@ -167,26 +167,41 @@ function labelOf(node: ItineraryNode): string {
  * One sentence a traveller can act on, or null when a plan costs them nothing.
  *
  * Deliberately concrete: "you lose 2 nights and 4 activities" is a decision,
- * "some itinerary items are affected" is not.
+ * "some itinerary items are affected" is not. Meals and airport transfers are
+ * named separately when the caller has told them apart — a traveller reading
+ * "1 activity" did not learn that the pickup they pre-booked is now waiting at
+ * the wrong hour.
  */
-export function describeTripConsequence(consequence: TripConsequence): string | null {
-  if (consequence.lost.length === 0) return null;
+export function describeTripConsequence(
+  consequence: TripConsequence & { mealsLost?: number; transfersLost?: number },
+): string | null {
+  if (consequence.lost.length === 0 && !consequence.transfersLost) return null;
   if (consequence.arrivesAfterTripEnds) {
     return "This lands after everything left in your trip — there would be nothing to arrive for.";
   }
+  const plural = (n: number, one: string, many: string) => `${n} ${n > 1 ? many : one}`;
   const parts: string[] = [];
-  if (consequence.nightsLost > 0) {
-    parts.push(`${consequence.nightsLost} night${consequence.nightsLost > 1 ? "s" : ""}`);
-  }
+  if (consequence.nightsLost > 0) parts.push(plural(consequence.nightsLost, "night", "nights"));
   if (consequence.activitiesLost > 0) {
-    parts.push(
-      `${consequence.activitiesLost} activit${consequence.activitiesLost > 1 ? "ies" : "y"}`,
-    );
+    parts.push(plural(consequence.activitiesLost, "activity", "activities"));
   }
-  if (parts.length === 0) return null;
+  if ((consequence.mealsLost ?? 0) > 0) parts.push(plural(consequence.mealsLost ?? 0, "meal", "meals"));
+
+  const joined =
+    parts.length <= 1 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  const transfers = consequence.transfersLost ?? 0;
+  const transferSentence =
+    transfers > 0
+      ? transfers === 1
+        ? "Your airport transfer has to be re-timed."
+        : `${transfers} transfers have to be re-timed.`
+      : "";
+
+  if (parts.length === 0) return transferSentence || null;
   const dayPrefix =
     consequence.daysLost >= 1
       ? `You arrive ${consequence.daysLost} day${consequence.daysLost > 1 ? "s" : ""} late: `
       : "You lose ";
-  return `${dayPrefix}${parts.join(" and ")} you had planned.`;
+  const lossSentence = `${dayPrefix}${joined} you had planned.`;
+  return transferSentence ? `${lossSentence} ${transferSentence}` : lossSentence;
 }

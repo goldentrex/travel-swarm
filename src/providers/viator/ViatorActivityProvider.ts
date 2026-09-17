@@ -251,7 +251,8 @@ export class ViatorActivityProvider implements ActivityProvider {
         const results =
           isRecord(body) && isRecord(body.products) && Array.isArray(body.products.results)
             ? body.products.results
-            : [];
+            : null;
+        if (!results) return empty;
         const options = results
           .map((raw): ActivityOption | null => this.mapPartnerProduct(raw, query.currency ?? "USD"))
           .filter((option): option is ActivityOption => option !== null);

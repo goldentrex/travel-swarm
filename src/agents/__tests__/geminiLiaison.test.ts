@@ -692,6 +692,37 @@ describe("buildPreferenceTradeoffs — W1 preference builder (primary rail)", ()
     }
   });
 
+  it("a stop candidate CHEAPER than the fare already paid nets a refund — never renders a negative price", () => {
+    // The stop routing's fareDifference is a REFUND (the traveller gets
+    // money back, not a charge) — `net` is therefore negative internally.
+    // Regression for a live bug: the detail string read "from $-43.09".
+    const feed = [
+      flightCandidate({ id: "D1", amount: 25.96, departure: "2026-08-22T15:30:00Z" }),
+      {
+        option: {
+          id: "S1",
+          airline: "VietJet Air",
+          departureTime: "2026-08-22T13:00:00Z",
+          arrivalTime: "2026-08-22T19:00:00Z",
+          stops: 1,
+        },
+        fareDifference: {
+          oldFlightId: "flight-xy123",
+          newFlightId: "S1",
+          amount: 43.09,
+          currency: "USD",
+          direction: "refund",
+        },
+      },
+    ];
+    const questions = buildPreferenceTradeoffs(feed);
+    const stops = questions.find((q) => q.id === "flight-stops")!;
+    const withStop = stops.options.find((o) => o.id === "cheaper_with_stop")!;
+    expect(withStop.detail).not.toContain("-43.09");
+    expect(withStop.detail).not.toContain("$-");
+    expect(withStop.detail).toContain("refunds $43.09");
+  });
+
   it("builds the cross-date question when a later day undercuts the same day", () => {
     const feed = [
       flightCandidate({ id: "T1", amount: 110, departure: "2026-08-22T15:30:00Z" }),

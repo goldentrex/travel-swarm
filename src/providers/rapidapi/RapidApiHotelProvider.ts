@@ -120,15 +120,19 @@ export function rapidApiHotelConfigured(): boolean {
   // few credits left should be silenceable without deleting it from the
   // environment — pulling the key makes every other check read as
   // misconfiguration, which is a different (and misleading) state.
-  const disabled = String(env?.HOTEL_PROVIDER_DISABLED ?? "").trim().toLowerCase();
+  const disabled = String(env?.HOTEL_PROVIDER_DISABLED ?? "")
+    .trim()
+    .toLowerCase();
   if (disabled === "1" || disabled === "true" || disabled === "on") return false;
   return Boolean(env?.RAPIDAPI_KEY && env?.RAPIDAPI_HOST);
 }
 
-function resolveEnvConfig(): RapidApiHotelProviderConfig {
+function resolveEnvConfig(
+  config?: Partial<RapidApiHotelProviderConfig>,
+): RapidApiHotelProviderConfig {
   const env = typeof process !== "undefined" ? process.env : undefined;
-  const apiKey = env?.RAPIDAPI_KEY;
-  const host = env?.RAPIDAPI_HOST;
+  const apiKey = config?.apiKey ?? env?.RAPIDAPI_KEY;
+  const host = config?.host ?? env?.RAPIDAPI_HOST;
   if (!apiKey || !host) {
     throw new Error(
       "RapidApiHotelProvider: RAPIDAPI_KEY and RAPIDAPI_HOST must be set. " +
@@ -145,7 +149,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function asFiniteNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value.replace(/[^\d.-]/g, ""));
+    const numeric = value.replace(/[^\d.-]/g, "");
+    if (!/^-?\d+(?:\.\d+)?$/.test(numeric)) return null;
+    const parsed = Number(numeric);
     if (Number.isFinite(parsed)) return parsed;
   }
   return null;
@@ -178,7 +184,7 @@ export class RapidApiHotelProvider implements HotelProvider {
   private readonly config: RapidApiHotelProviderConfig;
 
   constructor(config?: Partial<RapidApiHotelProviderConfig>) {
-    const fromEnv = resolveEnvConfig();
+    const fromEnv = resolveEnvConfig(config);
     const explicitTimeout = config?.timeoutMs;
     const timeoutMs =
       explicitTimeout !== undefined && Number.isFinite(explicitTimeout) && explicitTimeout > 0
@@ -206,16 +212,21 @@ export class RapidApiHotelProvider implements HotelProvider {
       `/v1/hotels/search-by-coordinates?${searchParams(hotel, toBookingDate(checkIn), checkOut, guests, "USD")}`,
     );
 
-    // Tolerant policy extraction: the Booking.com RapidAPI surface exposes
-    // cancellation terms in varying shapes per property; we walk the payload
-    // for the fields we need and fall back to conservative defaults (late
-    // check-in accepted, fee 0) when the property publishes nothing.
-    const found = collectPolicyFields(body);
+    // Policies must belong to the requested property, not the first nearby
+    // search result. Missing terms are unknown, never free/accepted defaults.
+    const results = Array.isArray(body) ? body : isRecord(body)
+      ? (Array.isArray(body.result) ? body.result : Array.isArray(body.results) ? body.results : []) : [];
+    const property = results.find(raw => isRecord(raw) && String(raw.hotel_id) === hotel.hotelId);
+    const found = collectPolicyFields(property);
+    if (found.lateCheckIn === undefined || found.cancellationFee === undefined || found.currency === undefined) {
+      throw new RapidApiError({ kind: "invalid_response", code: "hotel_policy_unverified",
+        message: "The requested hotel's late-arrival and cancellation terms could not be verified." });
+    }
     return {
       hotelName: hotel.name,
-      lateCheckInAvailable: found.lateCheckIn ?? true,
-      cancellationFee: found.cancellationFee ?? 0,
-      currency: found.currency ?? "USD",
+      lateCheckInAvailable: found.lateCheckIn,
+      cancellationFee: found.cancellationFee,
+      currency: found.currency,
       freeCancellationUntil: found.freeCancellationUntil,
     };
   }
@@ -237,13 +248,18 @@ export class RapidApiHotelProvider implements HotelProvider {
         ? body.result
         : isRecord(body) && Array.isArray(body.results)
           ? body.results
-          : [];
+          : null;
+    if (!rawResults)
+      throw new RapidApiError({
+        kind: "invalid_response",
+        message: "Hotel search returned no recognized result array.",
+      });
     const rooms: HotelRoomOption[] = [];
     for (const raw of rawResults) {
       if (!isRecord(raw)) continue;
       const priceBreakdown = isRecord(raw.price_breakdown) ? raw.price_breakdown : null;
       const rate = asFiniteNumber(raw.min_total_price ?? priceBreakdown?.gross_price);
-      if (rate === null) continue;
+      if (rate === null || rate < 0) continue;
       const name = typeof raw.hotel_name === "string" ? raw.hotel_name : query.hotelName;
       // Additive media (best-effort): Booking.com payloads expose property
       // photos under varying keys — collect up to 4 unique URLs.
@@ -454,6 +470,7 @@ function collectPolicyFields(body: unknown, depth = 0): PolicyFields {
   }
 
   const record = body as Record<string, unknown>;
+  if (typeof record.late_check_in_available === "boolean") found.lateCheckIn = record.late_check_in_available;
   if (typeof record.free_cancellation_until === "string") {
     found.freeCancellationUntil = toIso(record.free_cancellation_until);
   }
@@ -481,5 +498,5 @@ function mergePolicyFields(target: PolicyFields, source: PolicyFields): void {
 }
 
 function isComplete(found: PolicyFields): boolean {
-  return found.cancellationFee !== undefined && found.freeCancellationUntil !== undefined;
+  return found.lateCheckIn !== undefined && found.cancellationFee !== undefined && found.currency !== undefined;
 }

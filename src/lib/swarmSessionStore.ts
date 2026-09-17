@@ -19,7 +19,7 @@
  * `null` / `false` so `handleHackathonRequest` can keep its JSON-only,
  * never-throw contract.
  *
- * One-shot approval semantics (exactly-once booking) are enforced by an
+ * One-shot approval claims are enforced by an
  * atomic conditional state transition
  * (`proposal_ready|awaiting_approval → approved`, guarded by `expires_at`);
  * a replayed or concurrent approve finds no matching row and gets `null`.
@@ -371,6 +371,7 @@ export async function saveSwarmSession(input: NewSwarmSession): Promise<boolean>
 export async function saveSwarmSessionIfState(
   input: NewSwarmSession,
   allowedStates: readonly SwarmSessionState[] = ["processing", "gathering_preferences"],
+  requireLiveExisting = false,
 ): Promise<boolean> {
   try {
     const record = buildRecord(input);
@@ -378,12 +379,13 @@ export async function saveSwarmSessionIfState(
     if (client) {
       let matched = false;
       try {
-        const { data, error } = await client
+        let query = client
           .from("swarm_sessions")
           .update(dbPayload(record))
           .eq("id", input.id)
-          .in("state", [...allowedStates])
-          .select("id");
+          .in("state", [...allowedStates]);
+        if (requireLiveExisting) query = query.gt("expires_at", new Date().toISOString());
+        const { data, error } = await query.select("id");
         if (error) {
           console.warn(`[swarm-store] guarded save failed (${error.message}); refusing`);
           return false;
@@ -398,6 +400,8 @@ export async function saveSwarmSessionIfState(
         memoryPut(record); // keep the fast path aligned with the DB tier
         return true;
       }
+
+      if (requireLiveExisting) return false;
 
       // 0 rows: terminal/cancelled row OR no row at all — probe which.
       const { data: raw, error: readError } = await client
@@ -425,6 +429,8 @@ export async function saveSwarmSessionIfState(
 
     // Supabase absent (dev, memory-only): same allowed-state check in-process.
     const memory = memorySessions.get(input.id);
+    if (requireLiveExisting && (!memory || memory.record.expires_at <= new Date().toISOString()))
+      return false;
     if (memory && !allowedStates.includes(memory.record.state)) return false;
     memoryPut(buildRecord(input));
     return true;
@@ -565,8 +571,96 @@ export async function getSwarmSessionIgnoringExpiry(
   return lookupSwarmSession(id, { ignoreExpiry: true });
 }
 
+/** Atomically start resolve. A configured database must never fall back to a
+ * stale memory claim on failure. The resolution id is the operation identity. */
+export async function claimSwarmSessionForResolve(
+  id: string,
+  candidates?: unknown,
+): Promise<{ claimed: boolean; error?: string }> {
+  try {
+    const now = new Date().toISOString();
+    const client = tryGetAdminClient();
+    if (client) {
+      const { data, error } = await client
+        .from("swarm_sessions")
+        .update({ state: "processing", ...(candidates !== undefined ? { candidates } : {}) })
+        .eq("id", id)
+        .eq("state", "gathering_preferences")
+        .gt("expires_at", now)
+        .select("id");
+      if (error) return { claimed: false, error: "session_store_unavailable" };
+      const claimed = Array.isArray(data) && data.length === 1;
+      // Invalidate even on a lost claim: another instance may have won.
+      memorySessions.delete(id);
+      return { claimed };
+    }
+    const record = memorySessions.get(id)?.record;
+    if (!record || record.state !== "gathering_preferences" || record.expires_at <= now) {
+      return { claimed: false };
+    }
+    record.state = "processing";
+    if (candidates !== undefined) record.candidates = candidates;
+    return { claimed: true };
+  } catch {
+    return { claimed: false, error: "session_store_unavailable" };
+  }
+}
+
+export interface SwarmSettlementOperation {
+  operation_id: string;
+  plan_index: number;
+  started_at: string;
+  receipt?: Record<string, unknown>;
+}
+
+export function settlementOperation(record: SwarmSessionRecord): SwarmSettlementOperation | null {
+  const candidates = record.candidates;
+  if (!candidates || typeof candidates !== "object") return null;
+  const value = (candidates as Record<string, unknown>).settlement_operation;
+  if (!value || typeof value !== "object") return null;
+  const operation = value as SwarmSettlementOperation;
+  return typeof operation.operation_id === "string" && Number.isInteger(operation.plan_index)
+    ? operation
+    : null;
+}
+
+/** Persist the receipt and terminal state together, before acknowledging success.
+ * Never fall back to a stale memory record when the database is configured. */
+export async function saveSwarmSettlementReceipt(
+  entry: SwarmSessionRecord,
+  receipt: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    const operation = settlementOperation(entry);
+    if (!operation) return false;
+    const candidates = {
+      ...(entry.candidates as Record<string, unknown>),
+      settlement_operation: { ...operation, receipt },
+    };
+    const client = tryGetAdminClient();
+    if (client) {
+      const { data, error } = await client
+        .from("swarm_sessions")
+        .update({ state: "settled", candidates })
+        .eq("id", entry.id)
+        .eq("state", "approved")
+        .select("id");
+      if (error || !Array.isArray(data) || data.length !== 1) return false;
+      memorySessions.delete(entry.id);
+      return true;
+    }
+    const memory = memorySessions.get(entry.id)?.record;
+    if (!memory || memory.state !== "approved") return false;
+    memory.candidates = candidates;
+    memory.state = "settled";
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * One-shot claim for booking (exactly-once). Atomically transitions
+ * One-shot approval claim. Atomically transitions
  * `proposal_ready`/`awaiting_approval` → `approved` on a non-expired row.
  *
  * - Supabase configured & reachable ⇒ the conditional UPDATE is the gate; an
@@ -579,7 +673,10 @@ export async function getSwarmSessionIgnoringExpiry(
  * - Supabase absent (dev, memory-only) ⇒ the memory tier applies the same
  *   conditional transition in-process.
  */
-export async function claimSwarmSessionForBooking(id: string): Promise<SwarmSessionRecord | null> {
+export async function claimSwarmSessionForBooking(
+  id: string,
+  candidates?: unknown,
+): Promise<SwarmSessionRecord | null> {
   try {
     const nowIso = new Date().toISOString();
     const claimableStates: SwarmSessionState[] = ["proposal_ready", "awaiting_approval"];
@@ -589,7 +686,7 @@ export async function claimSwarmSessionForBooking(id: string): Promise<SwarmSess
       try {
         const { data, error } = await client
           .from("swarm_sessions")
-          .update({ state: "approved" })
+          .update({ state: "approved", ...(candidates !== undefined ? { candidates } : {}) })
           .eq("id", id)
           .in("state", claimableStates)
           .gt("expires_at", nowIso)
@@ -615,6 +712,7 @@ export async function claimSwarmSessionForBooking(id: string): Promise<SwarmSess
     const record = memory.record;
     if (record.expires_at <= nowIso || !claimableStates.includes(record.state)) return null;
     record.state = "approved";
+    if (candidates !== undefined) record.candidates = candidates;
     return cloneRecord(record);
   } catch (error) {
     console.warn("[swarm-store] claimSwarmSessionForBooking failed:", error);

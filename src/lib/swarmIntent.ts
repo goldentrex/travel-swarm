@@ -256,7 +256,15 @@ export function parseMissionIntentForTrip(
   const { nodeRefs, meta } = hydrated;
   const shortIntent = truncate(text);
 
-  // ── Explicit node: validate, then classify for delay/origin only ─────────
+  // ── Explicit node: validate, then classify the SAME way the keyword ──────
+  // branches below do — an explicit node means "don't re-pick a target",
+  // never "skip classification". This used to hardcode `kind: "delay"` for
+  // everything non-weather, which silently broke every category-gated
+  // behaviour for the scenario tiles (they ALL pass an explicit nodeId):
+  // `allowsActivityDrops`, `hotelOverbooked`, and (via the orchestrator's own
+  // text-sniffed classifier) a cancelled activity's OWN resolution. Live
+  // symptom: "Activity cancelled — Lau Pa Sat" produced a plan that only
+  // mentioned a downstream sibling and said nothing about Lau Pa Sat itself.
   if (explicitNodeId) {
     const ref = nodeRefs[explicitNodeId];
     if (!ref) {
@@ -269,15 +277,50 @@ export function parseMissionIntentForTrip(
     }
     const weather = WEATHER_INTENT_PATTERN.test(text);
     const weatherHint = weatherHintFromIntent(text);
+    if (weather) {
+      return {
+        kind: "mission",
+        mission: {
+          nodeId: explicitNodeId,
+          delayMinutes: 0,
+          description: personalize(ref.kind, shortIntent, hydrated, ref),
+          origin: "proactive",
+          ...(weatherHint ? { weatherHint } : {}),
+          kind: "weather",
+        },
+      };
+    }
+    // Same per-kind keyword checks as branches 2/3/4 below, applied to the
+    // EXPLICIT target instead of a name-matched one.
+    let category: TripMissionCategory = "delay";
+    let description = personalize(ref.kind, shortIntent, hydrated, ref);
+    if (ref.kind === "flight") {
+      const missed =
+        /\bmiss(ed|ing)?\b/i.test(text) ||
+        /(rat[ée]|loup[ée])/i.test(text) || // fr: raté / loupé
+        /(perd[íi]|perdido)/i.test(text) || // es: perdí / perdido
+        /verpass/i.test(text) || // de: verpasst / verpasste
+        /(错过|误机|没赶上)/.test(text); // zh-Hans
+      category = missed ? "missed_flight" : "delay";
+    } else if (ref.kind === "hotel") {
+      category = /\b(overbook\w*)\b/i.test(text) ? "hotel_overbooked" : "hotel";
+    } else if (ref.kind === "activity") {
+      const cancelled = /\bcancel\w*\b/i.test(text);
+      category = cancelled ? "activity_cancelled" : "delay";
+      // `classifyDisruptionKind` downstream (OrchestratorAgent) reads THIS
+      // description text to detect a cancellation — the generic
+      // "Change requested" wording never mentioned it, so route it through
+      // that check too instead of only the category field.
+      if (cancelled) description = `Activity cancelled — ${ref.label}`;
+    }
     return {
       kind: "mission",
       mission: {
         nodeId: explicitNodeId,
-        delayMinutes: weather ? 0 : delayMinutesFromIntent(text),
-        description: personalize(ref.kind, shortIntent, hydrated, ref),
-        origin: weather ? "proactive" : "reactive",
-        ...(weather && weatherHint ? { weatherHint } : {}),
-        kind: weather ? "weather" : "delay",
+        delayMinutes: delayMinutesFromIntent(text),
+        description,
+        origin: "reactive",
+        kind: category,
       },
     };
   }

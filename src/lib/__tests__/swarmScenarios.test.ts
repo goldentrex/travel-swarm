@@ -299,7 +299,7 @@ describe("SCENARIOS", () => {
     expect(approve.settlement.trip_updated).toBe(false);
   }, 30000);
 
-  it("G. re-approving a settled session is refused", async () => {
+  it("G. re-approving a settled session replays its receipt", async () => {
     const missionRes = await handleHackathonRequest(
       post("mission", { intent: "I missed my flight, reroute me", tripId: REAL_TRIP_UUID }),
     );
@@ -321,7 +321,8 @@ describe("SCENARIOS", () => {
     const body = (await second.json()) as any;
     console.log(`G. first=${first.status} second=${second.status} error=${body.error}`);
     expect(first.status).toBe(200);
-    expect(second.status).not.toBe(200);
+    expect(second.status).toBe(200);
+    expect(body.booking).toEqual((await first.json()).booking);
   }, 30000);
 
   it("H. every settled payload survives the iOS decoder intact", async () => {

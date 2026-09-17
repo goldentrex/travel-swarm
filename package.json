@@ -9,6 +9,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev --config workers/swarm-demo/wrangler.jsonc",
     "deploy": "wrangler deploy --config workers/swarm-demo/wrangler.jsonc",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.16.5",
+    "@vitest/coverage-v8": "^3.2.7",
     "typescript": "^5.8.3",
     "vitest": "^3.2.7",
     "wrangler": "^4.42.0"

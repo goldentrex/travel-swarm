@@ -231,16 +231,17 @@ describe("live real-trip mission — full pipeline", () => {
     ).toBe(true);
   });
 
-  it("never emits atlas_liveness on the degraded rail and keeps the canary", async () => {
+  it("uses an approvable synthetic recovery without fabricating atlas_liveness", async () => {
     const providerHooks = AtlasFlightProvider as unknown as { __failSearch: boolean };
     providerHooks.__failSearch = true;
 
     const response = await runMission();
     const body = (await response.json()) as MissionBody;
 
-    // Provider failure ⇒ degraded graph-only plan with the frozen canary.
-    expect(body.degraded).toBe(true);
+    // Provider failure ⇒ structured indicative recovery, still approvable.
+    expect(body.degraded).toBe(false);
     expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
+    expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
     // No correlation ids on the degraded rail ⇒ NO liveness row, ever.
     expect(body.swarm_trace.some((entry) => entry.step === "atlas_liveness")).toBe(false);
   });

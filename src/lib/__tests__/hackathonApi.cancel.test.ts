@@ -180,14 +180,26 @@ vi.mock("@/lib/swarmSessionStore", () => {
       record.state = "expired";
       return { cancelled: true, state: "expired" };
     },
-    async claimSwarmSessionForBooking(id: string): Promise<FakeSessionRecord | null> {
+    async claimSwarmSessionForBooking(id: string, candidates?: unknown): Promise<FakeSessionRecord | null> {
       const record = sessions.get(id);
       if (!record || (record.state !== "proposal_ready" && record.state !== "awaiting_approval")) {
         return null;
       }
       if (record.expires_at <= new Date().toISOString()) return null;
       record.state = "approved";
+      if (candidates !== undefined) record.candidates = candidates;
       return record;
+    },
+    settlementOperation(record: FakeSessionRecord) {
+      return (record.candidates as { settlement_operation?: unknown } | undefined)?.settlement_operation ?? null;
+    },
+    async saveSwarmSettlementReceipt(entry: FakeSessionRecord, receipt: Record<string, unknown>) {
+      const record = sessions.get(entry.id);
+      if (!record || record.state !== "approved") return false;
+      const candidates = entry.candidates as Record<string, unknown>;
+      record.candidates = { ...candidates, settlement_operation: { ...(candidates.settlement_operation as object), receipt } };
+      record.state = "settled";
+      return true;
     },
     async markSwarmSessionSettled(id: string): Promise<void> {
       const record = sessions.get(id);
@@ -380,7 +392,7 @@ describe("POST /mission/cancel (WS3)", () => {
   });
 
   it("store failure on cancel → 503 session_store_unavailable", async () => {
-    store.__seed({ id: "res_cancel_err", state: "proposal_ready" });
+    store.__seed({ id: "res_cancel_err", trip_id: TRIP_UUID, state: "proposal_ready" });
     store.__setCancelError(true);
 
     const response = await handleHackathonRequest(
@@ -512,7 +524,7 @@ describe("flight-less approve settles a real trip (gate ON)", () => {
     const stay = body.updated_content?.itinerary?.[0]?.items?.[1];
     expect(stay).toBeDefined();
     expect(String(stay?.swarm_note ?? "")).toContain("Swarm settlement");
-    expect(String(stay?.swarm_note ?? "")).toContain("late check in");
+    expect(String(stay?.swarm_note ?? "")).toContain("late check-in");
 
     // Session consumed exactly once.
     expect(store.__sessions.get("res_hotel")?.state).toBe("settled");

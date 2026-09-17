@@ -2,11 +2,9 @@ import SwiftUI
 
 // MARK: - Travel Swarm — the disruption-recovery sheet
 //
-// Level-4 agentic disruption recovery: launches swarm missions, renders the
-// live Swarm Activity Stream (one row per agent trace entry) inside an
-// iridescent "Deep Agentic Thinking" card, and hands proposals to the
-// TrustLayerSheet for explicit human approval. The whole file is wrapped in
-// `#if DEBUG` so Release / App Store builds contain none of it.
+// Assisted disruption recovery: shows the itinerary impact and supplier
+// trace, then hands proposals to TrustLayerSheet for explicit approval.
+// Ships in Release; SwarmAvailability reads the server feature switch.
 
 struct NexusSwarmView: View {
     @Environment(\.dismiss) private var dismiss
@@ -183,7 +181,7 @@ struct NexusSwarmView: View {
     // MARK: Iridescent Swarm Status card
 
     private var swarmStatusCard: some View {
-        GlassCard(cornerRadius: 22) {
+        SwarmSurfaceCard(cornerRadius: 22) {
             VStack(alignment: .leading, spacing: 12) {
                 Label(app.tr("Activité de l'essaim", "Swarm Activity Stream"), systemImage: "dot.radiowaves.left.and.right")
                     .font(.caption.weight(.semibold))
@@ -192,8 +190,16 @@ struct NexusSwarmView: View {
 
                 if model.trace.isEmpty {
                     Text(model.isProcessing
-                         ? "Dispatching agents across the itinerary graph…"
-                         : "Agents standing by — launch a mission below.")
+                         ? app.trm("Déploiement des agents sur le graphe du voyage…",
+                                   "Dispatching agents across the itinerary graph…",
+                                   "Desplegando agentes por el grafo del itinerario…",
+                                   "Agenten werden über den Reisegraphen verteilt…",
+                                   "正在行程图上调度智能体…")
+                         : app.trm("Agents en veille — lancez une mission ci-dessous.",
+                                   "Agents standing by — launch a mission below.",
+                                   "Agentes en espera: lanza una misión abajo.",
+                                   "Agenten bereit – starte unten eine Mission.",
+                                   "智能体待命 — 在下方启动任务。"))
                         .font(.footnote)
                         .foregroundStyle(.tertiary)
                         .padding(.vertical, 6)
@@ -218,10 +224,11 @@ struct NexusSwarmView: View {
                 }
             }
         }
-        // Iridescent border runs all the time to symbolize active monitoring
-        // by the Nexus Swarm.
+        // The iridescent border ANIMATES only while agents are actually
+        // working. It used to rotate continuously — idle, reviewing, settled —
+        // re-rendering the card under it at 30 fps for nothing.
         .overlay {
-            SwarmIridescentBorder(active: true,
+            SwarmIridescentBorder(active: model.isProcessing || model.phase == .resolving,
                                   settled: model.phase == .settled,
                                   cornerRadius: 22)
         }
@@ -243,6 +250,33 @@ struct NexusSwarmView: View {
         let slug: String
 
         var id: String { intent }
+    }
+
+    /// What the traveller reads on a mission tile. `MissionScenario.title`
+    /// stays ENGLISH on purpose — it is folded into the intent string the
+    /// backend's keyword parser matches (SPEC §4.2) — so the label is resolved
+    /// separately here instead of being shown raw in every locale.
+    fileprivate func scenarioTitle(_ scenario: MissionScenario) -> String {
+        switch scenario.slug {
+        case "missedFlight":
+            return app.trm("Vol manqué", "Missed flight", "Vuelo perdido", "Flug verpasst", "错过航班")
+        case "weather":
+            return app.trm("Météo", "Weather check", "Meteorología", "Wetter-Check", "天气检查")
+        case "hotelOverbooked":
+            return app.trm("Hôtel surbooké", "Hotel overbooked", "Hotel sobrevendido",
+                           "Hotel überbucht", "酒店超额预订")
+        case "activityCancelled":
+            return app.trm("Activité annulée", "Activity cancelled", "Actividad cancelada",
+                           "Aktivität abgesagt", "活动取消")
+        case "transitStrike":
+            return app.trm("Grève des transports", "Transit strike", "Huelga de transporte",
+                           "Verkehrsstreik", "交通罢工")
+        case "feelingUnwell":
+            return app.trm("Je ne me sens pas bien", "Feeling unwell", "Me siento mal",
+                           "Mir geht es nicht gut", "身体不适")
+        default:
+            return scenario.title
+        }
     }
 
     private let scenarios: [MissionScenario] = [
@@ -379,7 +413,7 @@ struct NexusSwarmView: View {
                 Image(systemName: scenario.symbol)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(scenario.tint)
-                Text(scenario.title)
+                Text(scenarioTitle(scenario))
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -469,7 +503,7 @@ struct NexusSwarmView: View {
     // MARK: Failed & settled
 
     private func failedBlock(_ message: String) -> some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(cornerRadius: 18) {
             VStack(alignment: .leading, spacing: 10) {
                 Label(app.tr("Échec de la mission de l'essaim", "Swarm mission failed"),
                       systemImage: "wifi.exclamationmark")
@@ -508,7 +542,7 @@ struct NexusSwarmView: View {
     }
 
     private var settledBlock: some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(cornerRadius: 18) {
             VStack(spacing: 12) {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 44))
@@ -773,6 +807,31 @@ fileprivate struct ScenarioSelectionSheet: View {
     let onLaunch: (_ intent: String, _ nodeId: String?) -> Void
 
     @State private var selectedIds = Set<String>()
+
+    /// Same mapping the mission tiles use, so the picker heading and the tile
+    /// the traveller tapped read the same words.
+    private var localizedScenarioTitle: String {
+        switch scenario.slug {
+        case "missedFlight":
+            return app.trm("Vol manqué", "Missed flight", "Vuelo perdido", "Flug verpasst", "错过航班")
+        case "weather":
+            return app.trm("Météo", "Weather check", "Meteorología", "Wetter-Check", "天气检查")
+        case "hotelOverbooked":
+            return app.trm("Hôtel surbooké", "Hotel overbooked", "Hotel sobrevendido",
+                           "Hotel überbucht", "酒店超额预订")
+        case "activityCancelled":
+            return app.trm("Activité annulée", "Activity cancelled", "Actividad cancelada",
+                           "Aktivität abgesagt", "活动取消")
+        case "transitStrike":
+            return app.trm("Grève des transports", "Transit strike", "Huelga de transporte",
+                           "Verkehrsstreik", "交通罢工")
+        case "feelingUnwell":
+            return app.trm("Je ne me sens pas bien", "Feeling unwell", "Me siento mal",
+                           "Mir geht es nicht gut", "身体不适")
+        default:
+            return scenario.title
+        }
+    }
 
     struct Option: Identifiable {
         let id: String
@@ -1076,7 +1135,11 @@ fileprivate struct ScenarioSelectionSheet: View {
                     }
                 }
             }
-            .navigationTitle("Select \(scenario.title)")
+            // The scenario's own title stays English (it feeds the backend
+            // intent); the heading the traveller reads is localized.
+            .navigationTitle(app.trm("Choisir : \(localizedScenarioTitle)", "Select \(localizedScenarioTitle)",
+                                     "Seleccionar: \(localizedScenarioTitle)", "Auswählen: \(localizedScenarioTitle)",
+                                     "选择：\(localizedScenarioTitle)"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

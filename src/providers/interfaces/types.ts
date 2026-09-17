@@ -77,6 +77,12 @@ export interface FlightOption {
   segments?: FlightSegment[];
   /** NEW (additive) — IATA codes of the layover airports, in order. */
   stopAirports?: AirportCode[];
+  /**
+   * Additive provenance marker for the deterministic recovery rail. Provider
+   * inventory omits it; an indicative option created after provider failure
+   * is explicitly marked so it can never be confused with a live Atlas offer.
+   */
+  inventorySource?: "synthetic_recovery";
 }
 
 /** Result envelope for {@link FlightProvider.searchAlternativeFlights}. */
@@ -146,18 +152,9 @@ export interface FlightRouteContext {
    */
   earliestDeparture?: IsoTimestamp;
   /**
-   * Candidates departing AFTER this instant are not replacements either.
-   *
-   * The floor above says "the flight you missed is gone". This is the other
-   * half, and it was missing: nothing capped how LATE a replacement could be,
-   * so a flight five days after the one the traveller missed counted as a
-   * usable rebooking. It satisfied every rule — it departs after the
-   * disruption, it flies the route — and it would have meant cancelling the
-   * rest of the holiday.
-   *
-   * "Rebook me" and "replan my trip" are different requests. Past this
-   * instant the honest answer is that no rebooking works, not a proposal that
-   * quietly writes off the days in between.
+   * Deprecated compatibility hint. Recovery no longer treats this as a hard
+   * veto: a late viable flight is retained and downstream stays/activities
+   * are reflowed around its actual arrival.
    */
   latestDeparture?: IsoTimestamp;
   /**
@@ -193,7 +190,7 @@ export interface FareDifference {
    *   currency), so `amount` is the FULL verified re-price charged as-is.
    * Absent on legacy/pre-extension providers (treat like `full_fare`).
    */
-  basis?: "fare_difference" | "full_fare" | "search_reference";
+  basis?: "fare_difference" | "full_fare" | "search_reference" | "synthetic_estimate";
   /** NEW (additive) — the original fare subtracted, only on `fare_difference` basis. */
   originalFare?: number;
   /** NEW (additive) — passenger count the quote was computed for (>= 1). */

@@ -2,14 +2,13 @@ import Foundation
 import Observation
 import SwiftUI
 
-// MARK: - Nexus Swarm state machine (DEBUG ONLY)
+// MARK: - Travel Swarm state machine
 //
 // `idle → monitoring → processing → proposal → awaiting_approval → settled`
 // (+ `failed`) — SPEC §5.2. Launches swarm missions against the hackathon
 // backend, polls `swarm-status` while the agents work, merges trace entries
 // for the Swarm Activity Stream, and picks up background monitor alerts.
-// The whole file is wrapped in `#if DEBUG` so Release / App Store builds
-// contain none of it.
+// Ships in Release behind the server-controlled SwarmAvailability switch.
 
 @MainActor
 @Observable
@@ -71,6 +70,7 @@ final class SwarmViewModel {
     /// that launches this intent instead of reviewing an unbookable plan.
     var adaptiveMissionIntent: String?
     var approving = false
+    private(set) var settlementPending = false
     var approveError: String?
     /// NEW (Phase C) — the mission/status response flagged the plan as
     /// assembled from simulated data (`degraded: true`): TrustLayerSheet
@@ -380,6 +380,7 @@ final class SwarmViewModel {
             isProcessing && resolutionId == id && gen == pollGeneration
         }
         let pollingStartedAt = Date()
+        var approvalPending = false
         for _ in 0..<60 {   // bounded — the demo graph resolves in < 3 s
             do {
                 let status = try await SwarmService.status(resolutionId: id)
@@ -412,9 +413,22 @@ final class SwarmViewModel {
                     isTakingLong = false
                     phase = .proposal
                     return
-                case "approved", "settled":
+                case "approved":
+                    approvalPending = true
+                    settlementPending = true                    // Approval is a claim, not proof of provider/trip completion.
+                    // Keep checking; the bounded poll loop handles interruptions.
+                    isTakingLong = true
+                case "settled":
                     guard stillFresh() else { return }
-                    phase = .settled
+                    if let receipt = status.receipt {
+                        // Same path as a direct approve. A stored receipt never
+                        // carries the content (the server keeps one copy of the
+                        // trip), so this rail always re-reads the settled trip.
+                        applySettlementReceipt(receipt)
+                    } else {
+                        closeSettlementGate()
+                        phase = .settled
+                    }
                     return
                 case "expired":
                     guard stillFresh() else { return }
@@ -445,7 +459,12 @@ final class SwarmViewModel {
             try? await Task.sleep(for: .seconds(1.5))
             guard stillFresh(), !Task.isCancelled else { return }
         }
-        if isProcessing {
+        if approvalPending {
+            failedOffersRerun = false
+            phase = .failed(swarmL(
+                "Approbation enregistrée. Vérifiez la réservation avant d’en effectuer une autre.",
+                "Approval recorded. Check the booking outcome before making another reservation."))
+        } else if isProcessing {
             phase = .failed(swarmL(
                 "L'essaim a mis trop de temps à répondre. Réessayez.",
                 "The swarm took too long to respond. Try again."))
@@ -476,31 +495,92 @@ final class SwarmViewModel {
     /// `{ resolutionId, approved: true, planIndex }` — the single settlement
     /// endpoint. `planIndex` settles the carousel page the user picked.
     func approve() async {
+        if settlementPending { await refreshSettlementStatus(); return }
         guard let id = resolutionId, phase == .awaitingApproval, !approving else { return }
         approving = true
+        settlementPending = true
         approveError = nil
         defer { approving = false }
         do {
             let response = try await SwarmService.approve(resolutionId: id, planIndex: selectedPlanIndex)
-            booking = response.booking
-            if let plan = response.plan { storePlans([plan]) }
-            settlementChanges = response.settlement?.changes ?? []
-            lastSettlement = response.settlement
-            phase = .settled
-            Haptics.success()
-            // Settlement rewrote the itinerary → push the fresh content_json
-            // into the open trip (already on the MainActor).
-            if let content = response.updatedContent {
-                onTripUpdated?(content)
-            } else if response.settlement?.tripUpdated == true {
-                // The rewrite landed server-side but the payload carried no
-                // `updated_content` — one network refresh picks it up.
-                onTripRefreshNeeded?()
-            }
+            applySettlementReceipt(response)
         } catch {
-            approveError = notBookableError(error) ?? friendlyError(error)
+            if let explanation = notBookableError(error) {
+                settlementPending = false
+                approveError = explanation
+            } else if case let SwarmService.ServiceError.http(code, _) = error,
+                      code == 400 || code == 401 || code == 403 || code == 410 {
+                settlementPending = false
+                approveError = friendlyError(error)
+            } else {
+                // A transport failure can happen after the provider acted.
+                // The next action reads status instead of submitting again.
+                approveError = swarmL(
+                    "Résultat à vérifier. Consultez le statut avant toute nouvelle réservation.",
+                    "The outcome needs checking. Check status before making another reservation.")
+            }
         }
     }
+
+    func refreshSettlementStatus() async {
+        guard let id = resolutionId, !approving else { return }
+        approving = true
+        defer { approving = false }
+        do {
+            let status = try await SwarmService.status(resolutionId: id)
+            if let receipt = status.receipt {
+                applySettlementReceipt(receipt)
+            } else if status.state == "proposal_ready" || status.state == "awaiting_approval" {
+                settlementPending = false
+                approveError = swarmL("L’approbation n’a pas été enregistrée. Vous pouvez réessayer.",
+                                      "Approval was not recorded. You can try again.")
+            } else {
+                approveError = swarmL("Résultat de réservation non confirmé. Vérifiez avant de réserver à nouveau.",
+                                      "Booking outcome is not confirmed. Check before booking again.")
+            }
+        } catch {
+            approveError = swarmL("Statut indisponible. Réessayez la vérification dans un instant.",
+                                  "Status is unavailable. Try checking again shortly.")
+        }
+    }
+
+    private func applySettlementReceipt(_ response: SwarmService.ApproveResponse) {
+        closeSettlementGate()
+        settlementPending = false
+        approveError = nil
+        booking = response.booking
+        if let plan = response.plan { storePlans([plan]) }
+        settlementChanges = response.settlement?.changes ?? []
+        lastSettlement = response.settlement
+        phase = .settled
+        if response.settlement?.needsFollowUp != true { Haptics.success() }
+        switch SwarmSettlementSync.action(for: response) {
+        case .applyContent(let content): onTripUpdated?(content)
+        case .refetch: onTripRefreshNeeded?()
+        case .none: break
+        }
+    }
+
+    /// The approval gate has closed: nothing about this mission is waiting on
+    /// the traveller any more. The pulsing badge on the trip screen used to
+    /// survive a settlement — it only cleared when the NEXT mission launched —
+    /// so the journey view kept announcing an alert that had been resolved.
+    private func closeSettlementGate() {
+        hasPendingAlert = false
+        latestAlert = nil
+    }
+
+    /// What the settlement could not finish for the traveller — itemized.
+    var settlementFollowUps: [SwarmService.FollowUp] { lastSettlement?.followUps ?? [] }
+
+    #if DEBUG
+    /// Screenshot harness only: feed a server-shaped receipt through the SAME
+    /// private path a real approval takes.
+    func debugApplySettlementReceipt(_ response: SwarmService.ApproveResponse) {
+        phase = .awaitingApproval
+        applySettlementReceipt(response)
+    }
+    #endif
 
     /// Maps the approve endpoint's 409 not-bookable codes
     /// (`degraded_plan_not_bookable` / `plan_not_bookable`) onto actionable
@@ -528,6 +608,7 @@ final class SwarmViewModel {
         booking = nil
         trace = []
         approveError = nil
+        settlementPending = false
         adaptiveMissionIntent = nil
         settlementChanges = []
         lastSettlement = nil

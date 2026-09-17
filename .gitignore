@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+coverage/
 
 # Secrets — never commit these.
 .env

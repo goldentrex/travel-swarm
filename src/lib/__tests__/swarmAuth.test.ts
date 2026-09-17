@@ -75,6 +75,7 @@ import {
   type FakeSwarmTripContextHooks,
 } from "./helpers/realTripFixture";
 import * as tripContextModule from "@/lib/swarmTripContext";
+import { saveSwarmSession, getSwarmSession } from "@/lib/swarmSessionStore";
 
 const tripCtx = tripContextModule as unknown as FakeSwarmTripContextHooks;
 
@@ -149,6 +150,79 @@ describe("real-trip swarm rail — per-user gate", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  async function sessionRequest(endpoint: "status" | "cancel", token: string | null) {
+    const id = `access-${endpoint}`;
+    await saveSwarmSession({
+      id,
+      trip_id: REAL_TRIP_UUID,
+      state: "proposal_ready",
+      plan: null,
+      trace: [
+        {
+          agent: "flight",
+          step: "quote",
+          detail: "private itinerary",
+          at: new Date().toISOString(),
+        },
+      ],
+      degraded: false,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${BEARER_TOKEN}`,
+      "Content-Type": "application/json",
+    };
+    if (token) headers[USER_TOKEN_HEADER] = token;
+    const request =
+      endpoint === "status"
+        ? new Request(`http://localhost/api/hackathon/swarm-status/${id}`, { headers })
+        : new Request("http://localhost/api/hackathon/mission/cancel", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ resolutionId: id }),
+          });
+    return handleHackathonRequest(request);
+  }
+
+  it.each(["status", "cancel"] as const)(
+    "%s requires the traveler's token, not just the app bearer",
+    async (endpoint) => {
+      const response = await sessionRequest(endpoint, null);
+      expect(response.status).toBe(401);
+      expect((await getSwarmSession(`access-${endpoint}`))?.state).toBe("proposal_ready");
+    },
+  );
+
+  it.each(["status", "cancel"] as const)(
+    "%s refuses a stranger who knows a session id",
+    async (endpoint) => {
+      identifiesAs(STRANGER);
+      db.tripOwner = OWNER;
+      const response = await sessionRequest(endpoint, "stranger-token");
+      expect(response.status).toBe(404);
+      expect(await response.text()).not.toContain("private itinerary");
+      expect((await getSwarmSession(`access-${endpoint}`))?.state).toBe("proposal_ready");
+    },
+  );
+
+  it("a viewer can read status but cannot cancel someone else's mission", async () => {
+    identifiesAs(STRANGER);
+    db.tripOwner = OWNER;
+    db.share = { user: STRANGER, level: "VIEW" };
+    expect((await sessionRequest("status", "viewer-token")).status).toBe(200);
+    expect((await sessionRequest("cancel", "viewer-token")).status).toBe(403);
+    expect((await getSwarmSession("access-cancel"))?.state).toBe("proposal_ready");
+  });
+
+  it("the owner can read status and cancel", async () => {
+    identifiesAs(OWNER);
+    db.tripOwner = OWNER;
+    expect((await sessionRequest("status", "owner-token")).status).toBe(200);
+    const response = await sessionRequest("cancel", "owner-token");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ cancelled: true });
   });
 
   it("refuses a caller who presents no user token at all", async () => {

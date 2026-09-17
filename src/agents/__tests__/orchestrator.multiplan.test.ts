@@ -181,7 +181,7 @@ describe("a replacement must leave the traveller a trip to arrive to", () => {
     return new OrchestratorAgent(buildGraphWithTrip(), flightStubMulti(candidates));
   }
 
-  it("drops a replacement that lands after everything left in the trip", async () => {
+  it("keeps a replacement that lands after the original downstream schedule", async () => {
     const usable = makeCandidate("SOON", 40, new Date(arrival + 4 * 60 * MINUTE_MS).toISOString());
     // Lands after both nights and both activities are over.
     const tooLate = makeCandidate("LATE", 10, new Date(arrival + 5 * DAY).toISOString());
@@ -193,20 +193,17 @@ describe("a replacement must leave the traveller a trip to arrive to", () => {
     const ids = outcome.plans.map((plan) => plan.proposed_resolution.new_flight?.id);
     expect(ids).toContain("SOON");
     // …even though LATE is the CHEAPEST, which is exactly why it used to win.
-    expect(ids).not.toContain("LATE");
-    expect(outcome.trace.join(" ")).toContain("landing after the rest of the trip is over");
+    expect(ids).toContain("LATE");
+    expect(outcome.trace.join(" ")).not.toContain("landing after the rest of the trip is over");
   });
 
-  it("offers NO flight rather than one that lands after the trip", async () => {
-    // "Never offer nothing" is right for a price ceiling and wrong here: a
-    // flight to a holiday that already ended is not a lesser option, it is a
-    // false one. The flight-less plan says so honestly instead.
+  it("offers the only flight and lets the graph reflow the trip around it", async () => {
     const tooLate = makeCandidate("LATE", 10, new Date(arrival + 5 * DAY).toISOString());
 
     const outcome = await orchestratorWithTrip([tooLate]).resolveDisruptionMulti(makeEvent());
 
     expect(outcome.plans.length).toBe(1);
-    expect(outcome.plans[0]?.proposed_resolution.new_flight).toBeUndefined();
+    expect(outcome.plans[0]?.proposed_resolution.new_flight?.id).toBe("LATE");
   });
 
   it("keeps a late-but-survivable replacement, since the trip goes on", async () => {
@@ -767,30 +764,65 @@ describe("OrchestratorAgent.resolveDisruptionMulti — routeContext anchoring (r
     // unaware-of-our-simulated-delay results (correctly) still departed at
     // 09:00 — so the exclude guard never matched, and the flight the
     // traveler just missed came back as its own "cheapest" replacement.
-    const { agent, captured } = capturingFlightAgent();
-    const orchestrator = new OrchestratorAgent(buildFlightOnlyGraph(), agent);
-    await orchestrator.resolveDisruptionMulti(
-      makeEvent({ delay: 240, description: "Reroute requested — Flight XY123 CDG → LIS" }),
-    );
-    const routeContext = captured();
-    expect(routeContext?.excludeFlight?.departureTime).toBe(new Date(BASE).toISOString());
-    expect(routeContext?.earliestDeparture).toBe(new Date(BASE).toISOString());
-    // The bug, made explicit: the shifted time must NEVER appear here.
-    const shifted = new Date(BASE + 240 * MINUTE_MS).toISOString();
-    expect(routeContext?.excludeFlight?.departureTime).not.toBe(shifted);
-    expect(routeContext?.earliestDeparture).not.toBe(shifted);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    try {
+      const { agent, captured } = capturingFlightAgent();
+      const orchestrator = new OrchestratorAgent(buildFlightOnlyGraph(), agent);
+      await orchestrator.resolveDisruptionMulti(
+        makeEvent({ delay: 240, description: "Reroute requested — Flight XY123 CDG → LIS" }),
+      );
+      const routeContext = captured();
+      expect(routeContext?.excludeFlight?.departureTime).toBe(new Date(BASE).toISOString());
+      expect(routeContext?.earliestDeparture).toBe(new Date(BASE).toISOString());
+      // The bug, made explicit: the shifted time must NEVER appear here.
+      const shifted = new Date(BASE + 240 * MINUTE_MS).toISOString();
+      expect(routeContext?.excludeFlight?.departureTime).not.toBe(shifted);
+      expect(routeContext?.earliestDeparture).not.toBe(shifted);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('sets the SAME floor even when the description never says "missed" (explicit-node UI path)', async () => {
     // The UI's "which flight did you miss" picker sends an explicit nodeId,
     // which classifies as "delay" rather than "missed_flight" — the floor
     // must not depend on that classification any more.
-    const { agent, captured } = capturingFlightAgent();
-    const orchestrator = new OrchestratorAgent(buildFlightOnlyGraph(), agent);
-    await orchestrator.resolveDisruptionMulti(
-      makeEvent({ delay: 240, description: "Reroute requested — Flight XY123 CDG → LIS" }),
-    );
-    expect(captured()?.earliestDeparture).toBe(new Date(BASE).toISOString());
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    try {
+      const { agent, captured } = capturingFlightAgent();
+      const orchestrator = new OrchestratorAgent(buildFlightOnlyGraph(), agent);
+      await orchestrator.resolveDisruptionMulti(
+        makeEvent({ delay: 240, description: "Reroute requested — Flight XY123 CDG → LIS" }),
+      );
+      expect(captured()?.earliestDeparture).toBe(new Date(BASE).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("moves the complete rebooking window with the sellable search date for a past fixture", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-17T03:15:00Z"));
+    try {
+      const { agent, captured } = capturingFlightAgent();
+      const orchestrator = new OrchestratorAgent(buildFlightOnlyGraph(), agent);
+      await orchestrator.resolveDisruptionMulti(
+        makeEvent({ delay: 240, description: "Reroute requested — Flight XY123 CDG → LIS" }),
+      );
+
+      const routeContext = captured();
+      const recoveryAnchor = "2026-09-17T05:15:00.000Z";
+      expect(routeContext?.departureDate).toBe(recoveryAnchor);
+      expect(routeContext?.earliestDeparture).toBe(recoveryAnchor);
+      expect(routeContext?.latestDeparture).toBeUndefined();
+      // The exact stale departure is still excluded for auditability, but it
+      // no longer defines the window used to judge future provider inventory.
+      expect(routeContext?.excludeFlight?.departureTime).toBe(new Date(BASE).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -849,4 +881,3 @@ describe("OrchestratorAgent.resolveDisruptionMulti — degraded rail", () => {
     expect(byId("ATL-FAST")?.badges).not.toContain("cheapest");
   });
 });
-

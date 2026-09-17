@@ -59,7 +59,19 @@ export interface ProposedNewFlight {
    * keeping its old segments would describe the previous journey.
    */
   segments?: NewFlightSegment[];
+  /**
+   * NEW (additive) — how `cost` was established, carried from the FlightAgent's
+   * `FareDifference.basis`. `verified` = re-priced by the provider;
+   * `search_reference` = the search's published price, not yet re-verified;
+   * `synthetic_estimate` = the zero-abort ladder's indicative schedule, which
+   * no provider sold. Absent on legacy plans (read as provider-backed). The
+   * approval sheet badges anything but `verified`, and the settlement never
+   * records a synthetic estimate as a booking.
+   */
+  fare_basis?: FareBasis;
 }
+
+export type FareBasis = "verified" | "search_reference" | "synthetic_estimate";
 
 /** One hop of a replacement flight, as stored on the leg. */
 export interface NewFlightSegment {
@@ -110,9 +122,12 @@ export interface HotelAlternative {
  * {@link ProposedResolution}: omit or `[]` when no hotel is impacted.
  */
 export interface HotelAdjustment {
+  /** No hotel action/fee is confirmed while this is true. */
+  requires_confirmation?: boolean;
+  note?: string;
   hotel_name: string;
   action: "late_check_in" | "rebook" | "none";
-  /** 0 when free. */
+  /** Verified fee; zero with requires_confirmation means no verified charge yet. */
   fee: number;
   /** NEW (additive) — best alternative room, feeds the presentation layer. */
   alternative?: HotelAlternative;
@@ -246,6 +261,14 @@ export interface OperationalSettlement {
   hotel_actions?: Array<{ nodeId: string; action: string; note: string; newCheckIn?: string }>;
   /** Confirmation code the settlement stamps on the rewritten flight leg. */
   bookingCode?: string;
+  /**
+   * NEW (additive) — what the provider actually did with the replacement,
+   * known because approval books BEFORE it writes the trip. `confirmed` = a
+   * provider order; `recorded` = no provider confirmation (unconfigured,
+   * failed, or an indicative option). Absent on direct/legacy settlements,
+   * which keep the previous behaviour.
+   */
+  booking_status?: "confirmed" | "recorded";
 }
 
 /**
@@ -311,6 +334,19 @@ export interface ResolutionPresentation {
     days_lost: number;
     /** Node ids of everything that becomes unreachable. */
     lost_node_ids: string[];
+    /** NEW (additive) — invalidated airport/ground transfers. */
+    transfers_lost?: number;
+    /** NEW (additive) — meals among the lost items (counted apart from activities). */
+    meals_lost?: number;
+  };
+  /**
+   * NEW (additive) — the settlement's own change lines, produced by running the
+   * SAME transformer that approval runs against the trip as it stands now. The
+   * approval sheet lists them so nothing is changed that was not shown.
+   */
+  settlement_preview?: {
+    changes: string[];
+    follow_ups: Array<{ kind: string; message: string }>;
   };
 }
 
@@ -403,7 +439,11 @@ function isProposedNewFlight(value: unknown): value is ProposedNewFlight {
     isOptionalFiniteNumber(value.stops) &&
     isOptionalFiniteNumber(value.durationMinutes) &&
     (value.stopAirports === undefined || isStringArray(value.stopAirports)) &&
-    (value.segments === undefined || isNewFlightSegmentArray(value.segments))
+    (value.segments === undefined || isNewFlightSegmentArray(value.segments)) &&
+    (value.fare_basis === undefined ||
+      value.fare_basis === "verified" ||
+      value.fare_basis === "search_reference" ||
+      value.fare_basis === "synthetic_estimate")
   );
 }
 
@@ -454,6 +494,8 @@ function isHotelAdjustment(value: unknown): value is HotelAdjustment {
     (value.action === "late_check_in" || value.action === "rebook" || value.action === "none") &&
     isFiniteNumber(value.fee) &&
     value.fee >= 0 &&
+    (value.requires_confirmation === undefined || typeof value.requires_confirmation === "boolean") &&
+    (value.note === undefined || typeof value.note === "string") &&
     (value.alternative === undefined || isHotelAlternative(value.alternative))
   );
 }
@@ -567,6 +609,13 @@ function isOperationalSettlement(value: unknown): value is OperationalSettlement
   ) {
     return false;
   }
+  if (
+    value.booking_status !== undefined &&
+    value.booking_status !== "confirmed" &&
+    value.booking_status !== "recorded"
+  ) {
+    return false;
+  }
   return value.bookingCode === undefined || typeof value.bookingCode === "string";
 }
 
@@ -624,6 +673,29 @@ function isResolutionPresentation(value: unknown): value is ResolutionPresentati
   }
   if (value.ledger_summary !== undefined && !isStringArray(value.ledger_summary)) {
     return false;
+  }
+  if (value.trip_impact !== undefined) {
+    const impact = value.trip_impact;
+    if (
+      !isRecord(impact) ||
+      !isOptionalFiniteNumber(impact.transfers_lost) ||
+      !isOptionalFiniteNumber(impact.meals_lost)
+    ) {
+      return false;
+    }
+  }
+  if (value.settlement_preview !== undefined) {
+    const preview = value.settlement_preview;
+    if (
+      !isRecord(preview) ||
+      !isStringArray(preview.changes) ||
+      !Array.isArray(preview.follow_ups) ||
+      !preview.follow_ups.every(
+        (entry) => isRecord(entry) && typeof entry.kind === "string" && typeof entry.message === "string",
+      )
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -746,6 +818,8 @@ export function resolutionPlanToJson(plan: ResolutionPlan): string {
           action: adjustment.action,
           fee: adjustment.fee,
         };
+        if (adjustment.requires_confirmation !== undefined) entry.requires_confirmation = adjustment.requires_confirmation;
+        if (adjustment.note !== undefined) entry.note = adjustment.note;
         if (adjustment.alternative !== undefined) {
           entry.alternative = canonicalizeJson(adjustment.alternative) as HotelAlternative;
         }
@@ -854,6 +928,7 @@ function canonicalNewFlight(flight: ProposedNewFlight): ProposedNewFlight {
   if (flight.segments !== undefined) {
     entry.segments = flight.segments.map((segment) => ({ ...segment }));
   }
+  if (flight.fare_basis !== undefined) entry.fare_basis = flight.fare_basis;
   return entry;
 }
 

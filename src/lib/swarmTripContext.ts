@@ -25,6 +25,16 @@
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { ItineraryGraph } from "@/core/dag";
 import type { ResolutionPlan, OperationalSettlement } from "@/agents";
+import {
+  airportInfo,
+  arrivalBuffer,
+  classifyItem,
+  describeDropReason,
+  earliestAfterLanding,
+  isSensibleStart,
+  minutesOfDay,
+  placeDisplacedItem,
+} from "@/core/sanity";
 
 // -------------------------------------------------------------------- types
 
@@ -59,6 +69,37 @@ export interface HydratedTrip {
   graph: ItineraryGraph;
   meta: HydratedTripMeta;
   nodeRefs: Record<string, SwarmNodeRef>;
+  /**
+   * The content_json this graph was hydrated from. Carried so the proposal can
+   * be previewed through the SAME settlement transformer that will later write
+   * the trip — what the traveller is shown before approving is then, by
+   * construction, what approving does.
+   */
+  content?: Record<string, unknown>;
+}
+
+/**
+ * Something the settlement could not finish on the traveller's behalf.
+ *
+ * Deliberately narrow. A booking the swarm really made needs nothing more; this
+ * is only for the cases where claiming otherwise would strand someone: an
+ * indicative flight nobody has ticketed, a pre-booked pickup now waiting at the
+ * wrong hour, a paid ticket that has to be refunded by its seller.
+ */
+/** What a settlement did to the itinerary, item by item — for disclosure. */
+export interface SettlementEffects {
+  /** Titles of itinerary items re-timed (explicitly or by the arrival cascade). */
+  moved: string[];
+  /** Items removed, with the category that decided their fate. */
+  cancelled: Array<{ title: string; category: string }>;
+  /** Ground-transfer legs re-anchored to the new arrival. */
+  transfersRetimed: number;
+}
+
+export interface SettlementFollowUp {
+  kind: "book_replacement_flight" | "retime_pickup_with_provider" | "claim_refund";
+  /** One sentence the traveller can act on. */
+  message: string;
 }
 
 const HOUR_MS = 3_600_000;
@@ -591,6 +632,7 @@ export function hydrateTripFromContent(
       currency: (asString(root.local_currency_code) ?? "EUR").toUpperCase(),
     },
     nodeRefs,
+    content: root,
   };
 }
 
@@ -813,6 +855,47 @@ function restateTitle(title: unknown, oldReference: string, newReference: string
  * WHY (already settled vs. leg not found) so the handler can report
  * honestly instead of guessing.
  */
+/**
+ * Keep the day row that restates a flight pointing at the same booking —
+ * reference only. The LEG is the booking authority: the journey view hides a
+ * restating row as a duplicate of its leg card unless that row is itself
+ * flagged booked or paid, so copying those flags made a settled flight appear
+ * twice. A row the traveller flagged by hand keeps its own flags.
+ */
+function mirrorBookingState(leg: Record<string, unknown>, item: Record<string, unknown>): void {
+  if (typeof leg.booking_reference === "string") item.booking_reference = leg.booking_reference;
+  else delete item.booking_reference;
+}
+
+/**
+ * "Hotel Campo de' Fiori", never "Hotel Hotel Campo de' Fiori". A property
+ * whose own name already says what it is keeps that name; anything else is
+ * introduced as a hotel so the change line still reads.
+ */
+export function hotelChangeLabel(name: string): string {
+  const trimmed = name.trim();
+  if (/\b(hotel|h[oô]tel|hostel|inn|resort|ryokan|lodge|guest ?house|motel|suites?|palace|apartments?|b&b|riad|pousada|parador|albergo|hostal)\b/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `Hotel ${trimmed}`;
+}
+
+/** A hotel action in words: "late check-in at 21:20", not "late_check_in". */
+export function hotelActionPhrase(action: string, newCheckInMs?: number): string {
+  switch (action) {
+    case "late_check_in":
+      return newCheckInMs !== undefined && Number.isFinite(newCheckInMs)
+        ? `late check-in at ${hhmmOf(newCheckInMs)}`
+        : "late check-in";
+    case "rebook":
+      return "room needs rebooking";
+    case "none":
+      return "no change needed";
+    default:
+      return action.replace(/_/g, " ");
+  }
+}
+
 export function applySettlementToContent(
   content: Record<string, unknown>,
   nodeRefs: Record<string, SwarmNodeRef>,
@@ -823,9 +906,19 @@ export function applySettlementToContent(
   changes: string[];
   flightRewriteLanded: boolean;
   flightSkipReason?: "already_settled" | "leg_not_found";
+  /** What the traveller still has to do themselves — empty when nothing. */
+  followUps: SettlementFollowUp[];
+  effects: SettlementEffects;
 } {
   const next = JSON.parse(JSON.stringify(content)) as Record<string, unknown>;
   const changes: string[] = [];
+  const followUps: SettlementFollowUp[] = [];
+  const effects: SettlementEffects = { moved: [], cancelled: [], transfersRetimed: 0 };
+  const settledAt = new Date().toISOString();
+  /** Pre-rewrite endpoints of the disrupted leg (for the transfer re-anchor). */
+  let previousDestinationCode: string | null = null;
+  let previousDestinationCity: string | null = null;
+  let previousOriginCode: string | null = null;
   let flightRewriteLanded = false;
   let flightSkipReason: "already_settled" | "leg_not_found" | undefined;
   /** The disrupted leg's arrival BEFORE the rewrite (NaN when unknown). */
@@ -838,6 +931,42 @@ export function applySettlementToContent(
    *  the flight's own row sits at its DEPARTURE time, which is before the
    *  arrival by definition, and "moving it after landing" is nonsense. */
   const legRestatementKeys = new Set<string>();
+
+  /**
+   * Keep the money trail of anything the settlement removes. The item leaves
+   * the day, but a ticket the traveller paid for does not stop existing — it
+   * becomes a refund to claim, and the record of it must survive.
+   */
+  const cancellations: Record<string, unknown>[] = Array.isArray(next.swarm_cancellations)
+    ? (next.swarm_cancellations as Record<string, unknown>[])
+    : [];
+  const archiveCancellation = (item: Record<string, unknown>, label: string, reason: string): void => {
+    const paidAmount = asFiniteNumber(item.paid_amount);
+    const paidCurrency = asString(item.paid_currency);
+    cancellations.push({
+      title: label,
+      reason,
+      cancelled_at: settledAt,
+      ...(item.booked === true ? { was_booked: true } : {}),
+      ...(item.paid === true && paidAmount !== null ? { paid_amount: paidAmount } : {}),
+      ...(item.paid === true && paidCurrency ? { paid_currency: paidCurrency } : {}),
+    });
+    next.swarm_cancellations = cancellations;
+    if (item.paid === true && paidAmount !== null && paidAmount > 0) {
+      followUps.push({
+        kind: "claim_refund",
+        message: `${label} was paid (${paidAmount}${paidCurrency ? ` ${paidCurrency}` : ""}) — request a refund from the seller.`,
+      });
+    }
+  };
+  const recordCancellation = (item: Record<string, unknown>, label: string, reason: string): void => {
+    archiveCancellation(item, label, reason);
+    effects.cancelled.push({
+      title: label,
+      category: classifyItem({ type: asString(item.type), title: textOf(item.title) || label }),
+    });
+    changes.push(`${label} cancelled — ${reason}`);
+  };
 
   const itinerary = Array.isArray(next.itinerary) ? (next.itinerary as unknown[]) : [];
   const transitGroups = Array.isArray(next.transit_groups)
@@ -876,6 +1005,9 @@ export function applySettlementToContent(
       // entries used to sit after the old landing, because those are exactly
       // the ones that depend on arriving.
       previousArrivalMs = parseEpoch(leg.arrive) ?? Number.NaN;
+      previousDestinationCode = asString(asRecord(leg.destination)?.code)?.toUpperCase() ?? null;
+      previousDestinationCity = asString(asRecord(leg.destination)?.city);
+      previousOriginCode = asString(asRecord(leg.origin)?.code)?.toUpperCase() ?? null;
       leg.reference = newFlight.reference;
       if (newFlight.carrier) leg.carrier = newFlight.carrier;
       // Write the canonical wall-clock form so this leg reads like every
@@ -883,8 +1015,47 @@ export function applySettlementToContent(
       // timeline quote UTC for a flight the traveler boards at a local time.
       leg.depart = toLegStamp(newFlight.depart) ?? newFlight.depart;
       leg.arrive = toLegStamp(newFlight.arrive) ?? newFlight.arrive;
-      leg.booked = true;
-      leg.booking_reference = operational.bookingCode ?? `SWARM-${newFlight.reference}`;
+      // Booking state follows what the provider actually did — exactly what a
+      // traveller booking this leg by hand would record. A priced, provider-
+      // backed fare is a booking. An INDICATIVE recovery option (the zero-
+      // abort ladder's synthetic schedule) is not: no airline sold that seat,
+      // and marking it booked would send someone to the airport without a
+      // ticket. Its schedule is still written — the rest of the day has to be
+      // planned around a realistic arrival — but it stays visibly unbooked.
+      const fareBasis = plan.proposed_resolution.new_flight?.fare_basis;
+      const replacementDestination = asString(plan.proposed_resolution.new_flight?.destination)?.toUpperCase();
+      if (replacementDestination && replacementDestination !== previousDestinationCode) {
+        const info = airportInfo(replacementDestination);
+        const destination = asRecord(leg.destination) ?? {};
+        destination.code = replacementDestination;
+        if (info) destination.city = info.city;
+        leg.destination = destination;
+      }
+      // A provider that did not confirm the order (unconfigured, failed) left
+      // no ticket either — same honest state as an estimate.
+      const unconfirmed = fareBasis === "synthetic_estimate" || operational.booking_status === "recorded";
+      if (unconfirmed) {
+        if (typeof leg.booking_reference === "string" && leg.booking_reference.length > 0) {
+          leg.previous_booking_reference = leg.booking_reference;
+        }
+        delete leg.booking_reference;
+        leg.booked = false;
+        leg.booking_source = fareBasis === "synthetic_estimate" ? "swarm_indicative" : "swarm_unconfirmed";
+        followUps.push({
+          kind: "book_replacement_flight",
+          message:
+            fareBasis === "synthetic_estimate"
+              ? `Flight ${newFlight.reference} is an estimated schedule, not a ticket — ` +
+                "book the replacement with the airline before travelling."
+              : `No ticket was confirmed for flight ${newFlight.reference} — ` +
+                "book it with the airline before travelling.",
+        });
+      } else {
+        leg.booked = true;
+        leg.booking_reference = operational.bookingCode ?? `SWARM-${newFlight.reference}`;
+        leg.booking_source = "swarm_settlement";
+        leg.settled_at = settledAt;
+      }
 
       // Routing: the replacement may be a completely different shape of
       // journey — a 6 h one-stop where the original was a 2 h non-stop. The
@@ -961,7 +1132,8 @@ export function applySettlementToContent(
         if (newFare && asRecord(item.cost)) {
           item.cost = { amount: newFare.amount, currency: newFare.currency };
         }
-        item.booking_reference = leg.booking_reference;
+        // …and the booking it belongs to (reference only — see mirrorBookingState).
+        mirrorBookingState(leg, item);
       }
     } else {
       flightSkipReason = alreadySettled ? "already_settled" : "leg_not_found";
@@ -983,8 +1155,9 @@ export function applySettlementToContent(
     if (!item) continue;
     settledItemKeys.add(`${ref.dayIndex}:${ref.itemIndex}`);
 
+    const shiftedCheckInMs = action.newCheckIn ? Date.parse(action.newCheckIn) : Number.NaN;
     if (action.newCheckIn) {
-      const shiftedMs = Date.parse(action.newCheckIn);
+      const shiftedMs = shiftedCheckInMs;
       if (Number.isFinite(shiftedMs)) {
         item.check_in = isoDateOf(shiftedMs);
         // Also stamp the time component: hydration reads `item.time` through
@@ -994,9 +1167,8 @@ export function applySettlementToContent(
         item.time = hhmmOf(shiftedMs);
       }
     }
-    const note = `Swarm settlement (${action.action.replace(/_/g, " ")}): ${
-      action.note || plan.incident
-    }`;
+    const phrase = hotelActionPhrase(action.action, shiftedCheckInMs);
+    const note = `Swarm settlement (${phrase}): ${action.note || plan.incident}`;
     // Idempotent append (clarity pass): a repeated settlement of the same
     // plan (same booking code / note) never duplicates the swarm_note.
     const existingNote = typeof item.swarm_note === "string" ? item.swarm_note : "";
@@ -1009,7 +1181,7 @@ export function applySettlementToContent(
     if (!noteAlreadyPresent) {
       item.swarm_note = existingNote.length > 0 ? `${existingNote} | ${note}` : note;
     }
-    changes.push(`Hotel ${ref.label}: ${action.action.replace(/_/g, " ")}`);
+    changes.push(`${hotelChangeLabel(ref.label)}: ${phrase}`);
   }
 
   // ── 3. Activity moves / swaps ────────────────────────────────────────────
@@ -1043,6 +1215,14 @@ export function applySettlementToContent(
     if (move.drop === true) {
       if (!itemsAt(ref.dayIndex)) continue;
       dropSplices.push({ dayIndex: ref.dayIndex, itemIndex: ref.itemIndex });
+      const droppedItem = asRecord(itemsAt(ref.dayIndex)?.[ref.itemIndex]);
+      if (droppedItem) {
+        archiveCancellation(droppedItem, ref.label, move.cancellationNote ?? "cancelled by the day reorganization");
+        effects.cancelled.push({
+          title: ref.label,
+          category: classifyItem({ type: asString(droppedItem.type), title: textOf(droppedItem.title) || ref.label }),
+        });
+      }
       changes.push(
         move.cancellationNote
           ? `${ref.label} cancelled — ${move.cancellationNote}`
@@ -1059,6 +1239,22 @@ export function applySettlementToContent(
     if (!sourceDay || !sourceItems) continue;
     const item = asRecord(sourceItems[ref.itemIndex]);
     if (!item) continue;
+
+    // Last line of defence: the proposal path already enforces the invariants,
+    // but a plan persisted before they existed must not write a museum visit
+    // at 02:00 onto a real trip.
+    const moveCategory = classifyItem({ type: asString(item.type), title: textOf(item.title) || ref.label });
+    const moveVerdict = isSensibleStart(
+      moveCategory,
+      textOf(item.title) || ref.label,
+      newMs,
+      minutesOfDay(ref.time),
+    );
+    if (!moveVerdict.ok) {
+      dropSplices.push({ dayIndex: ref.dayIndex, itemIndex: ref.itemIndex });
+      recordCancellation(item, ref.label, describeDropReason(moveVerdict.reason));
+      continue;
+    }
 
     const sourceDate = asString(sourceDay.date) ?? isoDateOf(ref.time);
     const targetDate = isoDateOf(newMs);
@@ -1090,6 +1286,7 @@ export function applySettlementToContent(
       });
     }
 
+    effects.moved.push(name);
     changes.push(
       move.replacementName
         ? `${name} swapped for ${move.replacementName} (${dayLabel} ${hhmmOf(newMs)})`
@@ -1150,11 +1347,89 @@ export function applySettlementToContent(
   // something that sat after it plainly was, and is now impossible.
   const cascadeArrivalMs = newFlight ? (parseEpoch(newFlight.arrive) ?? Number.NaN) : Number.NaN;
   if (flightRewriteLanded && Number.isFinite(cascadeArrivalMs) && Number.isFinite(previousArrivalMs)) {
-    // Time to clear the airport and reach the first stop of the day.
-    const ARRIVAL_BUFFER_MIN = 90;
-    let cursorMs = cascadeArrivalMs + ARRIVAL_BUFFER_MIN * MINUTE_MS;
-    let movedCount = 0;
+    // How long after touchdown the traveller can actually be somewhere. Sized
+    // per route (border control only when there is a border, the real ride
+    // into THIS city) instead of one flat number for every airport on earth.
+    const replacementOrigin =
+      asString(plan.proposed_resolution.new_flight?.origin)?.toUpperCase() ?? previousOriginCode;
+    const replacementDestination =
+      asString(plan.proposed_resolution.new_flight?.destination)?.toUpperCase() ?? previousDestinationCode;
+    const buffer = arrivalBuffer(replacementOrigin, replacementDestination);
+    const readyForPickupMs = cascadeArrivalMs + buffer.readyForPickupMinutes * MINUTE_MS;
+    const readyInCityMs = cascadeArrivalMs + buffer.readyInCityMinutes * MINUTE_MS;
 
+    // ── 4a. Ground transfers waiting at the airport ──────────────────────────
+    //
+    // The cascade below only ever looked at itinerary items, so a pre-booked
+    // pickup in transit_groups stayed at 12:45 for a plane landing at 19:50.
+    // A transfer is waiting on this flight when it leaves from where the flight
+    // used to land, after it used to land. It is re-anchored to when the
+    // traveller is really standing in arrivals, and follows the flight if the
+    // replacement lands at a different airport.
+    let transfersMoved = 0;
+    const disruptedTransitIndex = disruptedRef?.transitIndex;
+    transitGroups.forEach((rawLeg, index) => {
+      if (index === disruptedTransitIndex) return;
+      const leg = asRecord(rawLeg);
+      if (!leg) return;
+      if (classifyItem({ method: asString(leg.method) }) !== "ground_transfer") return;
+      const departMs = parseEpoch(leg.depart);
+      if (departMs === null) return;
+      const origin = asRecord(leg.origin);
+      const originCode = asString(origin?.code)?.toUpperCase() ?? null;
+      const originCity = asString(origin?.city)?.toLowerCase() ?? null;
+      const leavesFromArrival =
+        (originCode !== null && originCode === previousDestinationCode) ||
+        (originCode === null &&
+          originCity !== null &&
+          previousDestinationCity !== null &&
+          originCity === previousDestinationCity.toLowerCase());
+      const waitingOnTheOldLanding =
+        departMs >= previousArrivalMs - 30 * MINUTE_MS && departMs <= previousArrivalMs + 12 * 60 * MINUTE_MS;
+      if (!leavesFromArrival || !waitingOnTheOldLanding) return;
+
+      let touched = false;
+      if (
+        replacementDestination &&
+        originCode !== null &&
+        originCode !== replacementDestination
+      ) {
+        const info = airportInfo(replacementDestination);
+        leg.origin = { ...(origin ?? {}), code: replacementDestination, ...(info ? { city: info.city } : {}) };
+        // A terminal belongs to the airport it was written for.
+        delete (leg.origin as Record<string, unknown>).terminal;
+        touched = true;
+      }
+      const pickupMs = earliestAfterLanding(
+        departMs,
+        previousArrivalMs,
+        cascadeArrivalMs,
+        buffer.readyForPickupMinutes,
+      );
+      if (departMs < pickupMs) {
+        leg.depart = toLegStamp(new Date(pickupMs).toISOString());
+        touched = true;
+      }
+      if (!touched) return;
+      transfersMoved += 1;
+      effects.transfersRetimed += 1;
+      const newDepartMs = parseEpoch(leg.depart) ?? departMs;
+      changes.push(
+        `Airport transfer re-timed to ${hhmmOf(newDepartMs)} to meet the new arrival`,
+      );
+      if (leg.booked === true) {
+        followUps.push({
+          kind: "retime_pickup_with_provider",
+          message:
+            `Your booked transfer now needs to meet you at ${hhmmOf(newDepartMs)}` +
+            `${replacementDestination ? ` at ${replacementDestination}` : ""} — ` +
+            "confirm the new pickup time with the transfer company.",
+        });
+      }
+    });
+
+    // ── 4b. Everything on the itinerary that depended on landing ────────────
+    //
     // Every entry, across every day — matched on its TRUE instant rather than
     // on the day it happens to be filed under. A stay carries its own
     // `check_in` date, which can differ from its day's `date`; hydration reads
@@ -1163,8 +1438,9 @@ export function applySettlementToContent(
     interface Scheduled {
       item: Record<string, unknown>;
       key: string;
+      dayIndex: number;
+      itemIndex: number;
       atMs: number;
-      isStay: boolean;
     }
     const scheduled: Scheduled[] = [];
     for (const [dayIndex, rawDay] of itinerary.entries()) {
@@ -1188,60 +1464,123 @@ export function applySettlementToContent(
         scheduled.push({
           item,
           key: `${dayIndex}:${itemIndex}`,
+          dayIndex,
+          itemIndex,
           atMs: baseMs + minutes * MINUTE_MS,
-          isStay,
         });
       }
     }
     scheduled.sort((a, b) => a.atMs - b.atMs);
 
+    let cursorMs = cascadeArrivalMs;
+    let movedCount = 0;
+    const movedLabels: string[] = [];
+    // Check-ins an explicit hotel action already placed after the landing. They
+    // are processed in their ORIGINAL order below, so without reserving them up
+    // front a dinner could be booked for the very minute the traveller is
+    // still dropping their bags.
+    const BAG_DROP_MS = 30 * MINUTE_MS;
+    const occupied = scheduled
+      .filter(
+        (entry) =>
+          settledItemKeys.has(entry.key) &&
+          entry.atMs >= readyInCityMs &&
+          ["stay", "hotel"].includes(asString(entry.item.type)?.toLowerCase() ?? ""),
+      )
+      .map((entry) => ({ start: entry.atMs, end: entry.atMs + BAG_DROP_MS }));
+    const clearOfOccupied = (ms: number): number => {
+      let at = ms;
+      for (const window of occupied) {
+        if (at >= window.start && at < window.end) at = window.end;
+      }
+      return at;
+    };
+    const cascadeDrops: Array<{ dayIndex: number; itemIndex: number }> = [];
+
     for (const entry of scheduled) {
+      // The flight's own row is not a thing that waits for the flight.
+      if (legRestatementKeys.has(entry.key)) continue;
       // An explicit placement is respected — but only when it is POSSIBLE.
       //
       // The hotel action's new check-in comes from the graph propagation of the
       // NOMINAL delay, not from the replacement the traveller actually chose.
       // Live proof: an agent moved a check-in to 01:00 for a flight that lands
-      // at 01:05, five minutes after the room was supposedly taken. Deferring
-      // to an impossible instruction is not respect, it is just a slower way of
-      // writing a broken trip.
-      // The flight's own row is not a thing that waits for the flight.
-      if (legRestatementKeys.has(entry.key)) continue;
+      // at 01:05, five minutes after the room was supposedly taken.
       const explicitlyPlaced = settledItemKeys.has(entry.key);
-      if (explicitlyPlaced && entry.atMs >= cascadeArrivalMs) {
+      if (explicitlyPlaced && entry.atMs >= readyInCityMs) {
         if (entry.atMs >= cursorMs) cursorMs = entry.atMs;
         continue;
       }
       // Was it already waiting on the old landing, and is it now impossible?
       //
-      // The trigger is the ARRIVAL itself, not the arrival plus the buffer:
-      // settling a plan must fix what the new flight broke, not re-plan a day
-      // that still works. A replacement landing at the same time as the
-      // original leaves a tight transfer exactly as tight as the traveller
-      // already accepted, and shifting it would be a change nobody asked for.
+      // The trigger is the ARRIVAL, judged against when the traveller can
+      // really be there: settling a plan must fix what the new flight broke,
+      // not re-plan a day that still works.
+      const title = textOf(entry.item.title);
+      const category = classifyItem({ type: asString(entry.item.type), title });
       const wasWaitingOnTheOldLanding = entry.atMs >= previousArrivalMs;
-      const isNowImpossible = entry.atMs < cascadeArrivalMs;
-      // For an explicitly-placed entry the first half no longer applies: the
-      // agent already decided it belongs after the flight, so being before the
-      // new arrival is enough on its own.
+      const earliestMs = explicitlyPlaced
+        ? readyInCityMs
+        : earliestAfterLanding(
+            entry.atMs,
+            previousArrivalMs,
+            cascadeArrivalMs,
+            category === "ground_transfer" ? buffer.readyForPickupMinutes : buffer.readyInCityMinutes,
+          );
+      const isNowImpossible = entry.atMs < earliestMs;
       if (!isNowImpossible || !(wasWaitingOnTheOldLanding || explicitlyPlaced)) {
         if (entry.atMs >= cursorMs) cursorMs = entry.atMs;
         continue;
       }
-      entry.item.time = hhmmOf(cursorMs);
-      if (entry.isStay) {
+
+      // A ride into town is anchored on the arrivals hall, not on the queue of
+      // things that happen once the traveller is in town.
+      const placementFloor =
+        category === "ground_transfer" || category === "lodging"
+          ? earliestMs
+          : clearOfOccupied(Math.max(cursorMs, earliestMs));
+      const placement = placeDisplacedItem({ category, title, originalMs: entry.atMs }, placementFloor);
+      if (placement.action === "keep") continue;
+      if (placement.action === "drop") {
+        // Importance decides who gives way: never the flight, never the bed.
+        cascadeDrops.push({ dayIndex: entry.dayIndex, itemIndex: entry.itemIndex });
+        recordCancellation(entry.item, title || "An activity", describeDropReason(placement.reason));
+        continue;
+      }
+      entry.item.time = hhmmOf(placement.atMs);
+      if (title) effects.moved.push(title);
+      movedLabels.push(`${title || "An item"} → ${hhmmOf(placement.atMs)}`);
+      if (category === "lodging") {
         // The stay's own check-in date moves with it, or hydration snaps the
-        // room straight back on the next load.
-        entry.item.check_in = isoDateOf(cursorMs);
+        // room straight back on the next load. A late check-in consumes no
+        // slot in the day: the bed does not block the evening.
+        entry.item.check_in = isoDateOf(placement.atMs);
+        movedCount += 1;
+        // Dropping bags takes a moment; the bed itself does not block the evening.
+        cursorMs = Math.max(cursorMs, placement.atMs + 30 * MINUTE_MS);
+        continue;
       }
       movedCount += 1;
-      cursorMs += 45 * MINUTE_MS;
+      cursorMs =
+        category === "ground_transfer"
+          ? Math.max(cursorMs, placement.atMs)
+          : placement.atMs + 45 * MINUTE_MS;
     }
 
+    // Splice cascade drops per day, DESCENDING, so indices stay valid.
+    cascadeDrops.sort((a, b) => a.dayIndex - b.dayIndex || b.itemIndex - a.itemIndex);
+    for (const drop of cascadeDrops) itemsAt(drop.dayIndex)?.splice(drop.itemIndex, 1);
+
     if (movedCount > 0) {
+      // Name what moved: "1 item moved" told the traveller something changed
+      // without telling them what, on the one screen meant to disclose it.
       changes.push(
-        `Arrival cascade: ${movedCount} item${movedCount > 1 ? "s" : ""} moved after the new landing`,
+        movedLabels.length <= 3
+          ? `Arrival cascade: ${movedLabels.join(", ")}`
+          : `Arrival cascade: ${movedCount} items moved after the new landing`,
       );
     }
+    void transfersMoved;
   }
 
   return {
@@ -1249,6 +1588,8 @@ export function applySettlementToContent(
     changes,
     flightRewriteLanded,
     ...(flightSkipReason !== undefined ? { flightSkipReason } : {}),
+    followUps,
+    effects,
   };
 }
 
@@ -1269,6 +1610,8 @@ export type SettlePlanResult =
        *  client can seed its optimistic-concurrency registry without a
        *  refetch. Absent when the rev is unreadable. */
       contentRev?: number;
+      /** What the traveller still has to do themselves (additive). */
+      followUps?: SettlementFollowUp[];
     }
   | { conflict: true }
   | null;
@@ -1368,7 +1711,7 @@ export async function settlePlanOnTrip(
         }
         refs = rehydrated.nodeRefs;
       }
-      const { content, changes, flightRewriteLanded, flightSkipReason } = applySettlementToContent(
+      const { content, changes, flightRewriteLanded, flightSkipReason, followUps } = applySettlementToContent(
         row.content,
         refs,
         plan,
@@ -1382,6 +1725,7 @@ export async function settlePlanOnTrip(
           flightRewriteLanded,
           ...(flightSkipReason !== undefined ? { flightSkipReason } : {}),
           ...(written.newRev !== null ? { contentRev: written.newRev } : {}),
+          followUps,
         };
       }
       // 0 rows ⇒ concurrent write; loop re-reads and re-applies once.

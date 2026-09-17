@@ -363,6 +363,13 @@ describe("searchAlternativeFlights", () => {
     expect(body.infantNum).toBe(0);
     expect(body.currency).toBe("USD");
     expect(typeof body.requestId).toBe("string");
+    // Recovery inventory is carrier/cabin unrestricted. Atlas includes LCC
+    // content by default; its only documented carrier filter is `airlines`,
+    // so omission means all airlines rather than an invented include flag.
+    expect(body).not.toHaveProperty("airlines");
+    expect(body).not.toHaveProperty("cabinClass");
+    expect(body).not.toHaveProperty("includeLowCost");
+    expect(body).not.toHaveProperty("includeBudgetCarriers");
 
     expect(result.referenceFlightId).toBe("flight-xy123");
     expect(result.options).toHaveLength(1);
@@ -704,6 +711,15 @@ describe("bookFlight (verify → order → best-effort pay)", () => {
     expect(
       JSON.parse((fetchMock.mock.calls[2] as [string, RequestInit])[1].body as string),
     ).toEqual({ orderNo: "ORD-42", paymentMethod: 1 });
+  });
+
+  it.each([406, 615])("keeps processing payment %s pending", async (status) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: 0, sessionId: "sess-pending" }))
+      .mockResolvedValueOnce(jsonResponse({ status: 0, orderNo: "ORD-PENDING" }))
+      .mockResolvedValueOnce(jsonResponse({ status }));
+    const booking = await makeProvider().bookFlight("RT-123");
+    expect(booking.status).toBe("pending");
+    expect(booking.confirmationCode).toBe("ORD-PENDING");
   });
 
   it("still returns the orderNo when pay.do fails (payment never blocks)", async () => {

@@ -28,6 +28,10 @@ final class SwarmAvailability {
     /// True once the server has answered at least once this launch.
     private(set) var didLoad = false
 
+    /// True only when the server identifies the known Atlas test endpoint.
+    /// Keep test inventory distinct from a live ticket in the approval UI.
+    private(set) var usesFlightSandbox = false
+
     private static let cacheKey = "swarm.enabled.cached"
     private static let overrideKey = "swarm.forceEnabled"
 
@@ -56,6 +60,7 @@ final class SwarmAvailability {
             // Absent key ⇒ an older Worker that predates the switch: treat that
             // as enabled rather than hiding a working feature.
             let enabled = (json["swarmEnabled"] as? Bool) ?? true
+            usesFlightSandbox = (json["atlasSandboxHost"] as? String)?.lowercased() == "sandbox.atriptech.com"
             isEnabled = enabled
             didLoad = true
             UserDefaults.standard.set(enabled, forKey: Self.cacheKey)

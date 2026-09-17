@@ -23,6 +23,14 @@
 // --------------------------------------------------------------------- types
 
 import {
+  configuredGeminiModel,
+  emitGeminiUsage,
+  readGeminiUsage,
+  type GeminiUsageEvent,
+  type GeminiUsageObserver,
+  type GeminiCallBudget,
+} from "../geminiUsage";
+import {
   GEMINI_MODEL_CASCADE,
   modelLadder,
   noteModelExhausted,
@@ -94,6 +102,8 @@ export interface TradeoffQuestionContext {
 }
 
 export interface GeminiLiaisonConfig {
+  /** Opt-in local routing for an empty answer set or exact known preference ids. */
+  constraintRouting?: "model" | "deterministic_known";
   /** Gemini API key; defaults to `process.env.GEMINI_API_KEY`. */
   apiKey?: string;
   /** Per-call deadline in ms (default 20s) — shared by the attempt AND its
@@ -107,6 +117,10 @@ export interface GeminiLiaisonConfig {
    */
   /** Injectable fetch implementation (tests). */
   fetchImpl?: typeof fetch;
+  /** One sanitized measurement per actual HTTP attempt, including failures. */
+  onUsage?: GeminiUsageObserver;
+  /** Shared across liaison and day replanning for one resolve invocation. */
+  sharedBudget?: GeminiCallBudget;
   /**
    * Task 21 (additive): retries on a quota classify (`quota_429` — 429/503).
    * Default 0 (single-shot — the assess rail). The async resolve rail wires
@@ -533,6 +547,10 @@ interface LocalizedPreferenceStrings {
   dropActivityDetail: string;
   /** "from $X" construction per locale. */
   fromTemplate: string;
+  /** A candidate that's actually CHEAPER than the fare already paid nets a
+   *  refund (negative `net`) — this renders that honestly instead of a
+   *  nonsensical negative price ("from $-43.09"). */
+  refundTemplate: string;
   nonstopWord: string;
   stopOne: string;
   stopMany: string;
@@ -568,6 +586,7 @@ const PREFERENCE_STRINGS: Record<SupportedLanguage, LocalizedPreferenceStrings> 
     dropActivityLabel: "Drop {x}",
     dropActivityDetail: "Frees up the day — we keep {y} instead",
     fromTemplate: "from {price}",
+    refundTemplate: "refunds {price}",
     nonstopWord: "nonstop",
     stopOne: "1 stop",
     stopMany: "{n} stops",
@@ -601,6 +620,7 @@ const PREFERENCE_STRINGS: Record<SupportedLanguage, LocalizedPreferenceStrings> 
     dropActivityLabel: "{x} streichen",
     dropActivityDetail: "Macht den Tag frei — wir behalten stattdessen {y}",
     fromTemplate: "ab {price}",
+    refundTemplate: "erstattet {price}",
     nonstopWord: "direkt",
     stopOne: "1 Zwischenstopp",
     stopMany: "{n} Zwischenstopps",
@@ -634,6 +654,7 @@ const PREFERENCE_STRINGS: Record<SupportedLanguage, LocalizedPreferenceStrings> 
     dropActivityLabel: "Cancelar {x}",
     dropActivityDetail: "Libera el día: mantenemos {y} en su lugar",
     fromTemplate: "desde {price}",
+    refundTemplate: "reembolsa {price}",
     nonstopWord: "directo",
     stopOne: "1 escala",
     stopMany: "{n} escalas",
@@ -667,6 +688,7 @@ const PREFERENCE_STRINGS: Record<SupportedLanguage, LocalizedPreferenceStrings> 
     dropActivityLabel: "Abandonner {x}",
     dropActivityDetail: "Libère la journée — nous gardons {y} à la place",
     fromTemplate: "dès {price}",
+    refundTemplate: "rembourse {price}",
     nonstopWord: "direct",
     stopOne: "1 escale",
     stopMany: "{n} escales",
@@ -700,6 +722,7 @@ const PREFERENCE_STRINGS: Record<SupportedLanguage, LocalizedPreferenceStrings> 
     dropActivityLabel: "放弃{x}",
     dropActivityDetail: "腾出时间——改保{y}",
     fromTemplate: "{price}起",
+    refundTemplate: "退款{price}",
     nonstopWord: "直飞",
     stopOne: "1次中转",
     stopMany: "{n}次中转",
@@ -849,6 +872,12 @@ function cheapestFactOf(facts: FlightFact[]): FlightFact | null {
 
 function fromPhrase(fact: FlightFact, p: LocalizedPreferenceStrings): string {
   if (fact.net === null) return "";
+  // A candidate cheaper than the fare already paid nets a REFUND (negative
+  // `net`) — say so, rather than feeding the raw signed number into "from
+  // {price}" and printing a nonsensical negative price ("from $-43.09").
+  if (fact.net < 0) {
+    return fillTemplate(p.refundTemplate, { price: priceLabel(fact.currency, -fact.net) });
+  }
   return fillTemplate(p.fromTemplate, { price: priceLabel(fact.currency, fact.net) });
 }
 
@@ -1518,6 +1547,13 @@ export class GeminiLiaisonAgent {
   private readonly timeoutMs: number;
   private model: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly constraintRouting: "model" | "deterministic_known";
+  private constraintRoute: "model" | "deterministic" = "model";
+  get lastConstraintRoute(): "model" | "deterministic" {
+    return this.constraintRoute;
+  }
+  private readonly onUsage: GeminiUsageObserver | undefined;
+  private readonly sharedBudget: GeminiCallBudget | undefined;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
   private readonly callBudget: number;
@@ -1529,6 +1565,12 @@ export class GeminiLiaisonAgent {
   private degradeReason: GeminiDegradeReason | undefined;
 
   constructor(config: GeminiLiaisonConfig = {}) {
+    this.constraintRouting =
+      config.constraintRouting ??
+      (typeof process !== "undefined" &&
+      process.env.SWARM_CONSTRAINT_ROUTING === "deterministic_known"
+        ? "deterministic_known"
+        : "model");
     this.apiKey =
       config.apiKey !== undefined && config.apiKey.length > 0
         ? config.apiKey
@@ -1536,7 +1578,9 @@ export class GeminiLiaisonAgent {
           ? process.env.GEMINI_API_KEY
           : undefined;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.model = config.model ?? DEFAULT_MODEL;
+    this.model = config.model ?? configuredGeminiModel("liaison", DEFAULT_MODEL);
+    this.onUsage = config.onUsage;
+    this.sharedBudget = config.sharedBudget;
     this.maxRetries = Math.max(0, Math.floor(config.maxRetries ?? 0));
     this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.callBudget = config.callBudget ?? GEMINI_CALLS_PER_MISSION;
@@ -1643,7 +1687,33 @@ export class GeminiLiaisonAgent {
     questions: TradeoffQuestion[],
     answers: TradeoffAnswer[],
   ): Promise<ResolutionConstraints> {
+    this.degradeReason = undefined;
+    this.constraintRoute = "model";
     const deterministic = deriveConstraintsFromAnswers(questions, answers);
+    const exactRules = new Set([
+      "nonstop",
+      "cheaper_with_stop",
+      "with_stop",
+      "same_day",
+      "cheaper_later",
+      "later_day",
+    ]);
+    const answeredQuestions = new Set(answers.map((answer) => answer.question_id));
+    const knownAnswers =
+      answeredQuestions.size === answers.length &&
+      answers.every(
+        (answer) =>
+          exactRules.has(answer.option_id) &&
+          questions.some(
+            (question) =>
+              question.id === answer.question_id &&
+              question.options.some((option) => option.id === answer.option_id),
+          ),
+      );
+    if (this.constraintRouting === "deterministic_known" && knownAnswers) {
+      this.constraintRoute = "deterministic";
+      return deterministic;
+    }
     try {
       if (!this.apiKey) {
         this.degrade(
@@ -1722,7 +1792,18 @@ export class GeminiLiaisonAgent {
     }
 
     /** One attempt against `model`, with a deadline of its own. */
+    let budgetExhausted = false;
     const attempt = async (model: string): Promise<GeminiCallResult> => {
+      // Recheck AFTER any retry backoff: another concurrent day can consume
+      // the last slot while this call is waiting. Reserve before the next await.
+      if (
+        this.geminiCallsUsedCount >= this.callBudget ||
+        (this.sharedBudget && !this.sharedBudget.tryReserve())
+      ) {
+        budgetExhausted = true;
+        this.degradeReason = "quota_429";
+        return { ok: false, reason: "quota_429" };
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
@@ -1757,6 +1838,7 @@ export class GeminiLiaisonAgent {
     let rung = 0;
     while (
       !result.ok &&
+      !budgetExhausted &&
       (result.reason === "quota_429" || result.reason === "http_error") &&
       rung < this.maxRetries &&
       rung + 1 < ladder.length &&
@@ -1774,7 +1856,7 @@ export class GeminiLiaisonAgent {
       if (result.ok) noteModelHealthy(ladder[rung]);
     }
     if (!result.ok) {
-      if (result.reason === "quota_429") noteModelExhausted(ladder[rung]);
+      if (!budgetExhausted && result.reason === "quota_429") noteModelExhausted(ladder[rung]);
       this.degradeReason = result.reason;
     }
     return result;
@@ -1791,6 +1873,9 @@ export class GeminiLiaisonAgent {
     /** Defaults to the primary; the overload retry passes the lighter tier. */
     model: string = this.model,
   ): Promise<GeminiCallResult> {
+    const startedAt = Date.now();
+    let usage: GeminiUsageEvent["usage"] = null;
+    let outcome: GeminiUsageEvent["outcome"] = "exception";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
     try {
       const response = await this.fetchImpl(url, {
@@ -1819,6 +1904,7 @@ export class GeminiLiaisonAgent {
         console.error(
           `[liaison] Gemini HTTP ${response.status} (${response.statusText}): ${bodyText.slice(0, 500)} (degrade: ${reason})`,
         );
+        outcome = reason;
         return { ok: false, reason };
       }
       const data = (await response.json()) as {
@@ -1828,11 +1914,14 @@ export class GeminiLiaisonAgent {
           finishReason?: string;
         }>;
         error?: { message?: unknown };
+        usageMetadata?: unknown;
       };
+      usage = readGeminiUsage(data?.usageMetadata);
       if (data?.error) {
         console.error(
           `[liaison] Gemini error payload: ${String(data.error.message ?? "unknown")} (degrade: http_error)`,
         );
+        outcome = "http_error";
         return { ok: false, reason: "http_error" };
       }
       const finishReason = data?.candidates?.[0]?.finishReason;
@@ -1850,8 +1939,10 @@ export class GeminiLiaisonAgent {
                 finishReason ?? "none",
               )}) (degrade: invalid_output)`,
         );
+        outcome = "invalid_output";
         return { ok: false, reason: "invalid_output" };
       }
+      outcome = "text_received";
       return { ok: true, text };
     } catch (error) {
       const aborted = error instanceof Error && error.name === "AbortError";
@@ -1860,7 +1951,16 @@ export class GeminiLiaisonAgent {
         `[liaison] Gemini call failed${aborted ? " (timeout)" : ""} (degrade: ${reason}):`,
         error,
       );
+      outcome = reason;
       return { ok: false, reason };
+    } finally {
+      emitGeminiUsage(this.onUsage, {
+        model,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        maxOutputTokens: maxOutputTokens,
+        outcome,
+        usage,
+      });
     }
   }
 }

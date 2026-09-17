@@ -227,6 +227,23 @@ const ATLAS_AIRLINE_NAMES: Record<string, string> = {
   CI: "China Airlines",
   KE: "Korean Air",
   OZ: "Asiana Airlines",
+  "7C": "Jeju Air",
+  LJ: "Jin Air",
+  BX: "Air Busan",
+  TW: "T'way Air",
+  ZE: "Eastar Jet",
+  RS: "Air Seoul",
+  JT: "Lion Air",
+  ID: "Batik Air",
+  QZ: "Indonesia AirAsia",
+  IT: "Tigerair Taiwan",
+  MF: "Xiamen Air",
+  HO: "Juneyao Airlines",
+  "9C": "Spring Airlines",
+  PG: "Bangkok Airways",
+  FD: "Thai AirAsia",
+  DD: "Nok Air",
+  WE: "Thai Smile",
   MU: "China Eastern",
   CZ: "China Southern",
   CA: "Air China",
@@ -411,7 +428,7 @@ export function routingToFlightOption(raw: unknown, adults: number): FlightOptio
   // rebooking could only ever tell the traveller HOW MANY stops it had chosen
   // — never where, on what, or how long the connection was.
   const mappedSegments: FlightSegment[] = parsedSegments.map((segment) => ({
-    carrier: segment.carrierName ?? segment.carrier,
+    carrier: segment.carrierName ?? ATLAS_AIRLINE_NAMES[segment.carrier] ?? segment.carrier,
     flightNumber: segment.flightNumber,
     origin: segment.depAirport,
     destination: segment.arrAirport,
@@ -514,7 +531,7 @@ const SANDBOX_PASSENGER: Record<string, unknown> = {
 // "001-5551234567" could never pass.
 const SANDBOX_CONTACT: Record<string, unknown> = {
   name: "TEST/TRAVELER",
-  email: "sandbox@example.com",
+  email: "sandbox@globeplanner.app",
   mobile: "0001-55512345",
 };
 
@@ -607,12 +624,13 @@ export class AtlasFlightProvider implements FlightProvider {
       // `"currency":"EUR"`, adultPrice 52.98). SANDBOX_CURRENCY stays the
       // fallback for callers that supply no context.
       currency: quoteCurrency(routeContext?.currency),
-      // Search the cabin the traveller already holds. Omitted entirely when
-      // unknown, so the upstream keeps its own default rather than being
-      // pinned to economy by us.
-      ...(atlasCabinClass(routeContext?.cabin) !== null
-        ? { cabinClass: atlasCabinClass(routeContext?.cabin) }
-        : {}),
+      // Recovery searches are deliberately unrestricted. Atlas is itself an
+      // LCC-content API and its documented carrier restriction is the optional
+      // `airlines` element; omitting it permits every carrier. `includeLowCost`
+      // / `includeBudgetCarriers` are not Atlas search.do fields, so sending
+      // them would risk a business rejection. Cabin is also omitted here:
+      // many LCCs do not publish RBD/cabin data and pinning the old cabin hid
+      // otherwise viable economy recovery inventory.
       });
     } catch (error) {
       // ONLY a request-level decline. A gzip misconfiguration, a search-limit
@@ -800,9 +818,9 @@ export class AtlasFlightProvider implements FlightProvider {
     let bookingStatus: BookingConfirmation["status"] = "pending";
     try {
       const pay = await this.post("/pay.do", { orderNo, paymentMethod: 1 });
-      // 406 / 615 = payment processing — still counts as accepted upstream.
+      // 406 / 615 mean processing, not a confirmed payment.
       bookingStatus =
-        pay.status === 0 || pay.status === 406 || pay.status === 615 ? "confirmed" : "pending";
+        pay.status === 0 ? "confirmed" : "pending";
     } catch (error) {
       console.warn(
         "[atlas] best-effort pay.do failed (order kept):",

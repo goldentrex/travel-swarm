@@ -18,7 +18,7 @@ import Foundation
 // MARK: - Demo server origin (DEBUG ONLY)
 //
 // Shared, configurable origin for the hackathon demo server. The default is
-// the isolated swarm demo Worker (https://your-worker.example.com). Override
+// the isolated swarm demo Worker (https://swarm.globeplanner.app). Override
 // via the UserDefaults key `SwarmConfig.overrideKey` for local LAN dev when
 // the Mac's DHCP IP changes, e.g.:
 //   defaults write com.goldentrex.globeplanner swarm.demoOrigin "http://192.168.1.20:8080"
@@ -36,7 +36,7 @@ enum SwarmConfig {
             return cleaned
         }
         // Default: the isolated swarm demo Worker.
-        return "https://your-worker.example.com"
+        return "https://swarm.globeplanner.app"
     }
 
     static var apiBase: String { origin + "/api/hackathon" }
@@ -346,6 +346,34 @@ enum SwarmService {
         /// Why no replacement flight could be offered. Only `partner_coverage`
         /// names the provider, and the server proves it before saying so.
         let noFlightReason: NoFlightReason?
+        /// What approving WILL write, produced server-side by running the
+        /// settlement itself against the trip as it stands. Absent on older
+        /// payloads. Rendered before Approve so nothing changes unannounced.
+        let settlementPreview: SettlementPreview?
+
+        struct SettlementPreview: Decodable {
+            let changes: [String]
+            let followUps: [FollowUp]
+
+            enum CodingKeys: String, CodingKey {
+                case changes
+                case followUps = "follow_ups"
+            }
+
+            init(changes: [String], followUps: [FollowUp]) {
+                self.changes = changes
+                self.followUps = followUps
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                changes = ((try? c.decode([String].self, forKey: .changes)) ?? [])
+                    .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                followUps = (try? c.decode([FollowUp].self, forKey: .followUps)) ?? []
+            }
+
+            var isEmpty: Bool { changes.isEmpty && followUps.isEmpty }
+        }
 
         struct NoFlightReason: Decodable {
             let kind: String
@@ -371,12 +399,18 @@ enum SwarmService {
             let nightsLost: Int
             let activitiesLost: Int
             let daysLost: Int
+            /// Invalidated airport/ground transfers (additive; 0 when absent).
+            let transfersLost: Int
+            /// Meals among the lost items, counted apart from activities.
+            let mealsLost: Int
 
             enum CodingKeys: String, CodingKey {
                 case summary
                 case nightsLost = "nights_lost"
                 case activitiesLost = "activities_lost"
                 case daysLost = "days_lost"
+                case transfersLost = "transfers_lost"
+                case mealsLost = "meals_lost"
             }
 
             init(from decoder: Decoder) throws {
@@ -385,6 +419,8 @@ enum SwarmService {
                 nightsLost = (try? c.decode(Int.self, forKey: .nightsLost)) ?? 0
                 activitiesLost = (try? c.decode(Int.self, forKey: .activitiesLost)) ?? 0
                 daysLost = (try? c.decode(Int.self, forKey: .daysLost)) ?? 0
+                transfersLost = (try? c.decode(Int.self, forKey: .transfersLost)) ?? 0
+                mealsLost = (try? c.decode(Int.self, forKey: .mealsLost)) ?? 0
             }
         }
 
@@ -395,6 +431,7 @@ enum SwarmService {
             case ledgerSummary = "ledger_summary"
             case tripImpact = "trip_impact"
             case noFlightReason = "no_flight_reason"
+            case settlementPreview = "settlement_preview"
         }
 
         init(from decoder: Decoder) throws {
@@ -405,6 +442,8 @@ enum SwarmService {
             ledgerSummary = (try? c.decode([String].self, forKey: .ledgerSummary)) ?? []
             tripImpact = try? c.decode(TripImpact.self, forKey: .tripImpact)
             noFlightReason = try? c.decode(NoFlightReason.self, forKey: .noFlightReason)
+            settlementPreview = (try? c.decode(SettlementPreview.self, forKey: .settlementPreview))
+                .flatMap { $0.isEmpty ? nil : $0 }
         }
     }
 
@@ -580,6 +619,16 @@ enum SwarmService {
         /// so the proposal card must derive from them too or it would promise
         /// "Non-stop" for a journey the timeline then shows with a connection.
         let segments: [NewFlightSegment]?
+        /// How `cost` was established: "verified" (re-priced by the provider),
+        /// "search_reference" (published search price, not re-verified) or
+        /// "synthetic_estimate" (the zero-abort ladder's estimate — no provider
+        /// sold it). nil on older payloads, read as provider-backed.
+        let fareBasis: String?
+
+        /// The price is an estimate nobody sold — badge it, never present it as a quote.
+        var isIndicativeEstimate: Bool { fareBasis == "synthetic_estimate" }
+        /// A real provider price that has not been re-verified yet.
+        var isUnverifiedPrice: Bool { fareBasis == "search_reference" }
 
         /// One hop of the replacement, mirroring `TransitSegment` on the leg.
         struct NewFlightSegment: Decodable {
@@ -622,6 +671,8 @@ enum SwarmService {
             stopAirports = (try? c.decode([String].self, forKey: CodingKeyBox("stopAirports")))
                 ?? (try? c.decode([String].self, forKey: CodingKeyBox("stop_airports")))
             segments = try? c.decode([NewFlightSegment].self, forKey: CodingKeyBox("segments"))
+            fareBasis = (try? c.decode(String.self, forKey: CodingKeyBox("fare_basis")))
+                ?? (try? c.decode(String.self, forKey: CodingKeyBox("fareBasis")))
         }
 
         /// Layover points, derived from the hops when we have them.
@@ -708,17 +759,23 @@ enum SwarmService {
         /// "late_check_in" | "rebook" | "none"
         let action: String
         let fee: Double
+        let requiresConfirmation: Bool
+        let note: String?
 
         enum CodingKeys: String, CodingKey {
             case hotelName = "hotel_name"
             case action
             case fee
+            case requiresConfirmation = "requires_confirmation"
+            case note
         }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             hotelName = (try? c.decode(String.self, forKey: .hotelName)) ?? "Hotel"
             action = (try? c.decode(String.self, forKey: .action)) ?? "none"
+            requiresConfirmation = (try? c.decode(Bool.self, forKey: .requiresConfirmation)) ?? false
+            note = try? c.decode(String.self, forKey: .note)
             fee = (try? c.decode(Double.self, forKey: .fee)) ?? 0
         }
     }
@@ -885,10 +942,11 @@ enum SwarmService {
         /// NEW (Phase C) — see `MissionResponse.degraded`.
         let degraded: Bool
         let degradedReason: String?
+        let receipt: ApproveResponse?
 
         enum CodingKeys: String, CodingKey {
             case resolutionId = "resolution_id"
-            case state
+            case state, receipt
             case trace
             case plan
             case plans
@@ -897,7 +955,7 @@ enum SwarmService {
         }
 
         init(resolutionId: String, state: String, trace: [TraceEntry]?, plan: Plan?,
-             plans: [Plan]? = nil, degraded: Bool = false, degradedReason: String? = nil) {
+             plans: [Plan]? = nil, degraded: Bool = false, degradedReason: String? = nil, receipt: ApproveResponse? = nil) {
             self.resolutionId = resolutionId
             self.state = state
             self.trace = trace
@@ -905,11 +963,13 @@ enum SwarmService {
             self.plans = plans
             self.degraded = degraded
             self.degradedReason = degradedReason
+            self.receipt = receipt
         }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             resolutionId = (try? c.decode(String.self, forKey: .resolutionId)) ?? ""
+            receipt = try? c.decode(ApproveResponse.self, forKey: .receipt)
             state = (try? c.decode(String.self, forKey: .state)) ?? "processing"
             trace = try? c.decode([TraceEntry].self, forKey: .trace)
             plan = try? c.decode(Plan.self, forKey: .plan)
@@ -1091,6 +1151,7 @@ enum SwarmService {
     /// post-write `trips.content_rev` so the client can seed its optimistic
     /// concurrency registry without a refetch; absent on old payloads).
     struct Settlement: Decodable {
+        let needsFollowUp: Bool
         let tripUpdated: Bool
         /// True when the server skipped the itinerary rewrite (rev conflict)
         /// — the settlement must then NOT read as a full timeline update.
@@ -1101,24 +1162,63 @@ enum SwarmService {
         let bookingRecorded: Bool
         /// Additive — post-write `trips.content_rev` (absent ⇒ nil).
         let contentRev: Int?
+        /// Additive — exactly what the traveller still has to do themselves
+        /// (book an estimated flight, re-time a pickup, claim a refund). Empty
+        /// when the settlement finished everything on their behalf.
+        let followUps: [FollowUp]
 
         enum CodingKeys: String, CodingKey {
+            case needsFollowUp = "needs_follow_up"
             case tripUpdated = "trip_updated"
             case conflictSkipped = "conflict_skipped"
             case note
             case changes
             case bookingRecorded = "booking_recorded"
             case contentRev = "content_rev"
+            case followUps = "follow_ups"
         }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            followUps = (try? c.decode([FollowUp].self, forKey: .followUps)) ?? []
+            needsFollowUp = (try? c.decode(Bool.self, forKey: .needsFollowUp)) ?? false
             tripUpdated = (try? c.decode(Bool.self, forKey: .tripUpdated)) ?? false
             conflictSkipped = (try? c.decode(Bool.self, forKey: .conflictSkipped)) ?? false
             note = try? c.decode(String.self, forKey: .note)
             changes = (try? c.decode([String].self, forKey: .changes)) ?? []
             bookingRecorded = (try? c.decode(Bool.self, forKey: .bookingRecorded)) ?? false
             contentRev = try? c.decode(Int.self, forKey: .contentRev)
+        }
+    }
+
+    /// One thing the settlement could not finish for the traveller.
+    struct FollowUp: Decodable, Equatable, Identifiable {
+        /// "book_replacement_flight" | "retime_pickup_with_provider" | "claim_refund"
+        let kind: String
+        let message: String
+
+        var id: String { "\(kind)|\(message)" }
+
+        var systemImage: String {
+            switch kind {
+            case "book_replacement_flight": return "airplane.circle"
+            case "retime_pickup_with_provider": return "car.circle"
+            case "claim_refund": return "arrow.uturn.backward.circle"
+            default: return "exclamationmark.circle"
+            }
+        }
+
+        init(kind: String, message: String) {
+            self.kind = kind
+            self.message = message
+        }
+
+        enum CodingKeys: String, CodingKey { case kind, message }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            kind = (try? c.decode(String.self, forKey: .kind)) ?? ""
+            message = (try? c.decode(String.self, forKey: .message)) ?? ""
         }
     }
 

@@ -203,16 +203,19 @@ describe("FlightAgent flexible-date window", () => {
     expect(assessment.bestCandidate?.option.id).toBe("next-day");
   });
 
-  it("re-throws when EVERY date rejects — the callers' degrade contract survives", async () => {
-    // Total failure is NOT a per-date failure: the search itself is
-    // unavailable, and silently returning an empty assessment would
-    // masquerade as "found nothing" instead of "provider down".
+  it("synthesizes a structured recovery when EVERY date rejects", async () => {
     const provider = new DatedProvider(() => [], new Set([day(0), day(1)]));
     const agent = new FlightAgent(provider, { searchWindowDays: 2 });
 
-    await expect(
-      agent.assessRebookingOptions("flight-0", ORIGINAL_DEPARTURE, missedContext),
-    ).rejects.toThrow(/sandbox refused to search/);
+    const assessment = await agent.assessRebookingOptions(
+      "flight-0",
+      ORIGINAL_DEPARTURE,
+      missedContext,
+    );
+    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    expect(assessment.bestCandidate?.option.id).toMatch(/^SYNTHETIC-RECOVERY-/);
+    expect(assessment.fallbackReason).toMatch(/sandbox refused to search/);
+    expect(assessment.noReplacementReason).toBeUndefined();
   });
 
   // --------------------------------------------------------- W1 config knobs

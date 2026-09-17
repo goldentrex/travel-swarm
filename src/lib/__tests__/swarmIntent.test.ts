@@ -424,3 +424,108 @@ describe("parseMissionIntentForTrip — a flight-less trip is not a flight probl
   });
 });
 
+// ------------------------------------------ explicit-node branch (scenario tiles)
+
+/**
+ * REGRESSION — the scenario tiles ("Missed flight", "Hotel overbooked",
+ * "Activity cancelled", …) ALL send an explicit nodeId. That branch used to
+ * hardcode `kind: weather ? "weather" : "delay"` for every non-weather
+ * mission, discarding the actual category regardless of which tile launched
+ * it or what the intent text said. Every category-gated behaviour downstream
+ * — `allowsActivityDrops`, `hotelOverbooked`, the orchestrator's own
+ * cancellation detection — silently degraded to the generic path. Live
+ * symptom: "Activity cancelled — Lau Pa Sat" produced a plan that never
+ * mentioned Lau Pa Sat at all, only an unrelated downstream sibling.
+ */
+describe("parseMissionIntentForTrip — explicit-node branch classifies like the keyword branches", () => {
+  it('an explicit activity node + "cancelled" in the intent → activity_cancelled, not delay', () => {
+    const parsed = parseMissionIntentForTrip(
+      "Change my activity cancelled Ocean Museum Visit",
+      hydrateFixture(),
+      "activity-1-0",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.nodeId).toBe("activity-1-0");
+    expect(parsed.mission.kind).toBe("activity_cancelled");
+    // The orchestrator's own classifier text-sniffs the description for
+    // "cancel" — the generic "Change requested — X" wording never carried
+    // that signal, so the disrupted node's own resolution was silently
+    // skipped even once `category` was fixed.
+    expect(parsed.mission.description).toMatch(/cancel/i);
+  });
+
+  it("an explicit activity node WITHOUT cancel wording stays delay (no false positive)", () => {
+    const parsed = parseMissionIntentForTrip(
+      "Change my day plan around Ocean Museum Visit",
+      hydrateFixture(),
+      "activity-1-0",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).toBe("delay");
+  });
+
+  it('an explicit hotel node + "overbooked" → hotel_overbooked, not the generic hotel category', () => {
+    const parsed = parseMissionIntentForTrip(
+      "Change my hotel overbooked Atlantica Surf House",
+      hydrateFixture(),
+      "hotel-0-1",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.nodeId).toBe("hotel-0-1");
+    expect(parsed.mission.kind).toBe("hotel_overbooked");
+  });
+
+  it('an explicit flight node + "missed" → missed_flight, not the generic delay category', () => {
+    const parsed = parseMissionIntentForTrip(
+      "Change my missed flight TP437",
+      hydrateFixture(),
+      "flight-0",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.nodeId).toBe("flight-0");
+    expect(parsed.mission.kind).toBe("missed_flight");
+  });
+
+  it("an explicit flight node with a plain delay stays delay", () => {
+    const parsed = parseMissionIntentForTrip(
+      "Change my delayed flight TP437 by 3 hours",
+      hydrateFixture(),
+      "flight-0",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).toBe("delay");
+  });
+
+  it("an explicit node still wins over keyword re-targeting — the node is never re-picked", () => {
+    // The intent text names the OTHER activity, but the explicit nodeId
+    // must still be the one actually targeted.
+    const parsed = parseMissionIntentForTrip(
+      "Change my activity cancelled Surf Lesson", // names activity-0-0
+      hydrateFixture(),
+      "activity-1-0", // but the UI picker explicitly chose this one
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.nodeId).toBe("activity-1-0");
+    expect(parsed.mission.kind).toBe("activity_cancelled");
+  });
+
+  it("weather still short-circuits to the proactive weather category regardless of node kind", () => {
+    const parsed = parseMissionIntentForTrip(
+      "Storm warning for the surf lesson",
+      hydrateFixture(),
+      "activity-0-0",
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).toBe("weather");
+    expect(parsed.mission.origin).toBe("proactive");
+    expect(parsed.mission.delayMinutes).toBe(0);
+  });
+});
+

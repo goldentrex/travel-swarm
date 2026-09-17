@@ -1,34 +1,56 @@
 import SwiftUI
 import MapKit
 
-// MARK: - Nexus Swarm Trust Layer sheet (DEBUG ONLY)
+// MARK: - Nexus Swarm Trust Layer sheet
 //
 // Explicit human-approval gate for a swarm proposal: incident, impacted
 // nodes, PolicyAgent verdict, hotel & activity deltas, the "Your new plan"
 // dossier (flight card, imagery, change map, itemized ledger) and the
 // financial breakdown (new charges − refund = net payable, the Trust Layer
-// invariant). "Approve & Settle" → POST /api/hackathon/approve-resolution —
-// money only moves after this tap. The whole file is wrapped in `#if DEBUG`
-// so Release / App Store builds contain none of it.
+// invariant). Approval calls POST /api/hackathon/approve-resolution.
+// The receipt distinguishes provider bookings from changes recorded locally
+// in the trip. Ships in Release behind SwarmAvailability.
 
 struct TrustLayerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AppSettings.self) private var app
+    @Environment(SwarmAvailability.self) private var availability
 
     @Bindable var model: SwarmViewModel
     @State private var confirming = false
+    @State private var comparingPlans = false
     /// Which evidence groups are open. "What changes" starts expanded: it is
     /// the answer to "what is the swarm actually doing to my trip", and
     /// making the traveller tap for that put the one thing they came to read
     /// behind a disclosure.
-    @State private var expandedGroups: Set<String> = ["What changes"]
+    @State private var expandedGroups: Set<String> = ["changes"]
     /// One-shot settle-seal reveal flag (drives the spring in `settledBlock`).
     @State private var sealRevealed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    /// Bumped exactly once, at the selected quote's expiry. The approve button
+    /// and the confirmation popup re-derive their expired state from it, so a
+    /// dying quote disables them on time WITHOUT the whole sheet re-rendering
+    /// every second — the countdown digits live in `TTLBadgeView` alone.
+    @State private var expiryTick = Date()
+    /// Measured height of the floating actions card. The page reserves exactly
+    /// this much room at its end: a hard-coded 128 pt was ~70 pt short of the
+    /// real card, so the end of every plan — the price-guarantee countdown
+    /// included — could never be scrolled out from under Approve.
+    @State private var actionsHeight: CGFloat = 200
+    /// The window's bottom safe-area inset, read from the SAME proxy as the
+    /// card. The carousel ignores the bottom safe area so its backdrop runs
+    /// edge to edge, which means the home indicator has to be accounted for
+    /// explicitly — otherwise the card sits on top of it on every device that
+    /// has one, and the page reserves too little room beneath the plan.
+    @State private var actionsBottomInset: CGFloat = 0
 
     /// The plan behind the money copy (settle dialog + `money()`) — the
     /// carousel page currently on screen.
     private var plan: SwarmService.Plan? { model.selectedPlan }
+    private var isFlightRehearsal: Bool {
+        availability.usesFlightSandbox && plan?.proposedResolution.newFlight != nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -52,12 +74,20 @@ struct TrustLayerSheet: View {
                     scrollContent { emptyBlock }
                 }
             }
-            .background(AuroraBackground(animated: model.isProcessing))
+            // ONE translucent layer for the whole sheet. The aurora animates
+            // only while agents are working — during review nothing behind
+            // the plan moves, so nothing forces the page to re-composite.
+            // The app's own backdrop, so the sheet belongs to the same world
+            // as every other screen. It only ANIMATES while agents are working;
+            // during review it is a static gradient behind the glass.
+            .background(AuroraBackground(animated: model.isProcessing || model.phase == .resolving))
             .navigationTitle(app.tr("Trust Layer", "Trust Layer"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(model.phase == .settled ? "Done" : "Later") { dismiss() }
+                    Button(model.phase == .settled
+                           ? app.trm("Terminé", "Done", "Listo", "Fertig", "完成")
+                           : app.trm("Plus tard", "Later", "Más tarde", "Später", "稍后")) { dismiss() }
                         // Defense-in-depth: the dismiss button stays visible
                         // above the popup layer only as chrome — it must not
                         // close the sheet mid-settlement.
@@ -78,6 +108,28 @@ struct TrustLayerSheet: View {
             }
             .animation(reduceMotion ? nil : .spring(duration: 0.3), value: confirming)
         }
+        .sheet(isPresented: $comparingPlans) {
+            planComparison.dynamicTypeSize(dynamicTypeSize)
+        }
+        // One wake-up at the expiry instant, re-armed when the selected plan
+        // (and so its deadline) changes.
+        .task(id: model.selectedPlan?.expiresAt) {
+            guard let expiresAt = model.selectedPlan?.expiresAt else { return }
+            let remaining = expiresAt.timeIntervalSinceNow
+            if remaining > 0 {
+                try? await Task.sleep(for: .seconds(remaining))
+                guard !Task.isCancelled else { return }
+            }
+            expiryTick = Date()
+        }
+    }
+
+    /// Is the selected quote dead? Evaluated at render time; `expiryTick`
+    /// guarantees a render happens at the moment it becomes true.
+    private var selectedPlanExpired: Bool {
+        _ = expiryTick
+        guard let expiresAt = model.selectedPlan?.expiresAt else { return false }
+        return expiresAt <= Date()
     }
 
     /// Shared scroll wrapper for the non-carousel steps.
@@ -93,6 +145,10 @@ struct TrustLayerSheet: View {
     }
 
     private var settleDialogTitle: String {
+        if isFlightRehearsal {
+            return app.trm("Appliquer ce plan de répétition ?", "Apply this rehearsal plan?",
+                           "¿Aplicar este plan de prueba?", "Diesen Testplan anwenden?", "应用此演练方案？")
+        }
         if let plan {
             // Multi-currency settlements (e.g. a USD charge alongside an EUR
             // refund) — name EVERY payable bucket so no part of the bill is
@@ -105,13 +161,23 @@ struct TrustLayerSheet: View {
                 let joined = buckets
                     .map { SwarmFormat.money($0.netPayable, currency: $0.currency) }
                     .joined(separator: " + ")
-                return "Settle \(joined) with the provider?"
+                return app.trm("Régler \(joined) auprès du prestataire ?",
+                               "Settle \(joined) with the provider?",
+                               "¿Pagar \(joined) al proveedor?",
+                               "\(joined) beim Anbieter begleichen?",
+                               "向供应商支付 \(joined)？")
             }
             if plan.financialDelta.netPayable > 0 {
-                return "Settle \(money(plan.financialDelta.netPayable)) with the provider?"
+                let amount = money(plan.financialDelta.netPayable)
+                return app.trm("Régler \(amount) auprès du prestataire ?",
+                               "Settle \(amount) with the provider?",
+                               "¿Pagar \(amount) al proveedor?",
+                               "\(amount) beim Anbieter begleichen?",
+                               "向供应商支付 \(amount)？")
             }
         }
-        return "Approve this resolution plan?"
+        return app.trm("Approuver ce plan ?", "Approve this resolution plan?",
+                       "¿Aprobar este plan?", "Diesen Plan genehmigen?", "批准此方案？")
     }
 
     // MARK: Blocks
@@ -120,7 +186,7 @@ struct TrustLayerSheet: View {
     /// or in-memory session store). Approve is disabled below; the fix is a
     /// one-tap re-run.
     private var degradedBadge: some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard {
             HStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.title3)
@@ -138,15 +204,21 @@ struct TrustLayerSheet: View {
 
     private var degradedTitle: String {
         switch model.degradedReason {
-        case "session_store_memory": return "Simulated data — demo session"
-        default: return "Simulated data — provider offline"
+        case "session_store_memory":
+            return app.trm("Données simulées — session de démo", "Simulated data — demo session",
+                           "Datos simulados — sesión de demo", "Simulierte Daten – Demo-Sitzung",
+                           "模拟数据 — 演示会话")
+        default:
+            return app.trm("Données simulées — fournisseur indisponible", "Simulated data — provider offline",
+                           "Datos simulados — proveedor sin conexión", "Simulierte Daten – Anbieter offline",
+                           "模拟数据 — 供应商离线")
         }
     }
 
     private var approvalBanner: some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard {
             HStack(spacing: 12) {
-                Image(systemName: "checkmark.seal.fill")
+                Image(systemName: settlementNeedsFollowUp ? "exclamationmark.circle.fill" : "checkmark.seal.fill")
                     .font(.title2)
                     .foregroundStyle(Brand.gradient)
                 VStack(alignment: .leading, spacing: 3) {
@@ -174,9 +246,9 @@ struct TrustLayerSheet: View {
                 .font(.headline)
                 .fixedSize(horizontal: false, vertical: true)
             if !plan.impactedNodes.isEmpty {
-                GlassCard(cornerRadius: 18) {
+                SwarmSurfaceCard(style: .solid) {
                     VStack(alignment: .leading, spacing: 0) {
-                        sectionHeader("What it affected", icon: "exclamationmark.triangle")
+                        sectionHeader(app.trm("Ce qui est touché", "What it affected", "Qué se ve afectado", "Was betroffen ist", "受影响的内容"), icon: "exclamationmark.triangle")
                             .padding(.bottom, 6)
                         ForEach(Array(plan.impactedNodes.enumerated()), id: \.element) { idx, node in
                             factRow(node,
@@ -195,9 +267,9 @@ struct TrustLayerSheet: View {
     /// had to parse three different shapes to answer three simple questions;
     /// a single label-left / value-right rhythm reads in one pass.
     private func policyBlock(_ verdict: SwarmService.PolicyVerdict) -> some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(style: .solid) {
             VStack(alignment: .leading, spacing: 0) {
-                sectionHeader("Your ticket's change rules", icon: "scalemass")
+                sectionHeader(app.trm("Les règles de votre billet", "Your ticket's change rules", "Las reglas de tu billete", "Die Umbuchungsregeln deines Tickets", "你的机票改签规则"), icon: "scalemass")
                     .padding(.bottom, 6)
                 factRow(app.tr("Modification", "Rebooking"),
                         verdict.rebookPermitted
@@ -250,7 +322,7 @@ struct TrustLayerSheet: View {
     /// the page. A change is a pair; showing one half asks the traveller to
     /// hold the other in their head.
     private func beforeAfterBlock(_ plan: SwarmService.Plan) -> some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(style: .solid) {
             VStack(alignment: .leading, spacing: 10) {
                 let original = originalLeg()
                 changeSide(label: app.tr("AVANT", "WAS"),
@@ -371,9 +443,9 @@ struct TrustLayerSheet: View {
     }
 
     private func resolutionBlock(_ plan: SwarmService.Plan) -> some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(style: .solid) {
             VStack(alignment: .leading, spacing: 10) {
-                sectionHeader("What we'll change", icon: "wand.and.stars")
+                sectionHeader(app.trm("Ce que nous allons changer", "What we'll change", "Lo que vamos a cambiar", "Was wir ändern", "我们将更改的内容"), icon: "wand.and.stars")
                 if let flight = plan.proposedResolution.newFlight {
                     HStack {
                         Label(flight.displayLabel, systemImage: "airplane")
@@ -386,16 +458,38 @@ struct TrustLayerSheet: View {
                 }
                 let hotels = plan.proposedResolution.hotelAdjustments ?? []
                 ForEach(hotels, id: \.hotelName) { hotel in
-                    HStack(alignment: .top) {
-                        Label("\(hotel.hotelName) — \(hotel.action.replacingOccurrences(of: "_", with: " "))",
-                              systemImage: "bed.double")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(hotel.fee > 0 ? money(hotel.fee) : "no fee")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(alignment: .top) {
+                            Label("\(hotel.hotelName) — \(hotelActionLabel(hotel.action))",
+                                  systemImage: "bed.double")
+                                .font(.subheadline)
+                            Spacer()
+                            Text(hotel.requiresConfirmation
+                                 ? app.trm("Frais non vérifiés", "Fee unverified", "Tarifa sin verificar", "Gebühr ungeprüft", "费用未核实")
+                                 : (hotel.fee > 0 ? money(hotel.fee)
+                                    : app.trm("sans frais", "no fee", "sin cargo", "keine Gebühr", "无费用")))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        if let note = hotel.note, !note.isEmpty {
+                            Label(note, systemImage: hotel.requiresConfirmation ? "exclamationmark.triangle" : "clock")
+                                .font(.footnote)
+                                .foregroundStyle(hotel.requiresConfirmation ? Color.orange : Color.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if hotel.requiresConfirmation {
+                            Label(app.trm("Contactez l’établissement pour confirmer l’arrivée tardive et les frais.",
+                                          "Contact the property to confirm late arrival and any fees.",
+                                          "Contacta con el alojamiento para confirmar la llegada tardía y los cargos.",
+                                          "Kontaktiere die Unterkunft, um die späte Ankunft und Gebühren zu bestätigen.",
+                                          "请联系酒店确认晚到及相关费用。"),
+                                  systemImage: "exclamationmark.triangle")
+                                .font(.footnote)
+                                .foregroundStyle(.orange)
+                        }
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("trustLayer.hotel.\(hotel.hotelName)")
                 }
                 ForEach(plan.proposedResolution.rescheduledActivities, id: \.name) { activity in
                     VStack(alignment: .leading, spacing: 3) {
@@ -456,9 +550,9 @@ struct TrustLayerSheet: View {
     }
 
     private func newPlanDossier(_ plan: SwarmService.Plan) -> some View {
-        GlassCard(cornerRadius: 18) {
+        SwarmSurfaceCard(style: .solid) {
             VStack(alignment: .leading, spacing: 12) {
-                sectionHeader("Your new plan", icon: "doc.text.image")
+                sectionHeader(app.trm("Votre nouveau plan", "Your new plan", "Tu nuevo plan", "Dein neuer Plan", "你的新方案"), icon: "doc.text.image")
                 if let flight = plan.proposedResolution.newFlight {
                     dossierFlightCard(flight, plan: plan)
                 }
@@ -602,11 +696,11 @@ struct TrustLayerSheet: View {
                     .foregroundStyle(.secondary)
             }
             if let rate = hotel.ratePerNight {
-                dossierFactRow("Rate per night",
+                dossierFactRow(app.trm("Tarif par nuit", "Rate per night", "Precio por noche", "Preis pro Nacht", "每晚价格"),
                                SwarmFormat.money(rate, currency: hotel.currency ?? fallbackCurrency))
             }
             if let until = hotel.freeCancellationUntil, !until.isEmpty {
-                dossierFactRow("Free cancellation until", SwarmFormat.isoToLocalString(until))
+                dossierFactRow(app.trm("Annulation gratuite jusqu'au", "Free cancellation until", "Cancelación gratuita hasta", "Kostenlose Stornierung bis", "免费取消截止"), SwarmFormat.isoToLocalString(until))
             }
         }
     }
@@ -620,7 +714,7 @@ struct TrustLayerSheet: View {
             }
             HStack(spacing: 10) {
                 if let price = swap.priceFrom {
-                    dossierFactRow("From",
+                    dossierFactRow(app.trm("À partir de", "From", "Desde", "Ab", "起价"),
                                    SwarmFormat.money(price, currency: swap.currency ?? fallbackCurrency))
                 }
                 if let rating = swap.rating {
@@ -648,9 +742,9 @@ struct TrustLayerSheet: View {
         // Server-composed human ledger lines ("New flight CDG → OPO ·
         // +€150.00") win over the locally-computed itemization when present.
         let ledger = plan.presentation?.ledgerSummary ?? []
-        return GlassCard(cornerRadius: 18) {
+        return SwarmSurfaceCard(style: .solid) {
             VStack(alignment: .leading, spacing: 10) {
-                sectionHeader("Money summary", icon: "creditcard")
+                sectionHeader(app.trm("Récapitulatif financier", "Money summary", "Resumen económico", "Kostenübersicht", "费用汇总"), icon: "creditcard")
                 // THE headline number, in the traveller's own currency.
                 //
                 // The lines below are the truthful per-provider record, and on
@@ -672,11 +766,14 @@ struct TrustLayerSheet: View {
                                        signed: true, currency: display.currency)
                         }
                         Divider()
-                        financeRow(display.netPayable >= 0
-                                    ? app.tr("Total à payer", "Total due now")
-                                    : app.tr("Total remboursé", "Total back to you"),
-                                   value: abs(display.netPayable), color: .primary,
-                                   signed: false, bold: true, currency: display.currency)
+                        HStack(spacing: 8) {
+                            if let basis = pricingBasisChip(plan) { basis }
+                            financeRow(display.netPayable >= 0
+                                        ? app.tr("Total à payer", "Total due now")
+                                        : app.tr("Total remboursé", "Total back to you"),
+                                       value: abs(display.netPayable), color: .primary,
+                                       signed: false, bold: true, currency: display.currency)
+                        }
                         if display.converted {
                             // Never pass a converted figure off as a quote.
                             Text(app.tr(
@@ -706,30 +803,30 @@ struct TrustLayerSheet: View {
                         // The ledger only charges the fare DIFFERENCE against the
                         // original ticket (that's what the totals show) — this
                         // row is the full replacement price for transparency.
-                        financeRow("New flight (full price)", value: flight.cost, color: Brand.coral, signed: true)
+                        financeRow(app.trm("Nouveau vol (prix total)", "New flight (full price)", "Nuevo vuelo (precio total)", "Neuer Flug (Gesamtpreis)", "新航班（全价）"), value: flight.cost, color: Brand.coral, signed: true)
                     }
                     if let requote = plan.proposedResolution.transferRequote {
                         // Spatial-conflict transfer re-quote — its amount is part
                         // of total_new_charges, so itemize it to keep the
                         // breakdown summing to "Total new charges".
-                        financeRow("Ride re-quote (\(requote.from) → \(requote.to))",
+                        financeRow(app.trm("Transfert re-coté (\(requote.from) → \(requote.to))", "Ride re-quote (\(requote.from) → \(requote.to))", "Traslado recotizado (\(requote.from) → \(requote.to))", "Transfer neu berechnet (\(requote.from) → \(requote.to))", "接送重新报价（\(requote.from) → \(requote.to)）"),
                                    value: requote.amount, color: Brand.coral, signed: true)
                     }
                     if let verdict = plan.proposedResolution.policyVerdict, verdict.changeFee > 0 {
-                        financeRow("Policy change fee", value: verdict.changeFee, color: Brand.coral,
+                        financeRow(app.trm("Frais de modification", "Policy change fee", "Tarifa de cambio", "Umbuchungsgebühr", "改签费"), value: verdict.changeFee, color: Brand.coral,
                                    signed: true, currency: verdict.currency ?? plan.currency)
                     }
                     ForEach((plan.proposedResolution.hotelAdjustments ?? []).filter { $0.fee > 0 }, id: \.hotelName) { hotel in
-                        financeRow("Hotel — \(hotel.hotelName)", value: hotel.fee, color: Brand.coral, signed: true)
+                        financeRow(app.trm("Hôtel — \(hotel.hotelName)", "Hotel — \(hotel.hotelName)", "Hotel — \(hotel.hotelName)", "Hotel — \(hotel.hotelName)", "酒店 — \(hotel.hotelName)"), value: hotel.fee, color: Brand.coral, signed: true)
                     }
                     ForEach(plan.proposedResolution.rescheduledActivities.filter { $0.penalty > 0 }, id: \.name) { activity in
-                        financeRow("Activity swap — \(activity.name)", value: activity.penalty, color: Brand.coral, signed: true)
+                        financeRow(app.trm("Activité remplacée — \(activity.name)", "Activity swap — \(activity.name)", "Actividad sustituida — \(activity.name)", "Aktivität getauscht — \(activity.name)", "活动替换 — \(activity.name)"), value: activity.penalty, color: Brand.coral, signed: true)
                     }
                     Divider()
-                    financeRow("Total new charges", value: delta.totalNewCharges, color: Brand.coral, signed: true)
-                    financeRow("Total refund", value: delta.totalRefund, color: .green, signed: true)
+                    financeRow(app.trm("Total des nouveaux frais", "Total new charges", "Total de cargos nuevos", "Neue Kosten gesamt", "新增费用合计"), value: delta.totalNewCharges, color: Brand.coral, signed: true)
+                    financeRow(app.trm("Total remboursé", "Total refund", "Reembolso total", "Erstattung gesamt", "退款合计"), value: delta.totalRefund, color: .green, signed: true)
                     Divider()
-                    financeRow("Net payable", value: delta.netPayable, color: .primary, signed: false, bold: true)
+                    financeRow(app.trm("Net à payer", "Net payable", "Neto a pagar", "Netto zu zahlen", "应付净额"), value: delta.netPayable, color: .primary, signed: false, bold: true)
                 }
                 Text(app.tr(
                     "Les totaux à payer maintenant sont ce qui sera réglé ; les remboursements vous seront restitués.",
@@ -760,11 +857,15 @@ struct TrustLayerSheet: View {
                             }
                             approvalBanner
                             if model.plans.count > 1 {
-                                Label(app.tr("Balayez pour comparer les plans", "Swipe to compare the plans"),
-                                      systemImage: "hand.draw")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity, alignment: .center)
+                                Button { comparingPlans = true } label: {
+                                    Label(app.tr("Comparer les options", "Compare options"), systemImage: "list.bullet.rectangle")
+                                        .font(.subheadline.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 8)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(model.approving || model.settlementPending)
+                                .accessibilityIdentifier("trustLayer.compare")
                             }
                         }
                         .padding(.horizontal, 20)
@@ -783,14 +884,18 @@ struct TrustLayerSheet: View {
                         // stayed smooth. `GlassEffectContainer` exists for
                         // exactly this: the system renders the group in a
                         // single pass instead of one pass per card.
+                        // ONE glass pass for the page: the surfaces inside are
+                        // siblings in this container, so the system composites
+                        // them together instead of once per card.
                         GlassEffectContainer {
                             planPage(pagePlan, index: index)
                         }
-                            .padding(20)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 16)
                             // Room to scroll the end of the plan clear of
                             // the floating actions, which now sit over the
                             // page rather than in a strip beneath it.
-                            .padding(.bottom, 128)
+                            .padding(.bottom, compactActions ? 32 : actionsHeight + actionsBottomInset + 28)
                             .frame(maxWidth: 560)
                             .frame(maxWidth: .infinity)
                     } else {
@@ -802,13 +907,18 @@ struct TrustLayerSheet: View {
             }
         }
         .tabViewStyle(.page(indexDisplayMode: model.plans.count > 1 ? .always : .never))
-        .ignoresSafeArea(edges: .bottom)
+        // The backdrop runs edge-to-edge ONLY while the actions float over it.
+        // With the actions in the flow (accessibility sizes) the end of the
+        // page would otherwise sit under the home indicator, and on the
+        // smallest screen the Approve button never became fully tappable.
+        .ignoresSafeArea(edges: compactActions ? [] : .bottom)
         // The actions FLOAT over the plan rather than sitting in a reserved
         // strip below it. As a sibling in the stack they took vertical space
         // away from the carousel and clipped the card against their own edge;
         // as an overlay the plan runs the full height and scrolls underneath.
         // No divider, no `.bar` ground — the page shows through.
         .overlay(alignment: .bottom) {
+            if !compactActions {
             // A floating glass CARD, inset on every side — not a full-width
             // band welded to the bottom edge. It needs a surface of its own:
             // laid straight over the page the secondary label and the footnote
@@ -816,17 +926,121 @@ struct TrustLayerSheet: View {
             // material keeps them legible while the plan stays visible,
             // blurred, behind it and scrolls underneath.
             sharedApproveSection
+                // Chrome that must fit: the one control floating over the plan
+                // is capped so it can never swallow the content it approves.
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                 .padding(.horizontal, 16)
-                .padding(.vertical, 14)
+                .padding(.vertical, compactActions ? 12 : 16)
+                // Liquid Glass, like every other floating control in the app.
+                // A flat 0.97 fill was tried here and was WORSE: the plan
+                // scrolling underneath stayed readable through the footnote.
+                // Glass blurs what passes behind it, so the text stays legible
+                // while the page still shows through. ONE surface, not a stack.
                 .glassEffect(.regular, in: .rect(cornerRadius: 28))
+                .onGeometryChange(for: ActionsMetrics.self) {
+                    ActionsMetrics(height: $0.size.height, bottomInset: $0.safeAreaInsets.bottom)
+                } action: { metrics in
+                    // Only react to real changes (Dynamic Type, an error line
+                    // appearing) — never a per-frame layout feedback loop.
+                    if abs(metrics.height - actionsHeight) > 1 { actionsHeight = metrics.height }
+                    if abs(metrics.bottomInset - actionsBottomInset) > 1 { actionsBottomInset = metrics.bottomInset }
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("trustLayer.actions")
                 .padding(.horizontal, 16)
                 // The TabView ignores the bottom safe area so the backdrop
-                // runs edge-to-edge — inset the CARD itself so it stays
-                // clear of the home indicator.
-                .padding(.bottom, 12)
+                // runs edge-to-edge — inset the CARD itself by the MEASURED
+                // home-indicator inset (a flat 12 pt left it sitting on the
+                // indicator on every device that has one).
+                .padding(.bottom, actionsBottomInset + 12)
                 .frame(maxWidth: 560)
                 .frame(maxWidth: .infinity)
+            }
         }
+    }
+
+    /// A vertical overview makes every alternative reachable without swiping.
+    private var planComparison: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 12) {
+                    ForEach(Array(model.plans.enumerated()), id: \.offset) { index, option in
+                        comparisonOption(option, index: index)
+                    }
+                }
+                .padding(20)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity)
+            }
+            .navigationTitle(app.tr("Comparer les options", "Compare options"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(app.tr("Terminé", "Done")) { comparingPlans = false }
+                }
+            }
+        }
+    }
+
+    private func comparisonOption(_ option: SwarmService.Plan, index: Int) -> some View {
+        let selected = index == model.selectedPlanIndex
+        let amount = dueNow(option)
+        let dropped = option.proposedResolution.rescheduledActivities.filter { $0.action == "drop" }.count
+        return Button {
+            model.selectedPlanIndex = index
+            comparingPlans = false
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("\(app.tr("Option", "Option")) \(index + 1)")
+                        .font(.headline)
+                    Spacer()
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Brand.indigo)
+                    }
+                }
+                // The trade-off itself — cheapest / earliest / non-stop — is
+                // what a comparison is FOR; without it only price was compared.
+                let badges = option.badges ?? [option.badge].compactMap { $0 }
+                if !badges.isEmpty {
+                    badgeRow(badges, index: index, identifier: "trustLayer.compare.badges.\(index)")
+                }
+                Text(replacementHeadline(option))
+                    .font(.subheadline.weight(.semibold))
+                if let detail = replacementDetail(option), !detail.isEmpty {
+                    Text(detail).font(.footnote).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 8) {
+                    Text("\(amount.title) · \(amount.amount)")
+                        .font(.subheadline.weight(.bold)).monospacedDigit()
+                    if let basis = pricingBasisChip(option) { basis }
+                }
+                if let impact = option.presentation?.tripImpact, !impact.summary.isEmpty {
+                    Text(impact.summary)
+                        .font(.footnote)
+                        .foregroundStyle(Brand.coral)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if dropped > 0 {
+                    Text("\(app.tr("Activités retirées", "Activities removed")): \(dropped)")
+                        .font(.footnote).foregroundStyle(.orange)
+                }
+                Text(selected ? app.tr("Option sélectionnée", "Selected option")
+                     : app.tr("Examiner cette option", "Review this option"))
+                    .font(.caption.weight(.semibold)).foregroundStyle(Brand.indigo)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Brand.indigo.opacity(selected ? 0.10 : 0.04), in: RoundedRectangle(cornerRadius: 18))
+            .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Brand.indigo.opacity(selected ? 0.6 : 0.15)))
+        }
+        .buttonStyle(.plain)
+        .disabled(model.approving || model.settlementPending)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("trustLayer.option.\(index)")
     }
 
     /// One carousel page — the full dossier blocks reused from the classic
@@ -869,7 +1083,7 @@ struct TrustLayerSheet: View {
             // gets different copy and a different colour, because "wait and
             // retry" and "book it yourself" are opposite instructions.
             if let why = pagePlan.presentation?.noFlightReason, !why.summary.isEmpty {
-                GlassCard(cornerRadius: 18) {
+                SwarmSurfaceCard {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: why.isPartnerCoverage
                               ? "airplane.circle" : "clock.arrow.circlepath")
@@ -899,7 +1113,7 @@ struct TrustLayerSheet: View {
             // is the other half of the decision, and for a late rebooking it is
             // usually the half that matters more.
             if let impact = pagePlan.presentation?.tripImpact, !impact.summary.isEmpty {
-                GlassCard(cornerRadius: 18) {
+                SwarmSurfaceCard {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "calendar.badge.exclamationmark")
                             .font(.title3)
@@ -917,20 +1131,34 @@ struct TrustLayerSheet: View {
                 }
             }
 
+            // Exactly what approving will write, produced server-side by the
+            // settlement itself. Shown open, above the money: nothing on the
+            // trip may change that was not on this screen first.
+            if let preview = pagePlan.presentation?.settlementPreview {
+                settlementPreviewCard(preview)
+            }
+
             // Evidence, in the order a sceptic asks for it: what exactly
             // changes, then the arithmetic, then why the swarm chose this.
             VStack(spacing: 8) {
-                detailGroup("What changes", icon: "arrow.triangle.swap") {
+                detailGroup(key: "changes",
+                            app.trm("Ce qui change", "What changes", "Qué cambia", "Was sich ändert", "有哪些变化"),
+                            icon: "arrow.triangle.swap") {
                     beforeAfterBlock(pagePlan)
                     resolutionBlock(pagePlan)
                     if hasDossier(pagePlan) {
                         newPlanDossier(pagePlan)
                     }
                 }
-                detailGroup("The money", icon: "eurosign.circle") {
+                detailGroup(key: "money",
+                            app.trm("L'argent", "The money", "El dinero", "Das Geld", "费用明细"),
+                            icon: "eurosign.circle") {
                     financialBlock(pagePlan)
                 }
-                detailGroup("Why this plan", icon: "questionmark.circle") {
+                detailGroup(key: "why",
+                            app.trm("Pourquoi ce plan", "Why this plan", "Por qué este plan",
+                                    "Warum dieser Plan", "为什么是这个方案"),
+                            icon: "questionmark.circle") {
                     incidentBlock(pagePlan)
                     if let verdict = pagePlan.proposedResolution.policyVerdict {
                         policyBlock(verdict)
@@ -939,6 +1167,7 @@ struct TrustLayerSheet: View {
             }
 
             ttlRow(pagePlan)
+            inlineActions
         }
         .padding(14)
         // Bottom clearance so the page-control dots (shown for multi-plan
@@ -999,12 +1228,27 @@ struct TrustLayerSheet: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
+                if let basis = pricingBasisChip(pagePlan) {
+                    basis
+                }
                 Text(due.amount)
                     .font(.title3.weight(.bold))
                     .monospacedDigit()
                     .foregroundStyle(due.isCharge
                                      ? AnyShapeStyle(Brand.coral)
                                      : AnyShapeStyle(Color.green))
+            }
+            if pagePlan.proposedResolution.newFlight?.isIndicativeEstimate == true {
+                Text(app.trm(
+                    "Estimation : aucun prestataire n’a proposé ce vol. Il ne sera pas réservé — vous devrez le réserver auprès de la compagnie.",
+                    "Estimate: no provider offered this flight. It will not be booked — you will need to book it with the airline.",
+                    "Estimación: ningún proveedor ofreció este vuelo. No se reservará; tendrás que reservarlo con la aerolínea.",
+                    "Schätzung: Kein Anbieter hat diesen Flug angeboten. Er wird nicht gebucht – du musst ihn bei der Airline buchen.",
+                    "估算：没有供应商提供此航班，系统不会预订，需自行向航空公司预订。"))
+                    .font(.caption)
+                    .foregroundStyle(Brand.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("trustLayer.estimateNote")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1083,7 +1327,11 @@ struct TrustLayerSheet: View {
     /// One collapsible evidence section. Collapsed by default: it exists to be
     /// available, not to be read — a traveller who trusts the headline should
     /// never have to scroll past it to reach Approve.
-    private func detailGroup<Content: View>(_ title: String,
+    /// `key` is the stable identity used by `expandedGroups` (never shown);
+    /// `title` is what the traveller reads. They were the same English string,
+    /// which is why these three headers stayed English in every locale.
+    private func detailGroup<Content: View>(key: String,
+                                            _ title: String,
                                             icon: String,
                                             @ViewBuilder content: () -> Content) -> some View {
         // Built eagerly: DisclosureGroup's content closure escapes, and these
@@ -1091,9 +1339,9 @@ struct TrustLayerSheet: View {
         // rendering until the group is expanded.
         let body = content()
         let isExpanded = Binding(
-            get: { expandedGroups.contains(title) },
+            get: { expandedGroups.contains(key) },
             set: { open in
-                if open { expandedGroups.insert(title) } else { expandedGroups.remove(title) }
+                if open { expandedGroups.insert(key) } else { expandedGroups.remove(key) }
             }
         )
         return DisclosureGroup(isExpanded: isExpanded) {
@@ -1114,7 +1362,7 @@ struct TrustLayerSheet: View {
             .strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
     }
 
-    private func badgeRow(_ badges: [String], index: Int) -> some View {
+    private func badgeRow(_ badges: [String], index: Int, identifier: String? = nil) -> some View {
         let uniqueBadges = badges.reduce(into: [String]()) { acc, badge in
             if !acc.contains(badge) { acc.append(badge) }
         }
@@ -1123,7 +1371,8 @@ struct TrustLayerSheet: View {
                 badgeCapsule(badge)
             }
         }
-        .accessibilityIdentifier("trustLayer.badge.\(index)")
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(identifier ?? "trustLayer.badge.\(index)")
     }
 
     /// Translucent tinted capsule, matching the glass surfaces everywhere
@@ -1146,46 +1395,46 @@ struct TrustLayerSheet: View {
         case "cheapest": return ("💰", app.tr("Le moins cher", "Cheapest"), Brand.amber)
         case "fastest": return ("⚡️", app.tr("Arrivée au plus tôt", "Earliest arrival"), Brand.sky)
         case "balanced": return ("⚖️", app.tr("Équilibré", "Balanced"), Brand.violet)
-        case "same_day": return ("✨", app.tr("Même jour", "Same day"), Brand.indigo)
-        case "nonstop": return ("✨", app.tr("Direct", "Nonstop"), Brand.indigo)
+        case "same_day": return ("📅", app.tr("Même jour", "Same day"), Brand.indigo)
+        case "next_day": return ("🌙", app.tr("Lendemain", "Next day"), Brand.indigo)
+        case "nonstop": return ("✈️", app.tr("Direct", "Nonstop"), Brand.indigo)
         default: return ("✨", badge.replacingOccurrences(of: "_", with: " ").capitalized, Brand.indigo)
         }
     }
 
-    /// Per-plan TTL countdown (one per carousel page, from THAT plan's
-    /// `expires_at`) — keeps the `trustLayer.ttl` identifier semantics.
-    /// The ticking digits roll via `.contentTransition(.numericText())`.
+    /// Per-plan TTL countdown — rendered by `TTLBadgeView`, the ONLY view in
+    /// this sheet that re-renders every second.
     @ViewBuilder
     private func ttlRow(_ pagePlan: SwarmService.Plan) -> some View {
         if let expiresAt = pagePlan.expiresAt {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                let remaining = Int(expiresAt.timeIntervalSince(context.date))
-                if remaining > 0 {
-                    let mins = remaining / 60
-                    let secs = remaining % 60
-                    Text("Price guaranteed for \(String(format: "%02d:%02d", mins, secs))")
-                        .font(.caption.monospacedDigit())
-                        // Quiet while there's comfortable headroom; coral only
-                        // inside the final two minutes.
-                        .foregroundStyle(remaining >= 120
-                                         ? AnyShapeStyle(.secondary)
-                                         : AnyShapeStyle(Brand.coral))
-                        .contentTransition(.numericText(countsDown: true))
-                        .animation(.linear(duration: 0.2), value: remaining)
-                        .accessibilityIdentifier("trustLayer.ttl")
-                } else {
-                    Text(app.tr(
-                        "Devis expirés. Relancez la mission pour obtenir de nouveaux prix.",
-                        "Quotes expired. Re-run the mission to get fresh prices."))
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
+            TTLBadgeView(expiresAt: expiresAt)
         }
     }
 
     /// ONE settlement section shared by every carousel page — settles
     /// whatever page is selected (`model.selectedPlanIndex` → `planIndex`).
+    /// At accessibility text sizes the floating card grew to ~45% of the
+    /// screen and covered the flight and price being approved. There, only a
+    /// size-capped Approve button floats; everything else scrolls with the plan.
+    private var compactActions: Bool { dynamicTypeSize.isAccessibilitySize }
+
+    /// At accessibility text sizes the actions are part of the page, not a
+    /// card floating over it.
+    ///
+    /// A floating card cannot avoid covering content once the decision header
+    /// is ~800 pt tall: measured at AX3 on iPhone 17, 17 Pro Max and 17e, it
+    /// sat on top of the flight and the price being approved. In the flow
+    /// nothing can ever be hidden behind it, on any device.
+    @ViewBuilder
+    private var inlineActions: some View {
+        if compactActions {
+            sharedApproveSection
+                .padding(.top, 8)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("trustLayer.actions")
+        }
+    }
+
     private var sharedApproveSection: some View {
         VStack(spacing: 10) {
             if let approveError = model.approveError {
@@ -1212,23 +1461,11 @@ struct TrustLayerSheet: View {
                 .tint(Brand.indigo)
                 .disabled(model.isProcessing)
             }
-            if let expiresAt = model.selectedPlan?.expiresAt {
-                // The button lives INSIDE the timeline closure so its
-                // `disabled` state re-derives from `context.date` every
-                // second — the moment the selected plan's TTL hits 0:00 the
-                // button disables without waiting for an unrelated change.
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    let remaining = Int(expiresAt.timeIntervalSince(context.date))
-                    approveButton(isExpired: remaining <= 0)
-                }
-                declineButton
-                confirmFootnote
-            } else {
-                // No server TTL — approve is never expiry-gated.
-                approveButton(isExpired: false)
-                declineButton
-                confirmFootnote
-            }
+            // Expiry arrives as ONE state change at the deadline (see
+            // `expiryTick`), not as a per-second rebuild of this button.
+            approveButton(isExpired: selectedPlanExpired)
+            declineButton
+            confirmFootnote
         }
     }
 
@@ -1253,17 +1490,27 @@ struct TrustLayerSheet: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .accessibilityIdentifier("trustLayer.decline")
+        .disabled(model.approving || model.settlementPending)
     }
 
     /// The settlement footnote under the initial CTA (kept out of the
     /// confirm state, which carries its own message text).
     private var confirmFootnote: some View {
-        Text(app.tr(
-            "Le Trust Layer règle la différence de tarif auprès du prestataire après votre approbation.",
-            "The Trust Layer settles the fare difference with the provider once you approve."))
+        Text(isFlightRehearsal
+             ? app.trm("Vols en mode test : aucun billet réel n'est émis. Votre itinéraire peut être modifié.",
+                       "Flight booking rehearsal: no real ticket is issued. Your itinerary can still be updated.",
+                       "Reserva de vuelos de prueba: no se emite un billete real. Tu itinerario puede actualizarse.",
+                       "Flugbuchung im Testmodus: Es wird kein echtes Ticket ausgestellt. Dein Reiseplan kann aktualisiert werden.",
+                       "航班预订演练：不会签发真实机票，但仍可能更新行程。")
+             : app.trm("Votre approbation applique ce plan. Le résultat précise les réservations confirmées par les prestataires.",
+                       "Approval applies this plan. The result identifies which bookings the providers confirmed.",
+                       "La aprobación aplica este plan. El resultado indica qué reservas confirmaron los proveedores.",
+                       "Deine Zustimmung wendet diesen Plan an. Das Ergebnis zeigt, welche Buchungen die Anbieter bestätigt haben.",
+                       "批准后将应用此方案。结果会注明供应商确认了哪些预订。"))
             .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)
+            .accessibilityIdentifier("trustLayer.bookingEnvironment")
     }
 
     /// Centered settlement confirmation popup — shown as an overlay on the
@@ -1289,13 +1536,9 @@ struct TrustLayerSheet: View {
                 }
                 .transition(.opacity)
 
-            // Live TTL gating (same idiom as the main CTA): expiry derives
-            // from `context.date` every second so the "Allow payment"
-            // capsule disables — visibly — the moment the quote dies,
-            // instead of staying enabled-looking and silently no-opping.
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                popupCard(planExpired: popupPlanExpired(asOf: context.date))
-            }
+            // Same event-driven expiry as the main CTA: the capsule disables
+            // the moment the quote dies, without a per-second rebuild.
+            popupCard(planExpired: selectedPlanExpired || model.selectedPlan == nil)
             // Sit slightly below dead-center — feels anchored to the sheet's
             // action area rather than floating mid-screen.
             .offset(y: 60)
@@ -1311,7 +1554,7 @@ struct TrustLayerSheet: View {
     /// plain `Brand.gradient` — NOT `.glassEffect`: iOS 26 glass can cause
     /// silent tap no-ops in XCUITest.
     private func popupCard(planExpired: Bool) -> some View {
-        GlassCard(cornerRadius: 24) {
+        SwarmSurfaceCard {
             VStack(spacing: 14) {
                 Image(systemName: "creditcard.fill")
                     .font(.system(size: 30))
@@ -1319,14 +1562,12 @@ struct TrustLayerSheet: View {
                 Text(settleDialogTitle)
                     .font(.headline.weight(.semibold))
                     .multilineTextAlignment(.center)
-                Text(app.tr(
-                    "Ceci autorise le Trust Layer à régler le montant auprès du prestataire et exécute la réservation. Vous verrez le récapitulatif une fois le règlement terminé.",
-                    "This authorizes the Trust Layer to settle this amount with the provider and executes the booking. You'll see a recap once settlement completes."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                confirmFootnote
                 Button {
-                    guard !(model.approving || model.degraded || model.phase != .awaitingApproval || planExpired) else { return }
+                    // Re-checked live at tap time: the quote may have died
+                    // between the last render and this tap.
+                    guard !(model.approving || model.degraded || model.phase != .awaitingApproval
+                            || planExpired || selectedPlanExpired) else { return }
                     confirming = false
                     Task { await model.approve() }
                 } label: {
@@ -1334,8 +1575,8 @@ struct TrustLayerSheet: View {
                         if model.approving {
                             ProgressView().tint(.white)
                         } else {
-                            Label(app.tr("Autoriser le paiement", "Allow payment"),
-                                  systemImage: "creditcard")
+                            Label(app.trm("Confirmer et appliquer", "Confirm & apply", "Confirmar y aplicar", "Bestätigen und anwenden", "确认并应用"),
+                                  systemImage: "checkmark.seal")
                         }
                     }
                     .font(.headline.weight(.bold))
@@ -1369,29 +1610,26 @@ struct TrustLayerSheet: View {
         .accessibilityAddTraits(.isModal)
     }
 
-    /// Expiry snapshot for the popup's "Allow payment" gate, evaluated
-    /// against the `TimelineView` tick's date. NO selected plan means the
-    /// proposal behind the popup vanished (e.g. mission cancelled) — treat
-    /// it as expired so settlement can't proceed on a ghost plan.
-    private func popupPlanExpired(asOf date: Date) -> Bool {
-        guard let plan = model.selectedPlan else { return true }
-        guard let expiresAt = plan.expiresAt else { return false }
-        return expiresAt <= date
-    }
-
     /// The settlement button, extracted so it can live inside the TTL
     /// TimelineView (expiry-gated) or stand alone when `expiresAt` is nil.
     /// Brand-gradient capsule (NexusSwarmView send-button idiom) instead of
     /// `.borderedProminent` so the CTA reads as the primary action.
     private func approveButton(isExpired: Bool) -> some View {
         Button {
-            confirming = true
+            if model.settlementPending {
+                Task { await model.refreshSettlementStatus() }
+            } else {
+                confirming = true
+            }
         } label: {
             Group {
                 if model.approving {
                     ProgressView().tint(.white)
                 } else {
-                    Label(app.tr("Valider et appliquer", "Approve & apply"), systemImage: "checkmark.seal")
+                    Label(model.settlementPending
+                          ? app.tr("Vérifier le statut", "Check booking status")
+                          : app.tr("Valider et appliquer", "Approve & apply"),
+                          systemImage: model.settlementPending ? "arrow.clockwise" : "checkmark.seal")
                 }
             }
             .font(.headline)
@@ -1402,24 +1640,40 @@ struct TrustLayerSheet: View {
         }
         .buttonStyle(.plain)
         // Disabled affordance — mirrors the send-button dim idiom.
-        .opacity(isExpired || model.degraded ? 0.4 : 1)
+        .opacity(!model.settlementPending && (isExpired || model.degraded) ? 0.4 : 1)
         .accessibilityIdentifier("trustLayer.approve")
         // Degraded (simulated) plans are never approvable — the server 409s.
-        .disabled(model.approving || model.degraded || model.phase != .awaitingApproval || isExpired)
+        .disabled(model.approving || (!model.settlementPending && (model.degraded || model.phase != .awaitingApproval || isExpired)))
     }
 
     /// One-shot settlement reveal: the seal springs in exactly once
     /// (immediate under Reduce Motion). The success haptic already fired in
     /// `SwarmViewModel.approve()` at the moment settlement landed.
+    private var settlementNeedsFollowUp: Bool {
+        guard let receipt = model.lastSettlement else { return true }
+        return receipt.needsFollowUp || receipt.conflictSkipped || !receipt.tripUpdated
+            || (plan?.proposedResolution.newFlight != nil &&
+                (!receipt.bookingRecorded || model.booking?.status != "confirmed"))
+    }
+
     private var settledBlock: some View {
-        GlassCard {
+        SwarmSurfaceCard {
             VStack(spacing: 12) {
                 Image(systemName: "checkmark.seal.fill")
                     .font(.system(size: 52))
                     .foregroundStyle(Brand.gradient)
                     .scaleEffect(sealRevealed ? 1 : 0.4)
                     .opacity(sealRevealed ? 1 : 0)
-                Text(app.tr("Approuvé et appliqué", "Approved & settled"))
+                Text(!model.settlementFollowUps.isEmpty
+                     ? app.trm("Appliqué — il vous reste \(model.settlementFollowUps.count) chose(s) à faire",
+                               "Applied — \(model.settlementFollowUps.count) thing(s) left for you",
+                               "Aplicado — te queda(n) \(model.settlementFollowUps.count) cosa(s) por hacer",
+                               "Angewendet – \(model.settlementFollowUps.count) Punkt(e) für dich offen",
+                               "已应用 — 还有 \(model.settlementFollowUps.count) 项需要你处理")
+                     : settlementNeedsFollowUp
+                     ? app.tr("Vérification nécessaire", "Follow-up needed")
+                     : app.tr("Approuvé et appliqué", "Approved & applied"))
+                    .multilineTextAlignment(.center)
                     .font(.title3.weight(.bold))
                 if let code = model.booking?.confirmationCode {
                     // A code is a CARRIER confirmation only when a provider
@@ -1430,7 +1684,9 @@ struct TrustLayerSheet: View {
                     // "Confirmation code" invents an airline booking the
                     // traveler does not have.
                     let carrierBooked = model.lastSettlement?.bookingRecorded == true
-                    Text(carrierBooked
+                    Text(carrierBooked && isFlightRehearsal
+                         ? app.trm("Référence de réservation test", "Test booking reference", "Referencia de reserva de prueba", "Testbuchungsreferenz", "测试预订编号")
+                         : carrierBooked
                          ? app.tr("Code de confirmation", "Confirmation code")
                          : app.tr("Référence de règlement du swarm", "Swarm settlement reference"))
                         .font(.caption)
@@ -1442,8 +1698,8 @@ struct TrustLayerSheet: View {
                         .background(Brand.indigo.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
                     if !carrierBooked {
                         Text(app.tr(
-                            "Rien n'a été réservé auprès d'un fournisseur — la modification n'est enregistrée que dans votre voyage.",
-                            "Nothing was booked with a provider — this change is recorded in your trip only."))
+                            "Aucune confirmation du fournisseur n’est disponible ici. Vérifiez la réservation avant d’en effectuer une autre.",
+                            "No provider confirmation is available here. Check the booking outcome before making another reservation."))
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .multilineTextAlignment(.center)
@@ -1464,8 +1720,12 @@ struct TrustLayerSheet: View {
                 // the itinerary rewrite (rev conflict) or reported the trip
                 // untouched with a note, surface the note instead of letting
                 // the seal imply a full timeline update.
-                if let settlement = model.lastSettlement,
-                   settlement.conflictSkipped || !settlement.tripUpdated {
+                if !model.settlementFollowUps.isEmpty {
+                    // Itemized, so the traveller knows exactly what is left —
+                    // and, by omission, that everything else is done.
+                    followUpList(model.settlementFollowUps)
+                } else if let settlement = model.lastSettlement,
+                   settlement.needsFollowUp || settlement.conflictSkipped || !settlement.tripUpdated {
                     Text(settlementHonestyNote(settlement))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -1544,7 +1804,7 @@ struct TrustLayerSheet: View {
     }
 
     private var emptyBlock: some View {
-        GlassCard {
+        SwarmSurfaceCard {
             VStack(spacing: 10) {
                 Image(systemName: "tray")
                     .font(.title2)
@@ -1558,7 +1818,7 @@ struct TrustLayerSheet: View {
     }
 
     private var processingBlock: some View {
-        GlassCard {
+        SwarmSurfaceCard {
             VStack(spacing: 16) {
                 ProgressView()
                     .controlSize(.large)
@@ -1590,7 +1850,7 @@ struct TrustLayerSheet: View {
     /// 2-phase flow, step 2 — resolve acknowledged, the plans are being
     /// composed server-side (async rail while `pollStatus()` runs).
     private var resolvingBlock: some View {
-        GlassCard {
+        SwarmSurfaceCard {
             VStack(spacing: 16) {
                 ProgressView()
                     .controlSize(.large)
@@ -1640,14 +1900,28 @@ struct TrustLayerSheet: View {
 
     private func friendlyAgentMessage(for agent: String) -> String {
         switch agent {
-        case "orchestrator": return "Analyzing disruption..."
-        case "flight": return "Contacting airlines..."
-        case "hotel": return "Securing hotel accommodations..."
-        case "activity": return "Rescheduling activities..."
-        case "policy": return "Verifying fare rules..."
-        case "trust_layer": return "Finalizing resolution plan..."
-        default: return "Comparing alternate routes..."
-        }
+        case "orchestrator":
+            return app.trm("Analyse de la perturbation…", "Analyzing disruption…", "Analizando la interrupción…",
+                           "Störung wird analysiert…", "正在分析中断…")
+        case "flight":
+            return app.trm("Contact des compagnies…", "Contacting airlines…", "Contactando con aerolíneas…",
+                           "Airlines werden kontaktiert…", "正在联系航空公司…")
+        case "hotel":
+            return app.trm("Sécurisation de l'hébergement…", "Securing hotel accommodations…",
+                           "Asegurando el alojamiento…", "Unterkunft wird gesichert…", "正在确认住宿…")
+        case "activity":
+            return app.trm("Replanification des activités…", "Rescheduling activities…",
+                           "Reprogramando actividades…", "Aktivitäten werden umgeplant…", "正在重新安排活动…")
+        case "policy":
+            return app.trm("Vérification des règles tarifaires…", "Verifying fare rules…",
+                           "Verificando las reglas tarifarias…", "Tarifregeln werden geprüft…", "正在核对票价规则…")
+        case "trust_layer":
+            return app.trm("Finalisation du plan…", "Finalizing resolution plan…", "Finalizando el plan…",
+                           "Plan wird finalisiert…", "正在完成方案…")
+        default:
+            return app.trm("Comparaison des itinéraires…", "Comparing alternate routes…",
+                           "Comparando rutas alternativas…", "Alternativen werden verglichen…", "正在比较备选路线…")
+    }
     }
 
     private func sectionHeader(_ title: String, icon: String) -> some View {
@@ -1895,6 +2169,205 @@ private struct SwarmMapThumbnail: View {
                                          height: pinImage.size.height))
             }
         }
+    }
+}
+
+// MARK: - Settlement disclosure helpers
+
+extension TrustLayerSheet {
+    /// "Late check-in", not "late_check_in".
+    func hotelActionLabel(_ action: String) -> String {
+        switch action {
+        case "late_check_in":
+            return app.trm("Arrivée tardive", "Late check-in", "Llegada tardía", "Späte Anreise", "延迟入住")
+        case "rebook":
+            return app.trm("Chambre à réserver à nouveau", "Room needs rebooking", "Hay que volver a reservar",
+                           "Zimmer neu buchen", "需重新预订房间")
+        case "none":
+            return app.trm("Aucun changement", "No change", "Sin cambios", "Keine Änderung", "无变化")
+        default:
+            return action.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+
+    /// Chip naming how the price was established — shown only when it is NOT a
+    /// provider-verified fare, so a verified plan stays uncluttered.
+    func pricingBasisChip(_ plan: SwarmService.Plan) -> AnyView? {
+        guard let flight = plan.proposedResolution.newFlight else { return nil }
+        let label: String
+        let tint: Color
+        if flight.isIndicativeEstimate {
+            label = app.trm("Estimation", "Estimate", "Estimación", "Schätzung", "估算")
+            tint = Brand.amber
+        } else if flight.isUnverifiedPrice {
+            label = app.trm("Prix à confirmer", "Price unconfirmed", "Precio por confirmar",
+                            "Preis unbestätigt", "价格待确认")
+            tint = .orange
+        } else {
+            return nil
+        }
+        return AnyView(
+            Text(label)
+                .font(.caption2.weight(.bold))
+                .textCase(.uppercase)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .foregroundStyle(tint)
+                .background(tint.opacity(0.14), in: Capsule())
+                .overlay(Capsule().strokeBorder(tint.opacity(0.5), lineWidth: 0.5))
+                .accessibilityLabel(label)
+                .accessibilityIdentifier("trustLayer.pricingBasis")
+        )
+    }
+
+    func settlementPreviewCard(_ preview: SwarmService.Presentation.SettlementPreview) -> some View {
+        SwarmSurfaceCard {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(app.trm("Ce que l’approbation modifie", "What approving changes",
+                              "Qué cambia al aprobar", "Was die Zustimmung ändert", "批准后将更改"),
+                      systemImage: "list.bullet.clipboard")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(Array(preview.changes.enumerated()), id: \.offset) { _, change in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: change.contains("cancelled") ? "xmark.circle" : "arrow.right.circle")
+                            .font(.footnote)
+                            .foregroundStyle(change.contains("cancelled") ? Brand.coral : Brand.indigo)
+                        Text(change)
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if !preview.followUps.isEmpty {
+                    Divider().opacity(0.4)
+                    Text(app.trm("Il vous restera à faire", "Left for you to do", "Te quedará por hacer",
+                                 "Danach noch zu tun", "之后需要你处理"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    followUpList(preview.followUps)
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("trustLayer.settlementPreview")
+    }
+
+    func followUpList(_ followUps: [SwarmService.FollowUp]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(followUps) { followUp in
+                Label {
+                    Text(followUp.message)
+                        .font(.footnote)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: followUp.systemImage)
+                        .foregroundStyle(Brand.amber)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .accessibilityIdentifier("trustLayer.followUps")
+    }
+}
+
+/// Height of the floating actions card plus the window inset beneath it —
+/// read from one proxy so the page reserves exactly the room the card takes on
+/// THIS device, at THIS text size.
+struct ActionsMetrics: Equatable {
+    var height: CGFloat
+    var bottomInset: CGFloat
+}
+
+// MARK: - Surfaces
+
+/// The Trust Layer's card surface.
+///
+/// Liquid Glass is the app's language and the sheet keeps it — but only where
+/// it carries the design: the page-level cards a traveller actually looks at.
+/// Rows NESTED inside one of those cards use `.solid`, because glass sampled
+/// through glass is both the expensive case and the muddy-looking one. Every
+/// glass surface on a page is a sibling inside one `GlassEffectContainer`, so
+/// the system composites the group in a single pass instead of one pass per
+/// card (13 per page × 3 mounted pages was what dropped frames).
+struct SwarmSurfaceCard<Content: View>: View {
+    enum Style {
+        /// Page-level surface — real Liquid Glass.
+        case glass
+        /// Nested inside a glass card: a light fill, never glass on glass.
+        case solid
+    }
+
+    var cornerRadius: CGFloat = 18
+    var style: Style = .glass
+    @Environment(\.isSwarmActive) private var isSwarmActive
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        switch style {
+        case .glass:
+            content
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .overlay {
+                    if isSwarmActive {
+                        SwarmIridescentBorder(active: true, settled: false, cornerRadius: cornerRadius)
+                    }
+                }
+        case .solid:
+            content
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.55),
+                            in: .rect(cornerRadius: cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius)
+                    .strokeBorder(Color(uiColor: .separator).opacity(0.6), lineWidth: 0.5))
+        }
+    }
+}
+
+// MARK: - Quote countdown
+
+/// The ONLY view in the Trust Layer that re-renders every second.
+///
+/// It used to be a `TimelineView` wrapped around the countdown AND around the
+/// approve button AND around the confirmation popup, so each tick invalidated
+/// the button, its gradient and the popup card too. Here the tick is confined
+/// to one text badge; expiry reaches the rest of the sheet as a single state
+/// change at the deadline.
+struct TTLBadgeView: View {
+    @Environment(AppSettings.self) private var app
+    let expiresAt: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let remaining = Int(expiresAt.timeIntervalSince(context.date))
+            if remaining > 0 {
+                let clock = String(format: "%02d:%02d", remaining / 60, remaining % 60)
+                Text(app.trm("Prix garanti pendant \(clock)",
+                             "Price guaranteed for \(clock)",
+                             "Precio garantizado durante \(clock)",
+                             "Preis garantiert für \(clock)",
+                             "价格保证剩余 \(clock)"))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(remaining >= 120
+                                     ? AnyShapeStyle(.secondary)
+                                     : AnyShapeStyle(Brand.coral))
+                    .contentTransition(.numericText(countsDown: true))
+                    .animation(.linear(duration: 0.2), value: remaining)
+                    .accessibilityIdentifier("trustLayer.ttl")
+            } else {
+                Text(app.tr(
+                    "Devis expirés. Relancez la mission pour obtenir de nouveaux prix.",
+                    "Quotes expired. Re-run the mission to get fresh prices."))
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("trustLayer.ttlExpired")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

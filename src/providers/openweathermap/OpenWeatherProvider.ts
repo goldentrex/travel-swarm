@@ -69,9 +69,9 @@ function parseTimeoutMs(raw: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
-function resolveEnvConfig(): OpenWeatherProviderConfig {
+function resolveEnvConfig(explicitKey?: string): OpenWeatherProviderConfig {
   const env = typeof process !== "undefined" ? process.env : undefined;
-  const apiKey = env?.OPENWEATHER_API_KEY;
+  const apiKey = explicitKey ?? env?.OPENWEATHER_API_KEY;
   if (!apiKey) {
     throw new Error(
       "OpenWeatherProvider: OPENWEATHER_API_KEY is not set. Check openWeatherConfigured() before constructing the provider to degrade gracefully.",
@@ -94,7 +94,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
   private readonly config: OpenWeatherProviderConfig;
 
   constructor(config?: Partial<OpenWeatherProviderConfig>) {
-    const fromEnv = resolveEnvConfig();
+    const fromEnv = resolveEnvConfig(config?.apiKey);
     const explicitTimeout = config?.timeoutMs;
     const timeoutMs =
       explicitTimeout !== undefined && Number.isFinite(explicitTimeout) && explicitTimeout > 0
@@ -126,17 +126,27 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       });
     }
 
-    const horizonMs = Math.max(1, Math.trunc(horizonHours)) * 60 * 60 * 1000;
+    const horizonMs =
+      (Number.isFinite(horizonHours)
+        ? Math.max(1, Math.trunc(horizonHours))
+        : DEFAULT_HORIZON_HOURS) *
+      60 *
+      60 *
+      1000;
     const nowMs = Date.now();
     const windows: RainWindow[] = [];
     let open: { startMs: number; endMs: number; probability: number; description: string } | null =
       null;
 
-    for (const rawStep of body.hourly) {
+    const steps = body.hourly.filter(isRecord).sort((a, b) => Number(a.dt) - Number(b.dt));
+    for (const rawStep of steps) {
       if (!isRecord(rawStep)) continue;
       const dt = typeof rawStep.dt === "number" ? rawStep.dt * 1000 : NaN;
-      if (!Number.isFinite(dt) || dt > nowMs + horizonMs) continue;
-      const pop = typeof rawStep.pop === "number" ? rawStep.pop : 0;
+      if (!Number.isFinite(dt) || dt >= nowMs + horizonMs || dt + 3_600_000 <= nowMs) continue;
+      const pop =
+        typeof rawStep.pop === "number" && Number.isFinite(rawStep.pop)
+          ? Math.min(1, Math.max(0, rawStep.pop))
+          : 0;
       const weather =
         Array.isArray(rawStep.weather) && isRecord(rawStep.weather[0])
           ? (rawStep.weather[0] as Record<string, unknown>)
@@ -146,14 +156,14 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       const isRain = pop >= RAIN_PROBABILITY_THRESHOLD || RAIN_WEATHER_MAINS.has(main);
 
       if (isRain) {
-        const stepEnd = dt + 60 * 60 * 1000;
+        const stepEnd = Math.min(dt + 60 * 60 * 1000, nowMs + horizonMs);
         if (open && dt <= open.endMs) {
-          open.endMs = stepEnd;
+          open.endMs = Math.max(open.endMs, stepEnd);
           open.probability = Math.max(open.probability, pop);
           if (description.length > open.description.length) open.description = description;
         } else {
           if (open) windows.push(toRainWindow(open));
-          open = { startMs: dt, endMs: stepEnd, probability: pop, description };
+          open = { startMs: Math.max(dt, nowMs), endMs: stepEnd, probability: pop, description };
         }
       }
     }
@@ -171,6 +181,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
 
   private async request(method: "GET", path: string): Promise<unknown> {
     const url = `${this.config.baseUrl}${path}`;
+    const safePath = path.split("?")[0];
 
     let response: Response;
     try {
@@ -183,7 +194,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       const timeout = isTimeoutFailure(error);
       throw new WeatherApiError({
         kind: timeout ? "timeout" : "network",
-        message: `OpenWeatherMap request to ${path} ${timeout ? "timed out" : "failed"}.`,
+        message: `OpenWeatherMap request to ${safePath} ${timeout ? "timed out" : "failed"}.`,
         retryable: true,
         cause: error,
       });
@@ -193,7 +204,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
     const rawText = await response.text().catch((error) => {
       throw new WeatherApiError({
         kind: isTimeoutFailure(error) ? "timeout" : "network",
-        message: `OpenWeatherMap response body for ${path} could not be read.`,
+        message: `OpenWeatherMap response body for ${safePath} could not be read.`,
         status: response.status,
         retryable: true,
         cause: error,
@@ -205,7 +216,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       } catch (error) {
         throw new WeatherApiError({
           kind: "parse",
-          message: `OpenWeatherMap returned a non-JSON body for ${path} (status ${response.status}).`,
+          message: `OpenWeatherMap returned a non-JSON body for ${safePath} (status ${response.status}).`,
           status: response.status,
           retryable: RETRYABLE_HTTP_STATUSES.has(response.status),
           cause: error,
@@ -216,7 +227,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
     if (!response.ok) {
       throw new WeatherApiError({
         kind: "http",
-        message: `OpenWeatherMap request to ${path} failed with HTTP ${response.status}.`,
+        message: `OpenWeatherMap request to ${safePath} failed with HTTP ${response.status}.`,
         status: response.status,
         retryable: RETRYABLE_HTTP_STATUSES.has(response.status),
       });

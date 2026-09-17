@@ -243,6 +243,7 @@ describe("approve-resolution matrix", () => {
     expect(response.status).toBe(409);
     const body = (await response.json()) as Record<string, string>;
     expect(body.error).toBe("degraded_plan_not_bookable");
+    expect(store.__sessions.get("res_degraded")?.state).toBe("proposal_ready");
   });
 
   it("flight-less plan approves with a locally recorded booking (flight-only 409 gate removed)", async () => {
@@ -291,6 +292,45 @@ describe("approve-resolution matrix", () => {
     expect(body.settlement.booking_recorded).toBe(false);
     // Session was consumed exactly once.
     expect(store.__sessions.get("res_healthy")?.state).toBe("settled");
+  });
+
+  it("an indicative synthetic flight stays approvable and is recorded without Atlas booking", async () => {
+    const plan = bookablePlan();
+    plan.proposed_resolution.new_flight = {
+      id: "SYNTHETIC-RECOVERY-SIN-DPS-2026-09-18",
+      cost: 182,
+      origin: "SIN",
+      destination: "DPS",
+      airline: "Scoot (indicative fallback)",
+      flight_number: "TR285",
+    };
+    store.__seed({ id: "res_synthetic", degraded: false, plan });
+
+    const response = await handleHackathonRequest(
+      post("approve-resolution", { resolutionId: "res_synthetic", approved: true }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      approved: boolean;
+      booking: { flightId: string; status: string; source?: string };
+    };
+    expect(body.approved).toBe(true);
+    expect(body.booking.flightId).toBe("SYNTHETIC-RECOVERY-SIN-DPS-2026-09-18");
+    expect(body.booking.status).toBe("recorded");
+    expect(body.booking.source).toBe("swarm_settlement");
+    expect(store.__sessions.get("res_synthetic")?.state).toBe("settled");
+  });
+
+  it("an inconsistent financial proposal is rejected before approval is consumed", async () => {
+    const plan = bookablePlan();
+    plan.financial_delta.net_payable = 999999;
+    store.__seed({ id: "res_invalid_ledger", plan, degraded: false });
+    const response = await handleHackathonRequest(
+      post("approve-resolution", { resolutionId: "res_invalid_ledger", approved: true }),
+    );
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toBe("plan_not_bookable");
+    expect(store.__sessions.get("res_invalid_ledger")?.state).toBe("proposal_ready");
   });
 
   it("expired quotes → 410 quotes_expired", async () => {
@@ -390,14 +430,15 @@ describe("mission + swarm-status degraded visibility (B2)", () => {
 
     expect(body.degraded).toBe(true);
     expect(body.degraded_reason).toBe("session_store_memory");
-    // Degraded plans never carry a presentation block.
-    expect(body.plan.presentation).toBeUndefined();
+    // The provider fallback remains a full structured plan; memory-store
+    // degradation does not strip its presentation.
+    expect(body.plan.presentation).toBeDefined();
     expect(body.plan.currency).toBe("EUR");
     // Real-trip intent parsing names the fixture flight.
     expect(body.plan.incident).toContain("Delayed flight TP437");
   });
 
-  it("with a persistent store the reason flips to provider_offline", async () => {
+  it("with a persistent store the indicative fallback stays approvable", async () => {
     store.__setPersistent(true);
 
     const response = await handleHackathonRequest(
@@ -409,9 +450,10 @@ describe("mission + swarm-status degraded visibility (B2)", () => {
       degraded: boolean;
       degraded_reason?: string;
     };
-    // Provider still offline in tests — but the store is no longer the cause.
-    expect(body.degraded).toBe(true);
-    expect(body.degraded_reason).toBe("provider_offline");
+    // Provider is offline, but a structured indicative recovery exists and
+    // remains approvable; this is not the graph-only degraded rail.
+    expect(body.degraded).toBe(false);
+    expect(body.degraded_reason).toBeUndefined();
   });
 
   it("swarm-status body mirrors the degraded flag and reason", async () => {
@@ -460,8 +502,8 @@ describe("degraded plan formatting (B1.5) on the fixture trip", () => {
       // Machine-readable companion is present and IS an ISO timestamp.
       expect(activity.new_time_iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     }
-    // The provider fallback flight + degraded incident suffix stay intact.
-    expect(body.plan.proposed_resolution.new_flight?.id).toBe("XY999");
+    // The internal recovery synthesizer replaces the old hard-coded canary.
+    expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
     expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
   });
 
@@ -472,8 +514,15 @@ describe("degraded plan formatting (B1.5) on the fixture trip", () => {
     const body = (await response.json()) as { plan: ResolutionPlan };
     const plan = body.plan;
 
-    // 150 (fallback flight) + one 20-EUR penalty per rescheduled activity.
-    const expected = 150 + plan.proposed_resolution.rescheduled_activities.length * 20;
+    // Indicative +40 flight delta + the fallback policy's +25 change fee;
+    // activity penalties (if any) remain included by the normal ledger.
+    const expected =
+      40 +
+      25 +
+      plan.proposed_resolution.rescheduled_activities.reduce(
+        (sum, activity) => sum + activity.penalty,
+        0,
+      );
     expect(plan.financial_delta.total_new_charges).toBe(expected);
     expect(plan.financial_delta.net_payable).toBe(expected);
 
@@ -540,15 +589,15 @@ describe("non-flight missions run LIVE without an Atlas provider (clarity pass)"
     }
   });
 
-  it("a flight mission still degrades when Atlas is unavailable (canary byte-identical)", async () => {
+  it("a flight mission synthesizes an approvable option when Atlas is unavailable", async () => {
     store.__setPersistent(true);
     try {
       const response = await handleHackathonRequest(
         post("mission", { intent: "reroute TP437 by 4h", tripId: REAL_TRIP_UUID }),
       );
       const body = (await response.json()) as { degraded: boolean; plan: ResolutionPlan };
-      expect(body.degraded).toBe(true);
-      expect(body.plan.proposed_resolution.new_flight?.id).toBe("XY999");
+      expect(body.degraded).toBe(false);
+      expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
       expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
     } finally {
       store.__setPersistent(false);

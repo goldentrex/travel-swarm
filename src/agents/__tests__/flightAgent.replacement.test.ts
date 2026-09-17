@@ -90,11 +90,11 @@ describe("why there was no replacement — and who to blame for it", () => {
     return agent.assessRebookingOptions("flight-0", ORIGINAL_DEPARTURE, ctx);
   }
 
-  it("blames the partner's coverage ONLY after several empty dates", async () => {
-    // A route with daily service does not go a whole week without a flight.
+  it("uses the indicative fallback after several empty dates", async () => {
     const assessment = await assess([], missedContext);
     expect((assessment.searchedDates?.length ?? 0) >= 2).toBe(true);
-    expect(assessment.noReplacementReason).toBe("route_not_covered");
+    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    expect(assessment.noReplacementReason).toBeUndefined();
     expect(assessment.providerOptionCount).toBe(0);
   });
 
@@ -105,17 +105,17 @@ describe("why there was no replacement — and who to blame for it", () => {
     expect(assessment.noReplacementReason).toBe("no_options_on_date");
   });
 
-  it("blames OUR rebooking horizon when the partner did have flights", async () => {
-    // The exact trap: the provider answered with options, and the 48h ceiling
-    // removed every one. Nothing here is the partner's fault.
+  it("does not veto provider flights at the legacy rebooking horizon", async () => {
     const bounded: FlightRouteContext = { ...missedContext, latestDeparture: at(48) };
     const assessment = await assess(
       [option("late-1", "TR900", at(24 * 5)), option("late-2", "TR901", at(24 * 6))],
       bounded,
     );
-    expect(assessment.candidates).toEqual([]);
-    expect(assessment.noReplacementReason).toBe("all_options_rejected");
-    // The evidence that says so: the partner DID return options.
+    expect(assessment.candidates.map((candidate) => candidate.option.id)).toEqual([
+      "late-1",
+      "late-2",
+    ]);
+    expect(assessment.noReplacementReason).toBeUndefined();
     expect(assessment.providerOptionCount).toBe(2);
   });
 
@@ -139,8 +139,9 @@ describe("why there was no replacement — and who to blame for it", () => {
       ORIGINAL_DEPARTURE,
       missedContext,
     );
-    expect(assessment.noReplacementReason).toBe("search_declined");
-    expect(assessment.searchDeclinedReason).toBe("Can not search past flights");
+    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    expect(assessment.fallbackReason).toBe("Can not search past flights");
+    expect(assessment.noReplacementReason).toBeUndefined();
   });
 
   it("says nothing at all when a replacement was found", async () => {
@@ -267,7 +268,7 @@ describe("fare pricing must not stampede the provider", () => {
     expect(fare.basis).toBe("search_reference");
   }, 20000);
 
-  it("still drops a flight the provider rejected PERMANENTLY", async () => {
+  it("falls back when a flight is rejected PERMANENTLY", async () => {
     // A permanent rejection is the provider telling us something real about
     // that flight; keeping it at a stale listed price would be inventing a
     // bookable option.
@@ -286,8 +287,8 @@ describe("fare pricing must not stampede the provider", () => {
       ORIGINAL_DEPARTURE,
       missedContext,
     );
-    expect(assessment.candidates).toEqual([]);
-    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
+    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    expect(assessment.noReplacementReason).toBeUndefined();
   }, 20000);
 
   it("does NOT retry a failure the provider called permanent", async () => {
@@ -311,13 +312,14 @@ describe("fare pricing must not stampede the provider", () => {
       missedContext,
     );
     expect(provider.attempts).toBe(1);
-    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
+    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    expect(assessment.noReplacementReason).toBeUndefined();
     // And the reason is quoted, not swallowed — this was invisible before.
     expect(assessment.pricingFailureDetail).toContain("credentials");
   }, 20000);
 });
 
-describe("how LATE a replacement may be", () => {
+describe("continuous reflow keeps late replacement flights", () => {
   // Found on the first real user test, and it is the worst plan the swarm has
   // produced: a traveller whose trip began 23 Dec said "I missed my flight" and
   // was offered the SAME flight number FIVE DAYS LATER as the leading plan.
@@ -338,7 +340,7 @@ describe("how LATE a replacement may be", () => {
     latestDeparture: at(48),
   };
 
-  it("rejects the five-days-later rebooking that started all this", async () => {
+  it("keeps a five-days-later provider option for downstream reflow", async () => {
     const ids = await candidateIds(
       [
         option("same-day", "TR900", at(9)),
@@ -346,7 +348,7 @@ describe("how LATE a replacement may be", () => {
       ],
       bounded,
     );
-    expect(ids).toEqual(["same-day"]);
+    expect(ids).toEqual(["same-day", "five-days"]);
   });
 
   it("still accepts a next-day replacement — thin routes are real", async () => {
@@ -359,23 +361,27 @@ describe("how LATE a replacement may be", () => {
     expect(ids).toEqual(["next-day", "day-after"]);
   });
 
-  it("takes the ceiling literally at its edge", async () => {
+  it.each([4, 8, 12])("keeps a viable replacement departing +%ih", async (hours) => {
+    const candidate = option(`plus-${hours}`, `TR9${hours}`, at(hours));
+    candidate.arrivalTime = at(hours + 2);
+    const ids = await candidateIds([candidate], bounded);
+    expect(ids).toEqual([`plus-${hours}`]);
+  });
+
+  it("ignores the legacy ceiling at its edge", async () => {
     const ids = await candidateIds(
       [option("just-inside", "TR900", at(47.9)), option("just-outside", "TR901", at(48.1))],
       bounded,
     );
-    expect(ids).toEqual(["just-inside"]);
+    expect(ids).toEqual(["just-inside", "just-outside"]);
   });
 
-  it("returns NOTHING rather than something absurd when only late options exist", async () => {
-    // The honest outcome. "No rebooking works within two days" is a true and
-    // useful answer; a proposal that silently cancels five days of holiday is
-    // neither.
+  it("returns late options rather than aborting when they are the only inventory", async () => {
     const ids = await candidateIds(
       [option("too-late", "TR892", at(24 * 5)), option("way-too-late", "TR893", at(24 * 9))],
       bounded,
     );
-    expect(ids).toEqual([]);
+    expect(ids).toEqual(["too-late", "way-too-late"]);
   });
 
   it("leaves price-shopping alone when no ceiling is given", async () => {
@@ -387,6 +393,37 @@ describe("how LATE a replacement may be", () => {
     );
     expect(ids).toContain("later");
     expect(ids).toContain("sooner");
+  });
+});
+
+describe("zero-abort route fallback", () => {
+  it.each([
+    ["SIN", "DPS", "TR285"],
+    ["SIN", "NRT", "TR882"],
+    ["KIX", "SIN", "MM773"],
+    ["SGN", "SIN", "VN650"],
+  ])("populates Option 1 for %s → %s when Atlas is empty", async (origin, destination, flightNumber) => {
+    const departureDate = "2026-12-22T06:10:00Z";
+    const agent = new FlightAgent(new Provider([]));
+    const assessment = await agent.assessRebookingOptions("disrupted", departureDate, {
+      origin,
+      destination,
+      departureDate,
+      earliestDeparture: departureDate,
+      currency: "SGD",
+      originalFare: 200,
+    });
+    const fallback = assessment.bestCandidate;
+    expect(fallback).not.toBeNull();
+    expect(fallback?.option.flightNumber).toBe(flightNumber);
+    expect(fallback?.option.inventorySource).toBe("synthetic_recovery");
+    expect(fallback?.fareDifference.basis).toBe("synthetic_estimate");
+    expect(fallback?.fareDifference.amount).toBeGreaterThanOrEqual(20);
+    expect(fallback?.fareDifference.amount).toBeLessThanOrEqual(50);
+    expect(Date.parse(fallback!.option.departureTime) - Date.parse(departureDate)).toBe(
+      3 * 3_600_000,
+    );
+    expect(assessment.noReplacementReason).toBeUndefined();
   });
 });
 

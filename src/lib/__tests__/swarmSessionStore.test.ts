@@ -154,6 +154,10 @@ import * as serverModule from "@/integrations/supabase/client.server";
 import type { ResolutionPlan } from "@/agents";
 import {
   cancelSwarmSession,
+  claimSwarmSessionForResolve,
+  claimSwarmSessionForBooking,
+  saveSwarmSettlementReceipt,
+  settlementOperation,
   getSwarmSession,
   getSwarmSessionIgnoringExpiry,
   markSwarmSessionSettled,
@@ -596,5 +600,111 @@ describe("probeSwarmStoreHealth (live store probe behind health.storeHealthy)", 
   it("a missing admin client (no env) probes false", async () => {
     dbHooks.__setClientAvailable(false);
     expect(await probeSwarmStoreHealth()).toBe(false);
+  });
+});
+
+describe("atomic resolve startup", () => {
+  it.each([true, false])("only one concurrent claimant wins (database=%s)", async (database) => {
+    dbHooks.__setClientAvailable(database);
+    const id = nextId();
+    await saveSwarmSession({ id, state: "gathering_preferences", expires_at: FUTURE() });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => claimSwarmSessionForResolve(id)),
+    );
+    expect(results.filter((result) => result.claimed)).toHaveLength(1);
+    expect((await getSwarmSession(id))?.state).toBe("processing");
+  });
+  it("does not claim stale memory when the database fails", async () => {
+    const id = nextId();
+    await saveSwarmSession({ id, state: "gathering_preferences", expires_at: FUTURE() });
+    dbHooks.__setUpdateError({ message: "offline" });
+    expect(await claimSwarmSessionForResolve(id)).toEqual({
+      claimed: false,
+      error: "session_store_unavailable",
+    });
+    expect(dbHooks.__db.get(id)?.state).toBe("gathering_preferences");
+  });
+  it.each(["expired", "approved", "settled", "proposal_ready"] as const)(
+    "does not restart %s",
+    async (state) => {
+      const id = nextId();
+      await saveSwarmSession({ id, state, expires_at: FUTURE() });
+      expect(await claimSwarmSessionForResolve(id)).toEqual({ claimed: false });
+    },
+  );
+  it("does not start a timed-out preference session", async () => {
+    const id = nextId();
+    await saveSwarmSession({ id, state: "gathering_preferences", expires_at: PAST() });
+    expect(await claimSwarmSessionForResolve(id)).toEqual({ claimed: false });
+  });
+});
+
+describe("strict resolve finalization", () => {
+  it.each([true, false])("does not recreate a missing session (database=%s)", async (database) => {
+    dbHooks.__setClientAvailable(database);
+    expect(
+      await saveSwarmSessionIfState(
+        { id: nextId(), state: "proposal_ready" },
+        ["processing"],
+        true,
+      ),
+    ).toBe(false);
+  });
+  it.each([true, false])(
+    "does not extend an already expired operation (database=%s)",
+    async (database) => {
+      dbHooks.__setClientAvailable(database);
+      const id = nextId();
+      await saveSwarmSession({ id, state: "processing", expires_at: PAST() });
+      expect(
+        await saveSwarmSessionIfState(
+          { id, state: "proposal_ready", expires_at: FUTURE() },
+          ["processing"],
+          true,
+        ),
+      ).toBe(false);
+    },
+  );
+});
+
+describe("recoverable settlement receipts", () => {
+  it.each([true, false])(
+    "atomically records identity then receipt (database=%s)",
+    async (database) => {
+      dbHooks.__setClientAvailable(database);
+      const id = nextId();
+      await saveSwarmSession({ id, state: "proposal_ready", expires_at: FUTURE() });
+      const entry = await claimSwarmSessionForBooking(id, {
+        settlement_operation: {
+          operation_id: id,
+          plan_index: 1,
+          started_at: new Date().toISOString(),
+        },
+      });
+      expect(entry).not.toBeNull();
+      expect(settlementOperation(entry!)?.plan_index).toBe(1);
+      const receipt = { approved: true, booking: { confirmationCode: "TEST-ORDER" } };
+      expect(await saveSwarmSettlementReceipt(entry!, receipt)).toBe(true);
+      const stored = await getSwarmSession(id);
+      expect(stored?.state).toBe("settled");
+      expect(settlementOperation(stored!)?.receipt).toEqual(receipt);
+      expect(await claimSwarmSessionForBooking(id)).toBeNull();
+      expect(await saveSwarmSettlementReceipt(entry!, { approved: false })).toBe(false);
+    },
+  );
+  it("leaves the operation approved when durable receipt storage fails", async () => {
+    const id = nextId();
+    await saveSwarmSession({ id, state: "proposal_ready", expires_at: FUTURE() });
+    const entry = await claimSwarmSessionForBooking(id, {
+      settlement_operation: {
+        operation_id: id,
+        plan_index: 0,
+        started_at: new Date().toISOString(),
+      },
+    });
+    dbHooks.__setUpdateError({ message: "offline" });
+    expect(await saveSwarmSettlementReceipt(entry!, { approved: true })).toBe(false);
+    expect(dbHooks.__db.get(id)?.state).toBe("approved");
+    expect(await claimSwarmSessionForBooking(id)).toBeNull();
   });
 });

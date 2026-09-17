@@ -30,6 +30,14 @@
 
 import type { IsoTimestamp } from "@/providers/interfaces/types";
 import {
+  configuredGeminiModel,
+  emitGeminiUsage,
+  readGeminiUsage,
+  type GeminiUsageEvent,
+  type GeminiUsageObserver,
+  type GeminiCallBudget,
+} from "../geminiUsage";
+import {
   GEMINI_MODEL_CASCADE,
   modelLadder,
   noteModelExhausted,
@@ -114,6 +122,10 @@ export interface DayReorganizerConfig {
   model?: string;
   /** Injectable fetch implementation (tests). */
   fetchImpl?: typeof fetch;
+  /** One sanitized measurement per actual HTTP attempt, including failures. */
+  onUsage?: GeminiUsageObserver;
+  /** Shared across liaison and day replanning for one resolve invocation. */
+  sharedBudget?: GeminiCallBudget;
   /**
    * Task 21 (additive): retries on a `quota_429` classify (429/503).
    * Default 0 (single-shot). The async resolve rail wires exactly ONE retry;
@@ -334,7 +346,6 @@ export function resequenceDeterministically(request: DayReorgRequest): DayReorgD
     .filter((decision): decision is DayReorgDecision => decision !== undefined);
 }
 
-
 /**
  * Reinstate activities the model dropped without cause, using the
  * deterministic rail's decision for each, and re-validate the whole schedule.
@@ -354,9 +365,9 @@ function repairUnjustifiedDrops(
   const durationOf = new Map(request.activities.map((a) => [a.nodeId, a.durationMinutes]));
 
   // The model's own retimes, kept exactly as it wrote them.
-  const kept = value.filter(
-    (entry) => isRecord(entry) && entry.action === "retime",
-  ) as Array<Record<string, unknown>>;
+  const kept = value.filter((entry) => isRecord(entry) && entry.action === "retime") as Array<
+    Record<string, unknown>
+  >;
   const lastEndMs = kept.reduce((latest, entry) => {
     const start = Date.parse(String(entry.newTime));
     const mins = durationOf.get(String(entry.nodeId)) ?? 0;
@@ -460,7 +471,8 @@ export function validateReorgDecisions(
       if (typeof nodeId !== "string" || !known.has(nodeId) || seen.has(nodeId))
         return reject(`unknown or duplicated nodeId ${String(nodeId)}`);
       seen.add(nodeId);
-      if (action !== "retime" && action !== "drop") return reject(`unknown action ${String(action)}`);
+      if (action !== "retime" && action !== "drop")
+        return reject(`unknown action ${String(action)}`);
       const reason = typeof raw.reason === "string" && raw.reason.length > 0 ? raw.reason : null;
       if (action === "drop") {
         decisions.push({
@@ -483,9 +495,7 @@ export function validateReorgDecisions(
         );
       }
       if (startMs + durationMs > bounds.end) {
-        return reject(
-          `${nodeId} would end after latest_end ${new Date(bounds.end).toISOString()}`,
-        );
+        return reject(`${nodeId} would end after latest_end ${new Date(bounds.end).toISOString()}`);
       }
       decisions.push({
         nodeId,
@@ -495,8 +505,7 @@ export function validateReorgDecisions(
       });
     }
     // Exact coverage: every input activity decided exactly once.
-    if (seen.size !== known.size)
-      return reject(`decided ${seen.size} of ${known.size} activities`);
+    if (seen.size !== known.size) return reject(`decided ${seen.size} of ${known.size} activities`);
 
     // No overlaps + travel plausibility, in chronological order.
     const retimed = decisions
@@ -575,6 +584,8 @@ export class DayReorganizer {
   private readonly timeoutMs: number;
   private model: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly onUsage: GeminiUsageObserver | undefined;
+  private readonly sharedBudget: GeminiCallBudget | undefined;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
   private readonly callBudget: number;
@@ -594,7 +605,9 @@ export class DayReorganizer {
           ? process.env.GEMINI_API_KEY
           : undefined;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.model = config.model ?? DEFAULT_MODEL;
+    this.model = config.model ?? configuredGeminiModel("dayReorg", DEFAULT_MODEL);
+    this.onUsage = config.onUsage;
+    this.sharedBudget = config.sharedBudget;
     this.maxRetries = Math.max(0, Math.floor(config.maxRetries ?? 0));
     this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.callBudget = config.callBudget ?? GEMINI_CALLS_PER_MISSION;
@@ -752,8 +765,7 @@ export class DayReorganizer {
       new_arrival_time: request.newArrivalTime ?? null,
       /** No activity may START before this instant. Already includes the
        *  post-landing transit margin — do not add anything to it. */
-      earliest_start:
-        earliestStartMs !== null ? new Date(earliestStartMs).toISOString() : null,
+      earliest_start: earliestStartMs !== null ? new Date(earliestStartMs).toISOString() : null,
       /** Every activity must END by this instant (start + its duration). */
       latest_end: bounds ? new Date(bounds.end).toISOString() : null,
       /** `newTime` must be a full ISO-8601 UTC timestamp, e.g. "2026-09-10T14:30:00.000Z". */
@@ -818,7 +830,18 @@ export class DayReorganizer {
     /** One attempt against `model`, with a deadline of its own. Sharing one
      *  deadline let a saturated primary starve the retry, which then degraded
      *  as `timeout` instead of actually reaching the lighter model. */
+    let budgetExhausted = false;
     const attempt = async (model: string): Promise<GeminiCallResult> => {
+      // Recheck AFTER any retry backoff: another concurrent day can consume
+      // the last slot while this call is waiting. Reserve before the next await.
+      if (
+        this.geminiCallsUsedCount >= this.callBudget ||
+        (this.sharedBudget && !this.sharedBudget.tryReserve())
+      ) {
+        budgetExhausted = true;
+        this.degradeReason = "quota_429";
+        return { ok: false, reason: "quota_429" };
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
@@ -846,6 +869,7 @@ export class DayReorganizer {
     let rung = 0;
     while (
       !result.ok &&
+      !budgetExhausted &&
       (result.reason === "quota_429" || result.reason === "http_error") &&
       rung < this.maxRetries &&
       rung + 1 < ladder.length &&
@@ -863,7 +887,7 @@ export class DayReorganizer {
       if (result.ok) noteModelHealthy(ladder[rung]);
     }
     if (!result.ok) {
-      if (result.reason === "quota_429") noteModelExhausted(ladder[rung]);
+      if (!budgetExhausted && result.reason === "quota_429") noteModelExhausted(ladder[rung]);
       this.degradeReason = result.reason;
     }
     return result;
@@ -876,6 +900,9 @@ export class DayReorganizer {
     /** Defaults to the primary; the overload retry passes the lighter tier. */
     model: string = this.model,
   ): Promise<GeminiCallResult> {
+    const startedAt = Date.now();
+    let usage: GeminiUsageEvent["usage"] = null;
+    let outcome: GeminiUsageEvent["outcome"] = "exception";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
     try {
       const response = await this.fetchImpl(url, {
@@ -901,6 +928,7 @@ export class DayReorganizer {
         console.error(
           `[day-reorg] Gemini HTTP ${response.status} (${response.statusText}): ${bodyText.slice(0, 500)} (degrade: ${reason})`,
         );
+        outcome = reason;
         return { ok: false, reason };
       }
       const data = (await response.json()) as {
@@ -910,11 +938,14 @@ export class DayReorganizer {
           finishReason?: string;
         }>;
         error?: { message?: unknown };
+        usageMetadata?: unknown;
       };
+      usage = readGeminiUsage(data?.usageMetadata);
       if (data?.error) {
         console.error(
           `[day-reorg] Gemini error payload: ${String(data.error.message ?? "unknown")} (degrade: http_error)`,
         );
+        outcome = "http_error";
         return { ok: false, reason: "http_error" };
       }
       const finishReason = data?.candidates?.[0]?.finishReason;
@@ -932,8 +963,10 @@ export class DayReorganizer {
                 finishReason ?? "none",
               )}) (degrade: invalid_output)`,
         );
+        outcome = "invalid_output";
         return { ok: false, reason: "invalid_output" };
       }
+      outcome = "text_received";
       return { ok: true, text };
     } catch (error) {
       const aborted = error instanceof Error && error.name === "AbortError";
@@ -942,7 +975,16 @@ export class DayReorganizer {
         `[day-reorg] Gemini call failed${aborted ? " (timeout)" : ""} (degrade: ${reason}):`,
         error,
       );
+      outcome = reason;
       return { ok: false, reason };
+    } finally {
+      emitGeminiUsage(this.onUsage, {
+        model,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        maxOutputTokens: 2400,
+        outcome,
+        usage,
+      });
     }
   }
 }

@@ -66,21 +66,21 @@ export class HotelAgent {
   }
 
   async assessHotelImpact(request: HotelImpactRequest): Promise<HotelAssessment> {
-    // Degraded fallback: hotels accept late arrivals by default and no fee is
-    // invented when upstream data is missing — keeps the plan safe and the
-    // Trust Layer arithmetic honest.
+    // Unknown policy must not promise that a room is held or fees are zero.
+    // Zero here means no verified charge is added; the proposal flags follow-up.
     const degradedAssessment: HotelAssessment = {
       hotelNodeId: request.hotelNodeId,
-      lateCheckInAvailable: true,
+      lateCheckInAvailable: false,
       cancellationFee: 0,
       currency: "USD",
       alternativeRooms: [],
-      recommendation: "keep_late_checkin",
+      recommendation: "keep_as_is",
       feeDelta: 0,
       degraded: true,
-      note: "Hotel provider unavailable; assuming late check-in is accepted at no cost (conservative default).",
+      note: "Hotel policy could not be verified. Contact the property to confirm availability, late arrival and any fees before changing this booking.",
     };
 
+    let policyUnknown = false;
     let policies;
     try {
       policies = await this.provider.getHotelPolicies(
@@ -89,7 +89,8 @@ export class HotelAgent {
         request.guests,
       );
     } catch {
-      return degradedAssessment;
+      policyUnknown = true;
+      policies = { hotelName: request.hotelName, lateCheckInAvailable: false, cancellationFee: 0, currency: "USD" };
     }
 
     // Alternative rooms are only needed when the late check-in cannot be held.
@@ -122,18 +123,23 @@ export class HotelAgent {
       }
     }
 
+    if (policyUnknown) return { ...degradedAssessment, alternativeRooms };
+
     // Deterministic recommendation ladder:
-    //  1. Late check-in feasible → protect the existing reservation (free).
-    //  2. Not feasible but cancellation is free and a replacement room exists
-    //     → rebook the room.
-    //  3. Otherwise keep the booking as-is and let the property handle the
-    //     late arrival (most hotels hold rooms past the standard 3 pm slot).
-    const freeWindowOpen = policies.cancellationFee === 0;
+    //  1. Late check-in feasible (and not overbooked) → protect the existing
+    //     reservation (free).
+    //  2. Not feasible, or the property overbooked the room → rebook into a
+    //     replacement IF one was found, whatever the cancellation fee (an
+    //     overbooked traveller has no room to "keep" — paying the fee is
+    //     still better than arriving to no bed).
+    //  3. Not feasible and no replacement was found → keep the booking
+    //     as-is and let the property handle the late arrival (most hotels
+    //     hold rooms past the standard 3 pm slot).
     const recommendation: HotelAssessment["recommendation"] =
       !policies.lateCheckInAvailable || request.isOverbooked
-        ? freeWindowOpen && alternativeRooms.length > 0
+        ? alternativeRooms.length > 0
           ? "rebook_room"
-          : "rebook_room" // For overbooked, we must rebook even if not free! Wait, if not free, do we still rebook? Yes, we must.
+          : "keep_as_is"
         : "keep_late_checkin";
 
     // Fee math: only the rebook path moves money on the hotel side, and the
@@ -149,9 +155,12 @@ export class HotelAgent {
       alternativeRooms,
       recommendation,
       feeDelta,
-      note: policies.freeCancellationUntil
-        ? `Free cancellation until ${policies.freeCancellationUntil}.`
-        : undefined,
+      note:
+        recommendation === "keep_late_checkin"
+          ? "Late Check-in (confirmed)"
+          : policies.freeCancellationUntil
+            ? `Free cancellation until ${policies.freeCancellationUntil}.`
+            : undefined,
     };
   }
 }

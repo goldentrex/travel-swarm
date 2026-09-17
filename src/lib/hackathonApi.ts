@@ -145,7 +145,6 @@ import type {
   TransferRequote,
 } from "@/agents";
 import { validateResolutionPlan } from "@/agents";
-import { MAX_REBOOKING_WINDOW_HOURS } from "@/agents/flight/FlightAgent";
 import type { DisruptionResult, ItineraryGraph, ItineraryNode } from "@/core/dag";
 import { describeTripConsequence, evaluateTripConsequence } from "@/core/dag";
 import {
@@ -167,18 +166,24 @@ import {
   probeAtlasReachable,
   probeHotelReachable,
 } from "./swarmReachability";
-import { loadSwarmTrip, settlePlanOnTrip } from "./swarmTripContext";
+import { applySettlementToContent, loadSwarmTrip, settlePlanOnTrip } from "./swarmTripContext";
+import type { SettlementEffects, SettlementFollowUp } from "./swarmTripContext";
+import { AIRPORTS, arrivalBuffer, classifyItem } from "@/core/sanity";
 import { checkTripAccess, resolveSwarmActor, USER_TOKEN_HEADER } from "./swarmAuth";
 import { buildBookingPreview, type PreviewLineRequest } from "./swarmBookingPreview";
 import { hotelQuotaNote } from "@/providers/rapidapi/hotelQuota";
+import { GeminiCallBudget, geminiUsageLogger } from "@/agents/geminiUsage";
 import type { HydratedTrip, SwarmTripLoadResult } from "./swarmTripContext";
 import {
   cancelSwarmSession,
   claimSwarmSessionForBooking,
+  claimSwarmSessionForResolve,
+  type SwarmSessionRecord,
   getSwarmSession,
   getSwarmSessionIgnoringExpiry,
   listSwarmAlerts,
-  markSwarmSessionSettled,
+  saveSwarmSettlementReceipt,
+  settlementOperation,
   probeSwarmStoreHealth,
   saveSwarmSession,
   saveSwarmSessionIfState,
@@ -471,7 +476,8 @@ async function buildHealthSnapshot(): Promise<Record<string, unknown>> {
       "Atlas sandbox billing is quota-based; fare search credits are not deducted per request — live usage with 100% credits is expected.",
     // The app gates its entire swarm surface on this.
     swarmEnabled: swarmFeatureEnabled(),
-    geminiConfigured: typeof process.env.GEMINI_API_KEY === "string" &&
+    geminiConfigured:
+      typeof process.env.GEMINI_API_KEY === "string" &&
       process.env.GEMINI_API_KEY.trim().length > 0,
     hotelConfigured: rapidApiHotelConfigured(),
     activityConfigured: viatorEdgeConfigured(),
@@ -597,12 +603,21 @@ async function refuseUnlessTripAllowed(
     );
   }
   if (actor.kind === "invalid") {
-    return errorResponse(401, "invalid_user_token", "That session is no longer valid — sign in again.");
+    return errorResponse(
+      401,
+      "invalid_user_token",
+      "That session is no longer valid — sign in again.",
+    );
   }
   if (actor.kind === "unavailable") {
-    return errorResponse(503, "auth_unavailable", "Could not verify your session. Try again shortly.");
+    return errorResponse(
+      503,
+      "auth_unavailable",
+      "Could not verify your session. Try again shortly.",
+    );
   }
 
+  if (!tripId) return errorResponse(404, "unknown_trip", "That trip could not be found.");
   const access = await checkTripAccess(tripId, actor.userId);
   if (access.kind === "unavailable") {
     return errorResponse(503, "auth_unavailable", "Could not verify your access to this trip.");
@@ -660,11 +675,7 @@ export async function handleHackathonRequest(
     // build, or anything holding the token, would still reach these rails.
     // `health` stays reachable so the app can learn it is off.
     if (!swarmFeatureEnabled() && endpoint !== "health") {
-      return errorResponse(
-        503,
-        "swarm_disabled",
-        "The travel swarm is temporarily unavailable.",
-      );
+      return errorResponse(503, "swarm_disabled", "The travel swarm is temporarily unavailable.");
     }
 
     // GET surface: live activity-stream polling, background-alert feed, health.
@@ -682,7 +693,7 @@ export async function handleHackathonRequest(
       }
       if (endpoint === "alerts") return await handleAlerts(request);
       if (endpoint === "health") return jsonResponse(200, await buildHealthSnapshot());
-      return await handleSwarmStatus(endpoint.slice(SWARM_STATUS_PREFIX.length));
+      return await handleSwarmStatus(request, endpoint.slice(SWARM_STATUS_PREFIX.length));
     }
 
     if (method !== "POST") {
@@ -832,11 +843,29 @@ async function handleApproveResolution(request: Request): Promise<Response> {
   const pending = pendingLookup && "record" in pendingLookup ? pendingLookup.record : null;
   // Approval is the WRITE: it rewrites content_json and moves the budget, so
   // it needs edit rights on the trip, not merely knowledge of a resolution id.
-  if (pending && typeof pending.trip_id === "string" && pending.trip_id.length > 0) {
-    const approveRefusal = await refuseUnlessTripAllowed(request, pending.trip_id, "write");
+  if (pending) {
+    const approveRefusal = await refuseUnlessTripAllowed(request, pending.trip_id ?? "", "write");
     if (approveRefusal) return approveRefusal;
   }
   if (pending) {
+    const operation = settlementOperation(pending);
+    if (operation) {
+      if (operation.plan_index !== planIndex) {
+        return errorResponse(
+          409,
+          "approval_input_conflict",
+          "A different plan was already approved for this resolution.",
+        );
+      }
+      if (operation.receipt) return jsonResponse(200, operation.receipt);
+      if (pending.state === "approved") {
+        return errorResponse(
+          409,
+          "settlement_pending",
+          "Approval is recorded; the booking outcome is still being checked. Do not create another booking. Refresh this resolution's status.",
+        );
+      }
+    }
     // Session-level expiry: the TTL elapsed or the user cancelled the
     // session (cancel transitions it to `expired`).
     if (pending.state === "expired" || pending.expires_at <= new Date().toISOString()) {
@@ -861,11 +890,25 @@ async function handleApproveResolution(request: Request): Promise<Response> {
         `planIndex ${planIndex} is out of range for session "${resolutionId}".`,
       );
     }
+    if (pending.degraded) {
+      return errorResponse(
+        409,
+        "degraded_plan_not_bookable",
+        "This plan was assembled without verified providers. Re-run the mission when providers are available.",
+      );
+    }
+    if (!pendingSelected || !validateResolutionPlan(pendingSelected)) {
+      return errorResponse(
+        409,
+        "plan_not_bookable",
+        "This proposal is incomplete or inconsistent. Re-run the mission to get a valid plan.",
+      );
+    }
     // Trust Layer TTL gate (spec §3.5) — server-side enforcement: expired
     // quotes are never bookable, regardless of the client countdown state.
     // Presence-only gate: plans without expires_at approve as before.
     const planExpiresAt = pendingSelected?.expires_at;
-    if (typeof planExpiresAt === "number" && planExpiresAt < Date.now()) {
+    if (typeof planExpiresAt === "number" && planExpiresAt <= Date.now()) {
       return errorResponse(
         410,
         "quotes_expired",
@@ -877,11 +920,17 @@ async function handleApproveResolution(request: Request): Promise<Response> {
     // 409 pre-check was removed; the degraded gate below stays.
   }
 
-  // One-shot claim: an atomic conditional state transition
-  // (proposal_ready/awaiting_approval → approved, before booking) guarantees
-  // exactly-once bookFlight. Trade-off unchanged from the old cache: a
-  // booking failure also consumes the session (the client must re-simulate).
-  const entry = await claimSwarmSessionForBooking(resolutionId);
+  // Store operation identity in the same atomic claim as approval. A lost
+  // response can be recovered without starting a second provider operation.
+  const approvalCandidates = {
+    ...(pending?.candidates && typeof pending.candidates === "object" ? pending.candidates : {}),
+    settlement_operation: {
+      operation_id: resolutionId,
+      plan_index: planIndex,
+      started_at: new Date().toISOString(),
+    },
+  };
+  const entry = await claimSwarmSessionForBooking(resolutionId, approvalCandidates);
   if (!entry || !entry.plan) {
     return errorResponse(
       404,
@@ -910,9 +959,54 @@ async function handleApproveResolution(request: Request): Promise<Response> {
 
   const bookingCode = settlementBookingCode(resolutionId);
 
+  // ── Booking: only FLIGHT disruptions reach the booking rail. Plans with
+  // an operational layer settle the trip; a non-flight disruption settles
+  // the trip only and gets a locally recorded stub (the provider is never
+  // asked to "book" an activity/hotel node id). Plans without an
+  // operational layer keep the flight-booking contract.
+  const flightDisruption = plan.operational
+    ? plan.operational.disrupted?.kind === "flight" && plan.operational.new_flight != null
+    : true;
+  const flightId = plan.proposed_resolution?.new_flight?.id ?? "";
+  let booking: BookingConfirmation;
+  let bookingRecorded = false;
+  if (!flightDisruption) {
+    booking = localBookingRecord(
+      resolutionId,
+      flightId || plan.operational?.disrupted?.nodeId || "n/a",
+    );
+  } else {
+    const provider = tryCreateProvider();
+    // Indicative fallback ids are not Atlas routing identifiers. Approval
+    // applies the complete recovery plan and records its settlement, but must
+    // never send a fabricated identifier to verify.do/order.do.
+    if (flightId.startsWith("SYNTHETIC-RECOVERY-")) {
+      booking = localBookingRecord(resolutionId, flightId);
+    } else if (provider) {
+      try {
+        booking = await provider.bookFlight(flightId);
+        bookingRecorded = true;
+      } catch (error) {
+        if (error instanceof AtlasApiError) {
+          // The raw upstream message stays server-side (logs only).
+          console.warn(`[hackathon-api] booking failed (${error.kind}):`, error.message);
+        } else {
+          console.warn("[hackathon-api] booking failed:", error);
+        }
+        booking = localBookingRecord(resolutionId, flightId);
+      }
+    } else {
+      booking = localBookingRecord(resolutionId, flightId);
+    }
+  }
+
   // ── Settle the plan onto the REAL trip (uuid trip + operational layer).
-  // Best-effort: a conflict or load failure only skips the trip write; the
-  // booking below still proceeds (the session is already claimed).
+  //
+  // AFTER the booking attempt, never before: the trip write is the record of
+  // what happened, so it has to know what happened. Writing first stamped the
+  // leg as booked and THEN asked the provider — a failed order left the trip
+  // claiming a ticket that did not exist. Best-effort: a conflict or load
+  // failure only skips the trip write.
   let updatedContent: Record<string, unknown> | undefined;
   let settlementChanges: string[] = [];
   let tripUpdated = false;
@@ -921,6 +1015,7 @@ async function handleApproveResolution(request: Request): Promise<Response> {
   let settledContentRev: number | undefined;
   let flightRewriteSkipped = false;
   let flightSkipReason: "already_settled" | "leg_not_found" | undefined;
+  let settlementFollowUps: SettlementFollowUp[] = [];
   if (plan.operational && looksLikeTripUuid(entry.trip_id)) {
     const tripLoad = await loadSwarmTrip(entry.trip_id);
     // Proceed ONLY on a successful hydration: any other kind (store failure,
@@ -930,6 +1025,7 @@ async function handleApproveResolution(request: Request): Promise<Response> {
       const settled = await settlePlanOnTrip(entry.trip_id, tripLoad.trip.nodeRefs, plan, {
         ...plan.operational,
         bookingCode,
+        ...(flightDisruption ? { booking_status: booking.status === "confirmed" ? "confirmed" : "recorded" } : {}),
       });
       if (settled && "updatedContent" in settled) {
         // "Updated" means something actually LANDED — not merely that the
@@ -942,6 +1038,7 @@ async function handleApproveResolution(request: Request): Promise<Response> {
         updatedContent = settled.updatedContent;
         settlementChanges = settled.changes;
         settledContentRev = settled.contentRev;
+        settlementFollowUps = settled.followUps ?? [];
         // Honest settlement: a flight plan whose leg already carried this
         // booking code (or whose leg can no longer be located) is NOT
         // rewritten again — never report it as applied. `trip_updated` only
@@ -963,44 +1060,14 @@ async function handleApproveResolution(request: Request): Promise<Response> {
     }
   }
 
-  // ── Booking: only FLIGHT disruptions reach the booking rail. Plans with
-  // an operational layer settle the trip; a non-flight disruption settles
-  // the trip only and gets a locally recorded stub (the provider is never
-  // asked to "book" an activity/hotel node id). Plans without an
-  // operational layer keep the flight-booking contract.
-  const flightDisruption = plan.operational
-    ? plan.operational.disrupted?.kind === "flight" && plan.operational.new_flight != null
-    : true;
-  const flightId = plan.proposed_resolution?.new_flight?.id ?? "";
-  let booking: BookingConfirmation;
-  let bookingRecorded = false;
-  if (!flightDisruption) {
-    booking = localBookingRecord(
-      resolutionId,
-      flightId || plan.operational?.disrupted?.nodeId || "n/a",
-    );
-  } else {
-    const provider = tryCreateProvider();
-    if (provider) {
-      try {
-        booking = await provider.bookFlight(flightId);
-        bookingRecorded = true;
-      } catch (error) {
-        if (error instanceof AtlasApiError) {
-          // The raw upstream message stays server-side (logs only).
-          console.warn(`[hackathon-api] booking failed (${error.kind}):`, error.message);
-        } else {
-          console.warn("[hackathon-api] booking failed:", error);
-        }
-        booking = localBookingRecord(resolutionId, flightId);
-      }
-    } else {
-      booking = localBookingRecord(resolutionId, flightId);
-    }
-  }
-
-  await markSwarmSessionSettled(resolutionId);
-  return jsonResponse(200, {
+  const needsFollowUp =
+    settlementFollowUps.length > 0 ||
+    plan.proposed_resolution.hotel_adjustments?.some(adjustment => adjustment.requires_confirmation === true) === true ||
+    conflictSkipped ||
+    flightRewriteSkipped ||
+    !tripUpdated ||
+    (flightDisruption && (!bookingRecorded || booking.status !== "confirmed"));
+  const responseBody = {
     approved: true,
     booking,
     plan,
@@ -1008,6 +1075,18 @@ async function handleApproveResolution(request: Request): Promise<Response> {
     plan_index: planIndex,
     ...(updatedContent !== undefined ? { updated_content: updatedContent } : {}),
     settlement: {
+      needs_follow_up: needsFollowUp,
+      // Itemized: exactly what the traveller still has to do, and nothing
+      // else. A generic "needs follow-up" flag left people re-validating
+      // bookings the settlement had already made.
+      ...(settlementFollowUps.length > 0 ? { follow_ups: settlementFollowUps } : {}),
+      ...(flightDisruption && (!bookingRecorded || booking.status !== "confirmed")
+        ? {
+            note: "The itinerary result does not confirm ticket issuance. Check the provider outcome before making another reservation.",
+          }
+        : plan.proposed_resolution.hotel_adjustments?.some(adjustment => adjustment.requires_confirmation)
+          ? { note: "Hotel terms remain unverified. Contact the property to confirm availability, late arrival and any fees." }
+          : {}),
       trip_updated: tripUpdated,
       changes: settlementChanges,
       booking_recorded: bookingRecorded,
@@ -1033,7 +1112,18 @@ async function handleApproveResolution(request: Request): Promise<Response> {
           }
         : {}),
     },
-  });
+  };
+  // Do not persist a second full copy of content_json. Replayed receipts tell
+  // clients to refresh the trip using the existing trip_updated flag.
+  const { updated_content: _content, ...receipt } = responseBody;
+  if (!(await saveSwarmSettlementReceipt(entry, receipt))) {
+    return errorResponse(
+      503,
+      "settlement_receipt_pending",
+      "Approval was submitted but its receipt could not be saved. Do not book again; refresh this resolution to check its outcome.",
+    );
+  }
+  return jsonResponse(200, responseBody);
 }
 
 // --------------------------------------------------------------- simulation
@@ -1097,7 +1187,8 @@ interface SwarmRunResult {
 /**
  * Shared specialist/orchestrator construction behind runSwarmResolution,
  * runSwarmAssessment and runMultiResolution. Returns null when the Atlas
- * provider is missing (the callers degrade). Emits the SAME skip/default
+ * provider is missing. Flight missions still receive a FlightAgent whose
+ * internal synthesizer is the final recovery rung. Emits the SAME skip/default
  * trace rows the inlined version did, in the same order.
  */
 function buildSwarmOrchestrator(
@@ -1119,6 +1210,8 @@ function buildSwarmOrchestrator(
      * (the activity fan-out falls back to the chronological rail).
      */
     dayReorg?: boolean;
+    usageResolutionId?: string;
+    geminiBudget?: GeminiCallBudget;
   },
 ): {
   orchestrator: OrchestratorAgent;
@@ -1128,13 +1221,11 @@ function buildSwarmOrchestrator(
   const provider = tryCreateProvider();
   if (!options.hydrated) return null;
   // Clarity pass: non-flight missions run LIVE without an Atlas provider.
-  // Only a FLIGHT disruption genuinely needs the provider — any other
-  // disrupted node constructs the orchestrator with a null flight agent
-  // (the flight branch's null-guard degrades that limb only). A MISSING
-  // disrupted node degrades like a flight node: we cannot prove the mission
-  // is flight-free, so the pre-pass behavior (degraded + 409) applies.
+  // Only a FLIGHT disruption needs a FlightAgent. When Atlas is absent the
+  // agent still runs: its deterministic fallback guarantees a structured
+  // recovery option while preserving indicative provenance.
   const disruptedNode = options.hydrated.graph.getNode(options.nodeId);
-  if (!provider && (disruptedNode === undefined || disruptedNode.type === "flight")) return null;
+  if (disruptedNode === undefined) return null;
   if (!provider) {
     pushTrace("flight", "skipped", "flight agent not needed for this mission kind");
   }
@@ -1166,6 +1257,10 @@ function buildSwarmOrchestrator(
     activityAgent && flags?.dayReorg
       ? new DayReorganizer({
           callBudget: GEMINI_CALLS_PER_MISSION,
+          sharedBudget: flags?.geminiBudget,
+          ...(flags?.usageResolutionId
+            ? { onUsage: geminiUsageLogger(flags.usageResolutionId, "activity") }
+            : {}),
           ...(flags?.geminiRetry ? { maxRetries: GEMINI_QUOTA_RETRIES } : {}),
         })
       : null;
@@ -1201,7 +1296,9 @@ function buildSwarmOrchestrator(
     // Live-Atlas config (longer fare deadline — real verify.do pricing takes
     // several seconds; capped candidate fan-out). Null when no provider is
     // configured (non-flight missions run live without it).
-    provider ? new FlightAgent(provider, SWARM_FLIGHT_AGENT_CONFIG) : null,
+    provider || disruptedNode.type === "flight"
+      ? new FlightAgent(provider, SWARM_FLIGHT_AGENT_CONFIG)
+      : null,
     policyAgent,
     hotelAgent,
     activityAgent,
@@ -1353,7 +1450,7 @@ function noReplacementDetail(assessment: FlightRebookingAssessment): string | nu
     case "all_options_rejected":
       return (
         `partner returned ${assessment.providerOptionCount ?? 0} option(s), but none ` +
-        `qualify as a rebooking — every one departs beyond the ${MAX_REBOOKING_WINDOW_HOURS}h horizon`
+        `qualified as a usable replacement; the recovery synthesizer should provide the structured fallback`
       );
     case "pricing_unavailable":
       return (
@@ -1370,10 +1467,38 @@ function noReplacementDetail(assessment: FlightRebookingAssessment): string | nu
 
 function fareBasisDetail(assessment: FlightRebookingAssessment): string {
   const fare = assessment.bestCandidate?.fareDifference;
+  if (fare?.basis === "synthetic_estimate") {
+    return `indicative fallback estimate: +${fare.amount} ${fare.currency}; provider confirmation pending`;
+  }
   if (fare?.basis === "fare_difference") {
     return `fare basis: original ${fare.originalFare} ${fare.currency} for ${fare.adults ?? 1} pax`;
   }
   return "original fare unknown — quoting full verified re-price as the charge";
+}
+
+function usesSyntheticRecovery(assessment: FlightRebookingAssessment | null): boolean {
+  return assessment?.bestCandidate?.option.inventorySource === "synthetic_recovery";
+}
+
+function markSyntheticPlan(plan: ResolutionPlan): ResolutionPlan {
+  const canary = "(simulated — flight provider unavailable)";
+  const marked = plan.incident.includes(canary) ? plan : { ...plan, incident: `${plan.incident} ${canary}` };
+  // An estimate nobody sold was compared against nothing: "cheapest" and
+  // "earliest arrival" are claims about real inventory it never saw. Only the
+  // descriptive tags (non-stop, same day) survive.
+  const comparative = new Set(["cheapest", "fastest", "balanced"]);
+  const kept = (marked.badges ?? (marked.badge ? [marked.badge] : [])).filter((b) => !comparative.has(b));
+  const { badge: _badge, badges: _badges, ...rest } = marked;
+  return {
+    ...rest,
+    ...(kept.length > 0 ? { badges: kept, badge: kept[0] } : {}),
+  } as ResolutionPlan;
+}
+
+function flightSearchTraceDetail(assessment: FlightRebookingAssessment): string {
+  return usesSyntheticRecovery(assessment)
+    ? `${assessment.candidates.length} structured recovery option produced (indicative fallback)`
+    : `${assessment.candidates.length} alternative flight options found (live Atlas sandbox)`;
 }
 
 /**
@@ -1496,16 +1621,12 @@ async function runSwarmResolution(
             "fare_rules",
             policyVerdict.rebookPermitted
               ? `rebook permitted, change fee ${policyVerdict.changeFee} ${policyVerdict.currency}` +
-                ruleSourceSuffix(policyVerdict)
+                  ruleSourceSuffix(policyVerdict)
               : `rebook denied — ${policyVerdict.recommendedAction.replace(/_/g, " ")}`,
           );
         }
         if (rebookingAssessment) {
-          pushTrace(
-            "flight",
-            "search",
-            `${rebookingAssessment.candidates.length} alternative flight options found (live Atlas sandbox)`,
-          );
+          pushTrace("flight", "search", flightSearchTraceDetail(rebookingAssessment));
           const whyEmpty = noReplacementDetail(rebookingAssessment);
           if (whyEmpty) pushTrace("flight", "coverage", whyEmpty);
           // Additive: the flexible-date window attempted one search per
@@ -1570,10 +1691,15 @@ async function runSwarmResolution(
               activityProposals,
             })
           : null;
+        // Disclosure by construction: preview the settlement, then show every
+        // hotel decision it will write.
+        const disclosedPlan = mirrorOperationalHotels(plan, options.hydrated, operational);
+        const preview = previewSettlement(options.hydrated, disclosedPlan, operational);
         // B3 — assemble the display-only presentation layer in ONE place from
         // the validated specialist outputs (omitted entirely on degraded plans).
         const presentation = buildPresentation({
-          plan,
+          plan: disclosedPlan,
+          preview,
           best: rebookingAssessment?.bestCandidate ?? null,
           hotelAdjustments,
           activityProposals,
@@ -1587,12 +1713,27 @@ async function runSwarmResolution(
             return r ? { noFlight: r } : {};
           })(),
         });
-        const finalPlan: ResolutionPlan = {
-          ...plan,
+        const assembledPlan: ResolutionPlan = {
+          ...disclosedPlan,
           ...(presentation ? { presentation } : {}),
           ...(operational ? { operational } : {}),
         };
-        return { plan: finalPlan, degraded: false, trace };
+        const synthetic = usesSyntheticRecovery(rebookingAssessment);
+        if (synthetic) {
+          pushTrace(
+            "flight",
+            "synthetic_fallback",
+            `provider recovery ladder exhausted — ${rebookingAssessment?.fallbackReason ?? "no priced inventory"}`,
+          );
+        }
+        return {
+          plan: synthetic ? markSyntheticPlan(assembledPlan) : assembledPlan,
+          // Synthetic recovery remains approvable: approval applies the graph
+          // plan and records a pending settlement, while the visible
+          // indicative provenance prevents it being mistaken for a ticket.
+          degraded: false,
+          trace,
+        };
       }
       pushTrace("trust_layer", "validation_failed", "plan rejected by validator — degrading");
     } catch (error) {
@@ -1702,19 +1843,34 @@ export function buildOperational(
   // Hotel actions: impacted check-in nodes (re-timed by the graph propagation),
   // joined with the HotelAgent's adjustment verdict when available.
   const hotelActions: NonNullable<OperationalSettlement["hotel_actions"]> = [];
+  // The graph propagates the NOMINAL delay, so every carousel plan inherited
+  // the same check-in (23:40 for a flight landing 20:10 and one landing
+  // 20:40). A late check-in belongs to the flight actually chosen: the room is
+  // reached when the traveller is really in town, never earlier than booked.
+  const chosenArrivalMs = best ? Date.parse(best.option.arrivalTime) : Number.NaN;
+  const readyInCityMs = Number.isFinite(chosenArrivalMs)
+    ? chosenArrivalMs +
+      arrivalBuffer(best?.option.origin, best?.option.destination).readyInCityMinutes * 60_000
+    : Number.NaN;
   for (const report of outcome.disruption.affected) {
     if (report.nodeType !== "hotel_check_in") continue;
     const ref = hydrated.nodeRefs[report.nodeId];
     if (!ref) continue;
     const adjustment = outcome.hotelAdjustments.find((a) => a.hotel_name === ref.label);
     if (adjustment?.action === "none" && report.action !== "updated") continue;
+    const newCheckInMs = Number.isFinite(readyInCityMs)
+      ? Math.max(report.previousScheduledTime, readyInCityMs)
+      : report.newScheduledTime;
+    if (newCheckInMs !== undefined && newCheckInMs <= report.previousScheduledTime && Number.isFinite(readyInCityMs)) {
+      // The chosen flight still gets the traveller there before check-in:
+      // nothing to change at the hotel for THIS plan.
+      continue;
+    }
     hotelActions.push({
       nodeId: report.nodeId,
       action: adjustment?.action ?? "late_check_in",
       note: report.reason,
-      ...(report.newScheduledTime !== undefined
-        ? { newCheckIn: new Date(report.newScheduledTime).toISOString() }
-        : {}),
+      ...(newCheckInMs !== undefined ? { newCheckIn: new Date(newCheckInMs).toISOString() } : {}),
     });
   }
   // Hotel-source disruptions ("hotel overbooked"): handleDisruption re-times
@@ -1904,23 +2060,12 @@ function buildDegradedPlan(options: SwarmRunOptions): ResolutionPlan {
 // --------------------------------------------------------------- presentation
 
 /**
- * Static IATA coordinate table for map points (Phase B). No external calls —
- * common European/US hubs so hydrated trips usually find their airports.
+ * Map-pin coordinates, read from the canonical airport reference
+ * (`src/core/sanity/airports.ts`). The private 12-entry table this replaced
+ * held none of the Asia-Pacific airports the flight partner covers best, so
+ * the change map drew one pin — or none — on most real rebookings.
  */
-const IATA_COORDS: Record<string, { lat: number; lng: number; city: string }> = {
-  CDG: { lat: 49.0097, lng: 2.5479, city: "Paris CDG" },
-  ORY: { lat: 48.7262, lng: 2.3594, city: "Paris Orly" },
-  LIS: { lat: 38.7742, lng: -9.1342, city: "Lisbon" },
-  OPO: { lat: 41.2481, lng: -8.6814, city: "Porto" },
-  FAO: { lat: 37.0146, lng: -7.9659, city: "Faro" },
-  MAD: { lat: 40.4983, lng: -3.5676, city: "Madrid" },
-  BCN: { lat: 41.2974, lng: 2.0833, city: "Barcelona" },
-  LHR: { lat: 51.47, lng: -0.4543, city: "London Heathrow" },
-  FRA: { lat: 50.0379, lng: 8.5622, city: "Frankfurt" },
-  AMS: { lat: 52.3105, lng: 4.7683, city: "Amsterdam" },
-  JFK: { lat: 40.6413, lng: -73.7781, city: "New York JFK" },
-  SIN: { lat: 1.3644, lng: 103.9915, city: "Singapore" },
-};
+const IATA_COORDS: Record<string, { lat: number; lng: number; city: string }> = AIRPORTS;
 
 /** Display symbol for the common currencies; fallback "CODE ". */
 function currencySymbol(currency: string | undefined): string {
@@ -1950,6 +2095,76 @@ function formatSignedAmount(amount: number, currency: string | undefined): strin
  * field is optional and tolerant. Returns undefined when nothing presentable
  * came out of the pipeline (the plan simply omits the block then).
  */
+interface SettlementPreview {
+  changes: string[];
+  followUps: SettlementFollowUp[];
+  effects: SettlementEffects;
+}
+
+/**
+ * Run the settlement transformer — the exact function approval will run —
+ * against the trip as it stands, and keep what it WOULD do. Pure: nothing is
+ * written. Undefined when the trip content or the operational layer is absent.
+ */
+function previewSettlement(
+  hydrated: HydratedTrip | null | undefined,
+  plan: ResolutionPlan,
+  operational: OperationalSettlement | null,
+): SettlementPreview | undefined {
+  if (!hydrated?.content || !operational) return undefined;
+  try {
+    const result = applySettlementToContent(hydrated.content, hydrated.nodeRefs, plan, operational);
+    return { changes: result.changes, followUps: result.followUps, effects: result.effects };
+  } catch (error) {
+    console.warn("[hackathon-api] settlement preview failed:", error);
+    return undefined;
+  }
+}
+
+/**
+ * Make every hotel decision the settlement will write visible on the plan.
+ *
+ * `buildOperational` derives a late check-in from the graph even when no
+ * HotelAgent ran (provider unconfigured, disabled or rate-limited), but the
+ * approval sheet only reads `proposed_resolution.hotel_adjustments` — so the
+ * check-in moved on approval without ever having been shown. Mirrored rows
+ * carry no fee (none was quoted) and state the new check-in as a fact.
+ */
+function mirrorOperationalHotels(
+  plan: ResolutionPlan,
+  hydrated: HydratedTrip | null | undefined,
+  operational: OperationalSettlement | null,
+): ResolutionPlan {
+  const actions = operational?.hotel_actions ?? [];
+  if (!hydrated || actions.length === 0) return plan;
+  const existing = plan.proposed_resolution.hotel_adjustments ?? [];
+  const mirrored: HotelAdjustment[] = [];
+  for (const action of actions) {
+    const name = hydrated.nodeRefs[action.nodeId]?.label;
+    if (!name || existing.some((entry) => entry.hotel_name === name)) continue;
+    if (mirrored.some((entry) => entry.hotel_name === name)) continue;
+    if (action.action !== "late_check_in" && action.action !== "rebook") continue;
+    const checkInMs = action.newCheckIn ? Date.parse(action.newCheckIn) : Number.NaN;
+    mirrored.push({
+      hotel_name: name,
+      action: action.action,
+      fee: 0,
+      note:
+        action.action === "late_check_in" && Number.isFinite(checkInMs)
+          ? `Check-in moves to ${new Date(checkInMs).toISOString().slice(11, 16)} to match your new arrival.`
+          : action.note,
+    });
+  }
+  if (mirrored.length === 0) return plan;
+  return {
+    ...plan,
+    proposed_resolution: {
+      ...plan.proposed_resolution,
+      hotel_adjustments: [...existing, ...mirrored],
+    },
+  };
+}
+
 function buildPresentation(input: {
   plan: ResolutionPlan;
   best: RebookingCandidate | null;
@@ -1961,8 +2176,10 @@ function buildPresentation(input: {
   disruptedId?: string;
   /** Why no replacement flight was offered, when none was. */
   noFlight?: NonNullable<ResolutionPresentation["no_flight_reason"]>;
+  /** Dry-run of the settlement itself — what approving will really do. */
+  preview?: SettlementPreview;
 }): ResolutionPresentation | undefined {
-  const { plan, best, hotelAdjustments, activityProposals, graph, disruptedId, noFlight } = input;
+  const { plan, best, hotelAdjustments, activityProposals, graph, disruptedId, noFlight, preview } = input;
   const currency = plan.currency;
   // Flight-less plans (hotel/activity/transfer missions) carry NO new_flight
   // — the presentation must tolerate that (map points simply stay empty).
@@ -2008,13 +2225,32 @@ function buildPresentation(input: {
           .filter((activity) => activity.action !== "drop")
           .map((activity) => activity.name.trim().toLowerCase()),
       );
+      // The settlement dry-run is the authority on what survives: an item it
+      // re-times is not lost, and an item it cancels IS, whatever the purely
+      // temporal evaluator concluded.
+      for (const title of preview?.effects.moved ?? []) rescheduledNames.add(title.trim().toLowerCase());
+      const cancelledNames = new Set(
+        (preview?.effects.cancelled ?? []).map((item) => item.title.trim().toLowerCase()),
+      );
       const survivedByReschedule = (label: string) =>
-        rescheduledNames.has(label.trim().toLowerCase());
+        rescheduledNames.has(label.trim().toLowerCase()) && !cancelledNames.has(label.trim().toLowerCase());
       const trulyLost = consequence.lost.filter((item) => !survivedByReschedule(item.label));
+      for (const node of graph.getNodes()) {
+        if (node.type !== "activity" || !cancelledNames.has(node.name.trim().toLowerCase())) continue;
+        if (trulyLost.some((item) => item.nodeId === node.id)) continue;
+        trulyLost.push({ nodeId: node.id, type: node.type, label: node.name, scheduledTime: node.scheduledTime });
+      }
+      const isMeal = (label: string) => classifyItem({ title: label }) === "meal";
+      const transfersLost = Math.max(
+        trulyLost.filter((item) => item.type === "transfer").length,
+        preview?.effects.transfersRetimed ?? 0,
+      );
       const adjusted = {
         ...consequence,
         lost: trulyLost,
-        activitiesLost: trulyLost.filter((item) => item.type === "activity").length,
+        activitiesLost: trulyLost.filter((item) => item.type === "activity" && !isMeal(item.label)).length,
+        mealsLost: trulyLost.filter((item) => item.type === "activity" && isMeal(item.label)).length,
+        transfersLost,
         nightsLost: trulyLost.filter((item) => item.type === "hotel_check_in").length,
       };
 
@@ -2026,6 +2262,8 @@ function buildPresentation(input: {
           activities_lost: adjusted.activitiesLost,
           days_lost: adjusted.daysLost,
           lost_node_ids: adjusted.lost.map((item) => item.nodeId),
+          transfers_lost: adjusted.transfersLost,
+          meals_lost: adjusted.mealsLost,
         };
       }
     }
@@ -2063,7 +2301,14 @@ function buildPresentation(input: {
     };
   }
 
-  // Map points: static IATA table for the flight legs + hotel coordinates.
+  if (preview && (preview.changes.length > 0 || preview.followUps.length > 0)) {
+    presentation.settlement_preview = {
+      changes: preview.changes,
+      follow_ups: preview.followUps.map((entry) => ({ kind: entry.kind, message: entry.message })),
+    };
+  }
+
+  // Map points: canonical airport table for the flight legs + hotel coordinates.
   const points: NonNullable<ResolutionPresentation["map_points"]> = [];
   if (newFlight && newFlight.origin && IATA_COORDS[newFlight.origin]) {
     const coords = IATA_COORDS[newFlight.origin];
@@ -2495,16 +2740,12 @@ async function runSwarmAssessment(
           "fare_rules",
           assessment.policyVerdict.rebookPermitted
             ? `rebook permitted, change fee ${assessment.policyVerdict.changeFee} ${assessment.policyVerdict.currency}` +
-              ruleSourceSuffix(assessment.policyVerdict)
+                ruleSourceSuffix(assessment.policyVerdict)
             : `rebook denied — ${assessment.policyVerdict.recommendedAction.replace(/_/g, " ")}`,
         );
       }
       if (assessment.rebookingAssessment) {
-        pushTrace(
-          "flight",
-          "search",
-          `${assessment.rebookingAssessment.candidates.length} alternative flight options found (live Atlas sandbox)`,
-        );
+        pushTrace("flight", "search", flightSearchTraceDetail(assessment.rebookingAssessment));
         const whyEmpty = noReplacementDetail(assessment.rebookingAssessment);
         if (whyEmpty) pushTrace("flight", "coverage", whyEmpty);
         // Additive: the flexible-date window attempted one search per
@@ -2530,6 +2771,14 @@ async function runSwarmAssessment(
         "gathering_preferences",
         "candidates gathered — awaiting traveler trade-off answers",
       );
+      const synthetic = usesSyntheticRecovery(assessment.rebookingAssessment);
+      if (synthetic) {
+        pushTrace(
+          "flight",
+          "synthetic_fallback",
+          `provider recovery ladder exhausted — ${assessment.rebookingAssessment?.fallbackReason ?? "no priced inventory"}`,
+        );
+      }
       return { assessment, degraded: false, trace };
     } catch (error) {
       console.warn("[hackathon-api] assess pipeline failed, degrading:", error);
@@ -2558,6 +2807,8 @@ async function runMultiResolution(
   constraints: ResolutionConstraints | undefined,
   hooks?: {
     onTrace?: (entry: SwarmTraceEntry) => void;
+    usageResolutionId?: string;
+    geminiBudget?: GeminiCallBudget;
     /**
      * Task 21: wire the quota-aware Gemini retry (exactly ONE retry on
      * 429/503) into this run's DayReorganizer. Only the ASYNC resolve rail
@@ -2572,6 +2823,8 @@ async function runMultiResolution(
     // Task 25 (#3): the DayReorganizer rides ONLY on this resolve rail —
     // assess (and the legacy sync rail) never wire it.
     dayReorg: true,
+    usageResolutionId: hooks?.usageResolutionId,
+    geminiBudget: hooks?.geminiBudget,
     ...(hooks?.geminiRetry ? { geminiRetry: true } : {}),
   });
   if (built) {
@@ -2610,7 +2863,7 @@ async function runMultiResolution(
           "fare_rules_recheck",
           outcome.policyVerdict.rebookPermitted
             ? `rebook still permitted, change fee ${outcome.policyVerdict.changeFee} ${outcome.policyVerdict.currency}` +
-              ruleSourceSuffix(outcome.policyVerdict)
+                ruleSourceSuffix(outcome.policyVerdict)
             : `rebook denied — ${outcome.policyVerdict.recommendedAction.replace(/_/g, " ")}`,
         );
       }
@@ -2643,8 +2896,21 @@ async function runMultiResolution(
           "ledger_check",
           `plan${plan.badge ? ` (${plan.badge})` : ""}: ledger balanced: ${ledgerBalancedDetail(plan.financial_delta, plan.currency)}`,
         );
+        const operational = options.hydrated
+          ? buildOperational(options, options.hydrated, {
+              disruption: outcome.disruption,
+              rebookingAssessment: outcome.rebookingAssessment
+                ? { ...outcome.rebookingAssessment, bestCandidate: chosen }
+                : null,
+              hotelAdjustments: outcome.hotelAdjustments,
+              activityProposals: planProposals,
+            })
+          : null;
+        const disclosedPlan = mirrorOperationalHotels(plan, options.hydrated, operational);
+        const preview = previewSettlement(options.hydrated, disclosedPlan, operational);
         const presentation = buildPresentation({
-          plan,
+          plan: disclosedPlan,
+          preview,
           best: chosen,
           hotelAdjustments: outcome.hotelAdjustments,
           activityProposals: planProposals,
@@ -2658,25 +2924,18 @@ async function runMultiResolution(
             return r ? { noFlight: r } : {};
           })(),
         });
-        const operational = options.hydrated
-          ? buildOperational(options, options.hydrated, {
-              disruption: outcome.disruption,
-              rebookingAssessment: outcome.rebookingAssessment
-                ? { ...outcome.rebookingAssessment, bestCandidate: chosen }
-                : null,
-              hotelAdjustments: outcome.hotelAdjustments,
-              activityProposals: planProposals,
-            })
-          : null;
         return {
-          ...plan,
+          ...disclosedPlan,
           ...(presentation ? { presentation } : {}),
           ...(operational ? { operational } : {}),
         };
       });
       // HARD rule: an enriched plan is only persisted when it still passes
       // the TrustLayer validator (no unvalidated schedules ever leave here).
-      const validPlans = enrichedPlans.filter((plan) => validateResolutionPlan(plan));
+      const synthetic = usesSyntheticRecovery(outcome.rebookingAssessment);
+      const validPlans = enrichedPlans
+        .filter((plan) => validateResolutionPlan(plan))
+        .map((plan) => (synthetic ? markSyntheticPlan(plan) : plan));
       if (validPlans.length > 0) {
         const badges = validPlans.map((plan) => plan.badge ?? "fallback");
         pushTrace(
@@ -2684,6 +2943,13 @@ async function runMultiResolution(
           "multi_plan",
           `${validPlans.length} distinct plan(s) assembled: ${badges.join(", ")}`,
         );
+        if (synthetic) {
+          pushTrace(
+            "flight",
+            "synthetic_fallback",
+            `provider recovery ladder exhausted — ${outcome.rebookingAssessment?.fallbackReason ?? "no priced inventory"}`,
+          );
+        }
         return { plans: validPlans, degraded: false, trace };
       }
       pushTrace("trust_layer", "validation_failed", "no valid plans — degrading");
@@ -2907,6 +3173,43 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
       ? body.language.trim()
       : undefined;
 
+  // Canonical input makes retries order-independent without conflating different choices.
+  const requestKey = JSON.stringify({
+    language: language ?? null,
+    answers: [...answers].sort(
+      (a, b) =>
+        a.question_id.localeCompare(b.question_id) || a.option_id.localeCompare(b.option_id),
+    ),
+  });
+  const repeatResponse = (record: SwarmSessionRecord): Response => {
+    const metadata = record.candidates as { resolve_request_key?: string } | null;
+    if (metadata?.resolve_request_key !== requestKey) {
+      return errorResponse(
+        409,
+        "resolution_input_conflict",
+        "This resolution has different submitted choices. Start a new assessment to change them.",
+      );
+    }
+    if (record.state === "processing") {
+      return jsonResponse(200, { resolution_id: resolutionId, status: "processing" });
+    }
+    if (record.state === "proposal_ready" || record.state === "awaiting_approval") {
+      return jsonResponse(200, {
+        resolution_id: resolutionId,
+        status: "proposal_ready",
+        plans: record.plans ?? (record.plan ? [record.plan] : []),
+        swarm_trace: record.trace,
+        degraded: record.degraded,
+        ...(language ? { language } : {}),
+      });
+    }
+    return errorResponse(
+      409,
+      "resolution_not_active",
+      "This resolution is no longer active. Refresh its status.",
+    );
+  };
+
   const session = await getSwarmSession(resolutionId);
   if (!session) {
     return errorResponse(
@@ -2915,18 +3218,11 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
       `No swarm session for "${resolutionId}" (unknown or expired).`,
     );
   }
-  if (session.state !== "gathering_preferences") {
-    return errorResponse(
-      400,
-      "invalid_resolution_id",
-      `Session "${resolutionId}" is in state "${session.state}" — expected "gathering_preferences".`,
-    );
-  }
   // A resolution id is not an authorization: re-check the trip it names.
-  if (typeof session.trip_id === "string" && session.trip_id.length > 0) {
-    const resolveRefusal = await refuseUnlessTripAllowed(request, session.trip_id, "read");
-    if (resolveRefusal) return resolveRefusal;
-  }
+  const resolveRefusal = await refuseUnlessTripAllowed(request, session.trip_id ?? "", "read");
+  if (resolveRefusal) return resolveRefusal;
+
+  if (session.state !== "gathering_preferences") return repeatResponse(session);
 
   const stored = (
     typeof session.candidates === "object" && session.candidates !== null ? session.candidates : {}
@@ -2940,6 +3236,13 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
     agent: "liaison",
     step: "gemini_degraded",
     detail: `constraint translation fell back to deterministic derivation (reason: ${reason})`,
+    at: new Date().toISOString(),
+  });
+
+  const localRoutingRow = (): SwarmTraceEntry => ({
+    agent: "liaison",
+    step: "deterministic_constraints",
+    detail: "Known preferences translated locally; zero liaison model requests.",
     at: new Date().toISOString(),
   });
 
@@ -2965,6 +3268,25 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
   options = { ...options, tripId: resolveTripId, hydrated: tripLoad.trip };
   const sessionTripId = resolveTripId;
 
+  const resolveCandidates = { ...stored, resolve_request_key: requestKey };
+  const claim = await claimSwarmSessionForResolve(resolutionId, resolveCandidates);
+  if (claim.error) {
+    return errorResponse(
+      503,
+      "session_store_unavailable",
+      "Could not start resolution. Retry shortly.",
+    );
+  }
+  if (!claim.claimed) {
+    const current = await getSwarmSession(resolutionId);
+    return current
+      ? repeatResponse(current)
+      : errorResponse(409, "resolution_not_active", "Resolution expired. Start a new assessment.");
+  }
+
+  const stillProcessing = async () => (await getSwarmSession(resolutionId))?.state === "processing";
+  const geminiBudget = new GeminiCallBudget(GEMINI_CALLS_PER_MISSION);
+
   // ── Async rail: ack + ctx.waitUntil continuation ─────────────────────────
   if (ctx) {
     const initialTrace: SwarmTraceEntry[] = [
@@ -2976,7 +3298,7 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
         at: new Date().toISOString(),
       },
     ];
-    await updateSwarmSession(resolutionId, { state: "processing", trace: initialTrace });
+    await updateSwarmSession(resolutionId, { trace: initialTrace });
     // Shared chunked mirror writer (see createChunkedTraceMirror) — one
     // mirror write per TRACE_FLUSH_EVERY entries, never one per entry.
     const mirror = createChunkedTraceMirror(resolutionId, initialTrace);
@@ -2988,14 +3310,25 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
         // a mere microtask yield still flushes before the caller sees the
         // response). One tick is free; the pipeline loses nothing.
         await new Promise((resolve) => setTimeout(resolve, 0));
+        if (!(await stillProcessing())) return;
         // Task 21 (ack latency): the constraint translate rides INSIDE the
         // waitUntil continuation — the ack returns before any Gemini call
         // (constraints are only consumed by runMultiResolution below).
         // Quota-aware retry wired on this rail only: exactly ONE retry on
         // 429/503 inside the existing deadline (bounded extra subrequest).
-        const liaison = new GeminiLiaisonAgent({ maxRetries: GEMINI_QUOTA_RETRIES });
+        const liaison = new GeminiLiaisonAgent({
+          maxRetries: GEMINI_QUOTA_RETRIES,
+          onUsage: geminiUsageLogger(resolutionId, "liaison"),
+          sharedBudget: geminiBudget,
+        });
         const constraints = await liaison.translateAnswersToConstraints(questions, answers);
+        if (!(await stillProcessing())) return;
         const liaisonTrace: SwarmTraceEntry[] = [];
+        if (liaison.lastConstraintRoute === "deterministic") {
+          const row = localRoutingRow();
+          liaisonTrace.push(row);
+          mirror.persistTraceEntry(row);
+        }
         if (liaison.lastDegradeReason !== undefined) {
           const row = liaisonDegradeRow(liaison.lastDegradeReason);
           liaisonTrace.push(row);
@@ -3003,6 +3336,8 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
         }
         const { plans, degraded, trace } = await runMultiResolution(options, constraints, {
           onTrace: mirror.persistTraceEntry,
+          usageResolutionId: resolutionId,
+          geminiBudget,
           geminiRetry: true, // Task 21: async resolve rail wires the retry
         });
         await mirror.drain();
@@ -3018,20 +3353,25 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
         // State-guarded final upsert: a cancel landing between the expiry
         // check above and this write wins (the conditional UPDATE matches
         // no row and the terminal state is never overwritten).
-        const saved = await saveSwarmSessionIfState({
-          id: resolutionId,
-          trip_id: sessionTripId,
-          state: "proposal_ready",
-          plan: plans[0] ?? null,
-          plans,
-          trace: [...initialTrace, ...liaisonTrace, ...trace],
-          degraded: degraded || !swarmStoreIsPersistent(),
-          // Restart the session horizon at resolve time; quote TTLs restart
-          // inside the orchestrator assembly as well. The horizon is the
-          // max of the standard TTL and the latest plan quote + 5 min grace
-          // (WS1), so the session never dies before its quotes do.
-          expires_at: resolveSessionExpiresAt(plans),
-        });
+        const saved = await saveSwarmSessionIfState(
+          {
+            id: resolutionId,
+            trip_id: sessionTripId,
+            state: "proposal_ready",
+            candidates: resolveCandidates,
+            plan: plans[0] ?? null,
+            plans,
+            trace: [...initialTrace, ...liaisonTrace, ...trace],
+            degraded: degraded || !swarmStoreIsPersistent(),
+            // Restart the session horizon at resolve time; quote TTLs restart
+            // inside the orchestrator assembly as well. The horizon is the
+            // max of the standard TTL and the latest plan quote + 5 min grace
+            // (WS1), so the session never dies before its quotes do.
+            expires_at: resolveSessionExpiresAt(plans),
+          },
+          ["processing"],
+          true,
+        );
         if (!saved) {
           console.warn(
             `[hackathon-api] resolve ${resolutionId} final upsert refused — session state moved on (cancel won the race)`,
@@ -3039,7 +3379,7 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
         }
       })().catch(async (error) => {
         console.error("[hackathon-api] async resolve failed:", error);
-        await updateSwarmSession(resolutionId, { state: "expired" });
+        await cancelSwarmSession(resolutionId);
       }),
     );
     return jsonResponse(200, { resolution_id: resolutionId, status: "processing" });
@@ -3055,34 +3395,65 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
   //
   // ONE rung, not two: enough to reach the next model, still bounded for a
   // rail the caller is waiting on. Each attempt carries its own deadline.
-  const liaison = new GeminiLiaisonAgent({ maxRetries: 1 });
-  const constraints = await liaison.translateAnswersToConstraints(questions, answers);
-  const liaisonTrace: SwarmTraceEntry[] =
-    liaison.lastDegradeReason !== undefined ? [liaisonDegradeRow(liaison.lastDegradeReason)] : [];
-  const { plans, degraded, trace } = await runMultiResolution(options, constraints);
-  const sessionDegraded = degraded || !swarmStoreIsPersistent();
-  const degradedReason = deriveDegradedReason(degraded);
-  await saveSwarmSession({
-    id: resolutionId,
-    trip_id: sessionTripId,
-    state: "proposal_ready",
-    plan: plans[0] ?? null,
-    plans,
-    trace: [...session.trace, ...liaisonTrace, ...trace],
-    degraded: sessionDegraded,
-    // Same horizon rule as the async rail (WS1): the session must never
-    // expire before the plan quotes it carries.
-    expires_at: resolveSessionExpiresAt(plans),
-  });
-  return jsonResponse(200, {
-    resolution_id: resolutionId,
-    status: "proposal_ready",
-    plans,
-    swarm_trace: [...liaisonTrace, ...trace],
-    degraded: sessionDegraded,
-    ...(degradedReason ? { degraded_reason: degradedReason } : {}),
-    ...(language ? { language } : {}),
-  });
+  try {
+    const liaison = new GeminiLiaisonAgent({
+      maxRetries: 1,
+      onUsage: geminiUsageLogger(resolutionId, "liaison"),
+      sharedBudget: geminiBudget,
+    });
+    const constraints = await liaison.translateAnswersToConstraints(questions, answers);
+    if (!(await stillProcessing())) {
+      return errorResponse(409, "resolution_not_active", "Resolution was cancelled or expired.");
+    }
+    const liaisonTrace: SwarmTraceEntry[] =
+      liaison.lastDegradeReason !== undefined
+        ? [liaisonDegradeRow(liaison.lastDegradeReason)]
+        : liaison.lastConstraintRoute === "deterministic"
+          ? [localRoutingRow()]
+          : [];
+    const { plans, degraded, trace } = await runMultiResolution(options, constraints, {
+      usageResolutionId: resolutionId,
+      geminiBudget,
+    });
+    const sessionDegraded = degraded || !swarmStoreIsPersistent();
+    const degradedReason = deriveDegradedReason(degraded);
+    const saved = await saveSwarmSessionIfState(
+      {
+        id: resolutionId,
+        trip_id: sessionTripId,
+        state: "proposal_ready",
+        candidates: resolveCandidates,
+        plan: plans[0] ?? null,
+        plans,
+        trace: [...session.trace, ...liaisonTrace, ...trace],
+        degraded: sessionDegraded,
+        // Same horizon rule as the async rail (WS1): the session must never
+        // expire before the plan quotes it carries.
+        expires_at: resolveSessionExpiresAt(plans),
+      },
+      ["processing"],
+      true,
+    );
+    if (!saved) {
+      return errorResponse(
+        409,
+        "resolution_not_active",
+        "Resolution was cancelled or could not be saved. Refresh its status.",
+      );
+    }
+    return jsonResponse(200, {
+      resolution_id: resolutionId,
+      status: "proposal_ready",
+      plans,
+      swarm_trace: [...liaisonTrace, ...trace],
+      degraded: sessionDegraded,
+      ...(degradedReason ? { degraded_reason: degradedReason } : {}),
+      ...(language ? { language } : {}),
+    });
+  } catch (error) {
+    await cancelSwarmSession(resolutionId);
+    throw error;
+  }
 }
 
 // -------------------------------------------------------------- mission/cancel
@@ -3104,6 +3475,14 @@ async function handleMissionCancel(request: Request): Promise<Response> {
   const resolutionId = body.resolutionId;
   if (typeof resolutionId !== "string" || resolutionId.trim().length === 0) {
     return errorResponse(400, "invalid_body", "resolutionId must be a non-empty string.");
+  }
+  const lookup = await getSwarmSessionIgnoringExpiry(resolutionId.trim());
+  if (lookup && "error" in lookup) {
+    return errorResponse(503, "session_store_unavailable", "Could not load the swarm session.");
+  }
+  if (lookup && "record" in lookup) {
+    const refusal = await refuseUnlessTripAllowed(request, lookup.record.trip_id ?? "", "write");
+    if (refusal) return refusal;
   }
   const result = await cancelSwarmSession(resolutionId.trim());
   if (result.error) {
@@ -3137,11 +3516,14 @@ const PLAN_VISIBLE_STATES = new Set<string>([
  * GET /api/hackathon/swarm-status/{resolution_id} (SPEC §4.3) — polled by the
  * client (~1.5 s while processing) to render the Swarm Activity Stream.
  */
-async function handleSwarmStatus(resolutionId: string): Promise<Response> {
+async function handleSwarmStatus(request: Request, resolutionId: string): Promise<Response> {
   if (!resolutionId) {
     return errorResponse(404, "unknown_resolution", "No resolution id provided.");
   }
-  const session = await getSwarmSession(resolutionId);
+  const lookup = await getSwarmSessionIgnoringExpiry(resolutionId);
+  if (lookup && "error" in lookup)
+    return errorResponse(503, "session_store_unavailable", "Could not read resolution status.");
+  const session = lookup && "record" in lookup ? lookup.record : null;
   if (!session) {
     return errorResponse(
       404,
@@ -3149,6 +3531,10 @@ async function handleSwarmStatus(resolutionId: string): Promise<Response> {
       `No swarm session for "${resolutionId}" (unknown or expired).`,
     );
   }
+  // A session id and the app's shared bearer do not authorize access to a
+  // traveler's proposals, supplier references or itinerary trace.
+  const refusal = await refuseUnlessTripAllowed(request, session.trip_id ?? "", "read");
+  if (refusal) return refusal;
   // B2 — degraded visibility on the status body (additive). Sessions store a
   // single merged flag; the reason is derived: with a persistent store a
   // degraded session can only be provider-side, otherwise the memory-only
@@ -3158,9 +3544,16 @@ async function handleSwarmStatus(resolutionId: string): Promise<Response> {
       ? ("provider_offline" as const)
       : ("session_store_memory" as const)
     : undefined;
+  const operation = settlementOperation(session);
   const body: Record<string, unknown> = {
+    ...(operation?.receipt ? { receipt: operation.receipt } : {}),
+    ...(operation && !operation.receipt ? { settlement_pending: true } : {}),
     resolution_id: session.id,
-    state: session.state,
+    state:
+      session.expires_at <= new Date().toISOString() &&
+      !["approved", "settled"].includes(session.state)
+        ? "expired"
+        : session.state,
     trace: session.trace,
     degraded: session.degraded,
     ...(degradedReason ? { degraded_reason: degradedReason } : {}),

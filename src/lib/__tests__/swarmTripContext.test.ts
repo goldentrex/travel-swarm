@@ -800,7 +800,8 @@ describe("applySettlementToContent", () => {
     );
     const stay = (next.itinerary as any[])[0].items[1];
     expect(stay.check_in).toBe(day2Date);
-    expect(stay.swarm_note).toContain("late check in");
+    // Finding 5: the action reads as words with its time, not an enum.
+    expect(stay.swarm_note).toContain("late check-in at 01:00");
     expect(stay.swarm_note).toContain("arrival pushed back 6h");
     expect(changes.some((c) => c.includes("Atlantica Surf House"))).toBe(true);
   });

@@ -90,11 +90,14 @@ describe("why there was no replacement — and who to blame for it", () => {
     return agent.assessRebookingOptions("flight-0", ORIGINAL_DEPARTURE, ctx);
   }
 
-  it("uses the indicative fallback after several empty dates", async () => {
+  it("names the partner only after it ANSWERED empty on several dates", async () => {
+    // This used to hand back a fabricated flight and leave noReplacementReason
+    // undefined, which made the whole four-way verdict below unreachable.
     const assessment = await assess([], missedContext);
     expect((assessment.searchedDates?.length ?? 0) >= 2).toBe(true);
-    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
-    expect(assessment.noReplacementReason).toBeUndefined();
+    expect(assessment.candidates).toHaveLength(0);
+    expect(assessment.bestCandidate).toBeNull();
+    expect(assessment.noReplacementReason).toBe("route_not_covered");
     expect(assessment.providerOptionCount).toBe(0);
   });
 
@@ -139,9 +142,11 @@ describe("why there was no replacement — and who to blame for it", () => {
       ORIGINAL_DEPARTURE,
       missedContext,
     );
-    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
+    // A DECLINED search proves nothing about the route, so the verdict must be
+    // search_declined — never a coverage claim, and never an invented flight.
+    expect(assessment.candidates).toHaveLength(0);
     expect(assessment.fallbackReason).toBe("Can not search past flights");
-    expect(assessment.noReplacementReason).toBeUndefined();
+    expect(assessment.noReplacementReason).toBe("search_declined");
   });
 
   it("says nothing at all when a replacement was found", async () => {
@@ -287,8 +292,10 @@ describe("fare pricing must not stampede the provider", () => {
       ORIGINAL_DEPARTURE,
       missedContext,
     );
-    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
-    expect(assessment.noReplacementReason).toBeUndefined();
+    // The provider HAD a flight; only the pricing call refused. That is a
+    // different fact from "no such route", and the traveller is told which.
+    expect(assessment.candidates).toHaveLength(0);
+    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
   }, 20000);
 
   it("does NOT retry a failure the provider called permanent", async () => {
@@ -312,8 +319,7 @@ describe("fare pricing must not stampede the provider", () => {
       missedContext,
     );
     expect(provider.attempts).toBe(1);
-    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
-    expect(assessment.noReplacementReason).toBeUndefined();
+    expect(assessment.noReplacementReason).toBe("pricing_unavailable");
     // And the reason is quoted, not swallowed — this was invisible before.
     expect(assessment.pricingFailureDetail).toContain("credentials");
   }, 20000);
@@ -396,13 +402,13 @@ describe("continuous reflow keeps late replacement flights", () => {
   });
 });
 
-describe("zero-abort route fallback", () => {
+describe("an empty provider answer stays empty", () => {
   it.each([
     ["SIN", "DPS", "TR285"],
     ["SIN", "NRT", "TR882"],
     ["KIX", "SIN", "MM773"],
     ["SGN", "SIN", "VN650"],
-  ])("populates Option 1 for %s → %s when Atlas is empty", async (origin, destination, flightNumber) => {
+  ])("offers no flight for %s → %s when Atlas is empty, and says why", async (origin, destination, flightNumber) => {
     const departureDate = "2026-12-22T06:10:00Z";
     const agent = new FlightAgent(new Provider([]));
     const assessment = await agent.assessRebookingOptions("disrupted", departureDate, {
@@ -413,17 +419,14 @@ describe("zero-abort route fallback", () => {
       currency: "SGD",
       originalFare: 200,
     });
-    const fallback = assessment.bestCandidate;
-    expect(fallback).not.toBeNull();
-    expect(fallback?.option.flightNumber).toBe(flightNumber);
-    expect(fallback?.option.inventorySource).toBe("synthetic_recovery");
-    expect(fallback?.fareDifference.basis).toBe("synthetic_estimate");
-    expect(fallback?.fareDifference.amount).toBeGreaterThanOrEqual(20);
-    expect(fallback?.fareDifference.amount).toBeLessThanOrEqual(50);
-    expect(Date.parse(fallback!.option.departureTime) - Date.parse(departureDate)).toBe(
-      3 * 3_600_000,
-    );
-    expect(assessment.noReplacementReason).toBeUndefined();
+    // Atlas is empty on this route. There is no flight to offer, and the
+    // engine says so with the reason its own search proves — it does not put
+    // `${flightNumber}` on the screen, because nobody checked that such a
+    // flight exists.
+    expect(assessment.candidates).toHaveLength(0);
+    expect(assessment.bestCandidate).toBeNull();
+    expect(assessment.noReplacementReason).toBe("route_not_covered");
+    expect(assessment.fallbackReason).toContain("no inventory");
   });
 });
 

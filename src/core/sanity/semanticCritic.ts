@@ -106,7 +106,15 @@ export interface CriticItem {
 /** Everything the critic is allowed to reason about. Nothing else is sent. */
 export interface CriticContext {
   incident: string;
-  arrival: {
+  /**
+   * The replacement landing, when the mission HAS one. A weather swap, a
+   * cancelled activity or an overbooked room has no arrival — and the critic
+   * still has plenty to say about those, which is exactly where venue
+   * knowledge matters most. It used to be required, so the critic was only
+   * ever consulted on flight disruptions: 36 of 42 live missions never
+   * reached it.
+   */
+  arrival?: {
     origin?: string;
     airport?: string;
     /** When the replacement lands. */
@@ -165,9 +173,11 @@ function dayKey(ms: number): string {
  */
 export function deterministicCriticisms(context: CriticContext): Criticism[] {
   const out: Criticism[] = [];
-  const readyInCityMs = parse(context.arrival.ready_in_city_iso);
-  const readyForPickupMs = parse(context.arrival.ready_for_pickup_iso);
-  const arrivalMs = parse(context.arrival.iso);
+  // With no arrival, the rules that measure against a landing simply do not
+  // apply; the clock and venue rules below still do.
+  const readyInCityMs = parse(context.arrival?.ready_in_city_iso);
+  const readyForPickupMs = parse(context.arrival?.ready_for_pickup_iso);
+  const arrivalMs = parse(context.arrival?.iso);
 
   // 1. A room cannot be entered before the traveller is in the city.
   //
@@ -183,7 +193,7 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
       // A NIGHT later is a date shift; a few hours later is a late check-in,
       // which every reception in the world already handles.
       const nightsLost = unstayedNights(bookedMs, remedyMs);
-      const city = airportInfo(context.arrival.airport)?.city ?? "the city";
+      const city = airportInfo(context.arrival?.airport)?.city ?? "the city";
       out.push({
         node_id: context.hotel.node_id,
         issue_type: "HOTEL_PRECEDES_ARRIVAL",
@@ -510,21 +520,23 @@ export class SemanticCritic {
  * be tempted to reason about it.
  */
 export function buildCriticPrompt(context: CriticContext): string {
-  const destination = airportInfo(context.arrival.airport);
+  const destination = airportInfo(context.arrival?.airport);
   return JSON.stringify({
     incident: context.incident,
-    arrival: {
-      from: context.arrival.origin ?? null,
-      airport: context.arrival.airport ?? null,
-      airport_city: destination?.city ?? null,
-      lands_at: context.arrival.iso,
-      /** Standing in arrivals: landing + deplaning + immigration + baggage. */
-      ready_at_airport: context.arrival.ready_for_pickup_iso,
-      /** In the city centre — do not add anything to this, it is the answer. */
-      ready_in_city: context.arrival.ready_in_city_iso,
-      arrives_a_day_later_than_booked: context.arrival.is_next_day,
-      originally_landed_at: context.arrival.original_arrival_iso ?? null,
-    },
+    arrival: context.arrival
+      ? {
+          from: context.arrival.origin ?? null,
+          airport: context.arrival.airport ?? null,
+          airport_city: destination?.city ?? null,
+          lands_at: context.arrival.iso,
+          /** Standing in arrivals: landing + deplaning + immigration + baggage. */
+          ready_at_airport: context.arrival.ready_for_pickup_iso,
+          /** In the city centre — do not add anything to this, it is the answer. */
+          ready_in_city: context.arrival.ready_in_city_iso,
+          arrives_a_day_later_than_booked: context.arrival.is_next_day,
+          originally_landed_at: context.arrival.original_arrival_iso ?? null,
+        }
+      : null,
     hotel: context.hotel
       ? {
           node_id: context.hotel.node_id,
@@ -574,8 +586,8 @@ export function rulingsFor(
 ): Map<string, CriticRuling> {
   const rulings = new Map<string, CriticRuling>();
   const byId = new Map(context.items.map((item) => [item.node_id, item]));
-  const readyInCityMs = parse(context.arrival.ready_in_city_iso);
-  const readyForPickupMs = parse(context.arrival.ready_for_pickup_iso);
+  const readyInCityMs = parse(context.arrival?.ready_in_city_iso);
+  const readyForPickupMs = parse(context.arrival?.ready_for_pickup_iso);
 
   for (const criticism of verdict.criticisms) {
     const reason = criticism.explanation;

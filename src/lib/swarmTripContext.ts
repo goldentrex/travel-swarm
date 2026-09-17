@@ -1029,6 +1029,56 @@ export function applySettlementToContent(
   };
 
   const itinerary = Array.isArray(next.itinerary) ? (next.itinerary as unknown[]) : [];
+  /**
+ * Put a day back in chronological order.
+ *
+ * Every write above edits a day in place or splices items in and out, and
+ * none of them restored the running order: a live battery came back with 40 of
+ * 62 settled days out of sequence, one reading 16:30 · 21:30 · 08:00 · 11:30 ·
+ * 17:00. The iOS timeline happens to re-sort at render time, so most of it was
+ * invisible — but the stored trip was simply wrong, and two paths read the
+ * array order directly: a day the traveller arranged BY HAND (`manual_order`,
+ * where array order IS the intended order), and the renderer's fallback that
+ * gives an item with no time the time of the item BEFORE it.
+ *
+ * A day the settlement rewrote is no longer the day the traveller arranged —
+ * items have moved in, moved out, been cancelled — so `manual_order` is
+ * cleared with it rather than pretending a hand-made sequence survived a
+ * disruption. Items without a time keep their position relative to the timed
+ * item they follow, which is exactly what the renderer assumes.
+ */
+function resortDay(day: Record<string, unknown> | null | undefined): void {
+  if (!day) return;
+  const items = Array.isArray(day.items) ? (day.items as unknown[]) : null;
+  if (!items || items.length < 2) return;
+  // Decorate with the CARRIED time — an untimed item belongs with whatever it
+  // followed, so it must not be flung to the start of the day.
+  let carried = -1;
+  const decorated = items.map((raw, index) => {
+    const minutes = timeStringToMinutes(asString(asRecord(raw)?.time));
+    if (minutes !== null) carried = minutes;
+    return { raw, key: carried, index };
+  });
+  const ordered = [...decorated].sort((a, b) => a.key - b.key || a.index - b.index);
+  if (ordered.every((entry, i) => entry.index === i)) return;
+  day.items = ordered.map((entry) => entry.raw);
+  if (day.manual_order === true) day.manual_order = false;
+}
+
+/** The day that holds `date`, appended to the itinerary when it has none. */
+  const ensureDay = (date: string): Record<string, unknown> => {
+    const existing = itinerary.find((d) => asRecord(d)?.date === date);
+    if (existing) return existing as Record<string, unknown>;
+    const created: Record<string, unknown> = {
+      day: itinerary.length + 1,
+      date,
+      place: textOf(next.destination) || "",
+      travelers: [],
+      items: [],
+    };
+    itinerary.push(created);
+    return created;
+  };
   const transitGroups = Array.isArray(next.transit_groups)
     ? (next.transit_groups as unknown[])
     : [];
@@ -1264,6 +1314,20 @@ export function applySettlementToContent(
         message: `You arrive a day later, so ${nightsLost} ${nightWord} at ${hotelChangeLabel(ref.label)} from ${checkInDateLabel(bookedCheckInMs)} goes unused — ask the property whether it can be released or credited before you travel.`,
       });
     }
+    // A stay that loses a night is NEVER "no change needed". The agent's
+    // verdict describes the ROOM POLICY (nothing to renegotiate), but the
+    // traveller's night is gone either way — a live trip printed "1 booked
+    // night from Fri 6 Nov will not be used" and "no change needed" on two
+    // adjacent lines about the same hotel. The lost night has already been
+    // stated above, so the redundant second line is simply not emitted.
+    if (nightsLost > 0 && action.action === "none") {
+      const note = `Swarm settlement (${nightsLost === 1 ? "night not used" : `${nightsLost} nights not used`}): ${action.note || plan.incident}`;
+      const existing = typeof item.swarm_note === "string" ? item.swarm_note : "";
+      if (!existing.includes(note)) {
+        item.swarm_note = existing.length > 0 ? `${existing} | ${note}` : note;
+      }
+      continue;
+    }
     const phrase = hotelActionPhrase(action.action, shiftedCheckInMs, bookedCheckInMs);
     const note = `Swarm settlement (${phrase}): ${action.note || plan.incident}`;
     // Idempotent append (clarity pass): a repeated settlement of the same
@@ -1406,19 +1470,7 @@ export function applySettlementToContent(
   // Then append each moved item to its target day (created at the end of
   // the itinerary when missing).
   for (const move of crossDayMoves) {
-    let targetDay = itinerary.find((d) => asRecord(d)?.date === move.targetDate) as
-      | Record<string, unknown>
-      | undefined;
-    if (!targetDay) {
-      targetDay = {
-        day: itinerary.length + 1,
-        date: move.targetDate,
-        place: textOf(next.destination) || "",
-        travelers: [],
-        items: [],
-      };
-      itinerary.push(targetDay);
-    }
+    const targetDay = ensureDay(move.targetDate);
     const targetItems = Array.isArray(targetDay.items)
       ? (targetDay.items as unknown[])
       : (targetDay.items = []);
@@ -1463,6 +1515,18 @@ export function applySettlementToContent(
     // used to land, after it used to land. It is re-anchored to when the
     // traveller is really standing in arrivals, and follows the flight if the
     // replacement lands at a different airport.
+    // A cascade can push an item onto ANOTHER CALENDAR DAY — a ride from the
+    // airport follows a plane that now lands tomorrow. Re-writing only its
+    // clock time left it filed under the old day, which is how a trip came
+    // back showing a Narita bus at 08:35 and a Shinjuku check-in at 10:20 on
+    // the very day the traveller was still in Singapore until 16:55. The item
+    // has to MOVE days, exactly as an explicit activity move does.
+    const cascadeRelocations: Array<{
+      dayIndex: number;
+      itemIndex: number;
+      item: Record<string, unknown>;
+      targetDate: string;
+    }> = [];
     let transfersMoved = 0;
     const disruptedTransitIndex = disruptedRef?.transitIndex;
     transitGroups.forEach((rawLeg, index) => {
@@ -1645,8 +1709,31 @@ export function applySettlementToContent(
         continue;
       }
       entry.item.time = hhmmOf(placement.atMs);
+      // Which day does it now belong to? `placeDisplacedItem` only ever lets
+      // lodging and ground transfers cross midnight (everything softer is
+      // dropped rather than stacked onto a day that has its own plan), so this
+      // is the ride from the airport following its flight.
+      const cascadeSourceDate =
+        asString(dayAt(entry.dayIndex)?.date) ?? isoDateOf(entry.atMs);
+      const cascadeTargetDate = isoDateOf(placement.atMs);
+      const movesDays = cascadeTargetDate !== cascadeSourceDate;
+      if (movesDays && category !== "lodging") {
+        // Lodging is excluded on purpose: a stay is addressed by its own
+        // `check_in` date (set below), and the row stands for a night rather
+        // than for a moment in a day's running order.
+        cascadeRelocations.push({
+          dayIndex: entry.dayIndex,
+          itemIndex: entry.itemIndex,
+          item: entry.item,
+          targetDate: cascadeTargetDate,
+        });
+      }
       if (title) effects.moved.push(title);
-      movedLabels.push(`${title || "An item"} → ${hhmmOf(placement.atMs)}`);
+      movedLabels.push(
+        movesDays
+          ? `${title || "An item"} → ${checkInDateLabel(placement.atMs)} ${hhmmOf(placement.atMs)}`
+          : `${title || "An item"} → ${hhmmOf(placement.atMs)}`,
+      );
       if (category === "lodging") {
         // The stay's own check-in date moves with it, or hydration snaps the
         // room straight back on the next load. A late check-in consumes no
@@ -1664,9 +1751,22 @@ export function applySettlementToContent(
           : placement.atMs + 45 * MINUTE_MS;
     }
 
-    // Splice cascade drops per day, DESCENDING, so indices stay valid.
-    cascadeDrops.sort((a, b) => a.dayIndex - b.dayIndex || b.itemIndex - a.itemIndex);
-    for (const drop of cascadeDrops) itemsAt(drop.dayIndex)?.splice(drop.itemIndex, 1);
+    // Splice cascade drops AND the removals of relocated items in ONE
+    // descending pass per day, so neither can shift the other's index.
+    const cascadeRemovals = [
+      ...cascadeDrops,
+      ...cascadeRelocations.map((move) => ({ dayIndex: move.dayIndex, itemIndex: move.itemIndex })),
+    ];
+    cascadeRemovals.sort((a, b) => a.dayIndex - b.dayIndex || b.itemIndex - a.itemIndex);
+    for (const removal of cascadeRemovals) itemsAt(removal.dayIndex)?.splice(removal.itemIndex, 1);
+    // …then re-file each relocated item on the day it now happens.
+    for (const move of cascadeRelocations) {
+      const targetDay = ensureDay(move.targetDate);
+      const targetItems = Array.isArray(targetDay.items)
+        ? (targetDay.items as unknown[])
+        : (targetDay.items = []);
+      targetItems.push(move.item);
+    }
 
     if (movedCount > 0) {
       // Name what moved: "1 item moved" told the traveller something changed
@@ -1678,6 +1778,27 @@ export function applySettlementToContent(
       );
     }
     void transfersMoved;
+  }
+
+  // ── Every day the settlement rewrote goes back in running order ─────────
+  // Compared against the ORIGINAL rather than tracked per write site: a day
+  // the settlement never touched keeps whatever order the traveller gave it,
+  // including a deliberate hand-made one.
+  const originalDays = Array.isArray(content.itinerary) ? (content.itinerary as unknown[]) : [];
+  const fingerprint = (day: unknown): string =>
+    JSON.stringify(
+      (Array.isArray(asRecord(day)?.items) ? (asRecord(day)!.items as unknown[]) : []).map((raw) => {
+        const item = asRecord(raw);
+        return [textOf(item?.title), asString(item?.time), asString(item?.type)];
+      }),
+    );
+  for (let dayIndex = 0; dayIndex < itinerary.length; dayIndex += 1) {
+    const before = originalDays[dayIndex];
+    const after = itinerary[dayIndex];
+    // A day that appeared during this settlement has no "before" and is
+    // ordered from scratch.
+    if (before !== undefined && fingerprint(before) === fingerprint(after)) continue;
+    resortDay(asRecord(after));
   }
 
   return {

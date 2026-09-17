@@ -918,6 +918,139 @@ describe("the settlement never writes an absurd trip", () => {
     expect(unused?.unstayed).toBe(true);
   });
 
+  it("moves the airport ride to the day the plane actually lands", () => {
+    // The live Tokyo defect, exactly: the replacement departs on the 15th and
+    // lands the 16th, and the settled trip came back showing the airport bus
+    // and the check-in on the 15th — hours before the traveller had even left.
+    // Re-writing the clock is not enough; the ride has to change DAY.
+    const content = romeTrip();
+    const day1 = (content.itinerary as any[])[0];
+    day1.items.push({ type: "transit", title: "Airport Limousine Bus to Rome", time: "12:45" });
+    const hydrated = hydrateTripFromContent("t", "Rome", "Rome", content)!;
+    const plan: ResolutionPlan = {
+      incident: "Delayed flight AZ311",
+      impacted_nodes: [],
+      proposed_resolution: {
+        new_flight: { id: "AZ-345", cost: 210, currency: "EUR", origin: "CDG", destination: "FCO" },
+        rescheduled_activities: [],
+      },
+      financial_delta: { total_refund: 0, total_new_charges: 85, net_payable: 85 },
+      requires_human_approval: true,
+      currency: "EUR",
+    };
+    const { content: next } = applySettlementToContent(content, hydrated.nodeRefs, plan, {
+      disrupted: { nodeId: "flight-0", kind: "flight", label: "Flight AZ311" },
+      // Departs the 14th at 22:00, lands the FIFTEENTH at 06:30.
+      new_flight: {
+        reference: "AZ345",
+        depart: `${DAY}T22:00:00Z`,
+        arrive: "2031-03-15T06:30:00Z",
+        carrier: "ITA Airways",
+      },
+      bookingCode: "SWARM-QA0002",
+    });
+    const days = (next.itinerary as any[]);
+    const titlesOn = (date: string) =>
+      (days.find((d) => d.date === date)?.items ?? []).map((i: any) => i.title);
+
+    // The bus is GONE from the departure day…
+    expect(titlesOn(DAY)).not.toContain("Airport Limousine Bus to Rome");
+    // …and stands on the day the plane lands.
+    expect(titlesOn("2031-03-15")).toContain("Airport Limousine Bus to Rome");
+    const bus = days
+      .flatMap((d: any) => d.items)
+      .find((i: any) => i.title === "Airport Limousine Bus to Rome");
+    // Never before the plane is on the ground. CDG→FCO is Schengen, so there
+    // is no border queue: the ride keeps the 35-minute gap the traveller had
+    // already accepted (capped at the real 45-minute deplane+bags buffer).
+    expect(bus.time > "06:30").toBe(true);
+    expect(bus.time).toBe("07:05");
+  });
+
+  it("never says a hotel needs no change on the same breath as losing its night", () => {
+    // Both lines were printed about one property on a live trip.
+    const { changes } = settle(`2031-03-15T18:00:00Z`, {}, {
+      hotel_actions: [
+        {
+          nodeId: "hotel-0-5",
+          action: "none",
+          note: "Room policy unchanged.",
+          newCheckIn: "2031-03-15T20:00:00.000Z",
+        },
+      ],
+    });
+    expect(changes.some((c) => /will not be used/.test(c))).toBe(true);
+    expect(changes.some((c) => /no change needed/.test(c))).toBe(false);
+  });
+
+  it("puts every rewritten day back in running order", () => {
+    // Live battery 2026-09-17: 40 of 62 settled days came back out of
+    // sequence, one reading 16:30 · 21:30 · 08:00 · 11:30 · 17:00. The iOS
+    // timeline re-sorts at render time so most of it was invisible, but the
+    // stored trip was wrong and two paths read the array order directly.
+    const content = romeTrip();
+    const day1 = (content.itinerary as any[])[0];
+    day1.items.push({ type: "transit", title: "Airport Limousine Bus to Rome", time: "12:45" });
+    const hydrated = hydrateTripFromContent("t", "Rome", "Rome", content)!;
+    const plan: ResolutionPlan = {
+      incident: "Delayed flight AZ311",
+      impacted_nodes: [],
+      proposed_resolution: {
+        new_flight: { id: "AZ-345", cost: 210, currency: "EUR", origin: "CDG", destination: "FCO" },
+        rescheduled_activities: [],
+      },
+      financial_delta: { total_refund: 0, total_new_charges: 85, net_payable: 85 },
+      requires_human_approval: true,
+      currency: "EUR",
+    };
+    const { content: next } = applySettlementToContent(content, hydrated.nodeRefs, plan, {
+      disrupted: { nodeId: "flight-0", kind: "flight", label: "Flight AZ311" },
+      new_flight: {
+        reference: "AZ345",
+        depart: `${DAY}T22:00:00Z`,
+        arrive: "2031-03-15T06:30:00Z",
+        carrier: "ITA Airways",
+      },
+      bookingCode: "SWARM-QA0003",
+    });
+
+    for (const day of next.itinerary as any[]) {
+      const times = (day.items ?? [])
+        .map((i: any) => i.time)
+        .filter((t: unknown): t is string => typeof t === "string");
+      expect(times, `day ${day.date} is out of order`).toEqual([...times].sort());
+    }
+  });
+
+  it("does NOT reorder a day the settlement never touched", () => {
+    // A day the traveller arranged by hand keeps that arrangement — the
+    // settlement only restores order on days it actually rewrote.
+    const content = romeTrip();
+    const day2 = (content.itinerary as any[])[1];
+    day2.manual_order = true;
+    day2.items = [
+      { type: "activity", title: "Evening first, on purpose", time: "19:00" },
+      { type: "activity", title: "Morning second, on purpose", time: "09:00" },
+    ];
+    const hydrated = hydrateTripFromContent("t", "Rome", "Rome", content)!;
+    const { content: next } = applySettlementToContent(
+      content,
+      hydrated.nodeRefs,
+      {
+        incident: "x",
+        impacted_nodes: [],
+        proposed_resolution: { rescheduled_activities: [] },
+        financial_delta: { total_refund: 0, total_new_charges: 0, net_payable: 0 },
+        requires_human_approval: true,
+        currency: "EUR",
+      } as ResolutionPlan,
+      { disrupted: { nodeId: "flight-0", kind: "flight", label: "Flight AZ311" } },
+    );
+    const after = (next.itinerary as any[])[1];
+    expect(after.items.map((i: any) => i.time)).toEqual(["19:00", "09:00"]);
+    expect(after.manual_order).toBe(true);
+  });
+
   it("a merely late arrival is still a late check-in, not a lost night", () => {
     // 01:00 on the 15th is the night of the 14th in every hotel's book.
     const { changes, followUps, item } = settle(`${DAY}T23:10:00Z`, {}, {

@@ -39,13 +39,16 @@ import type {
 } from "@/core/dag";
 import { ItineraryGraph } from "@/core/dag";
 import {
+  EXCESSIVE_JOURNEY,
   arrivalBuffer,
   arrivalWindows,
+  clampToWindowStart,
   classifyItem,
   criticCategoryOf,
   describeDropReason,
   deterministicCriticisms,
   isSensibleStart,
+  journeyStretchFactor,
   minutesOfDay,
   rulingsFor,
   unstayedNights,
@@ -559,7 +562,37 @@ export function selectPlanCandidates(
     });
   }
 
+  // An option that takes several times as long as the route physically needs
+  // is not a trade-off, it is an ordeal — and it must never be the one the
+  // traveller is shown FIRST while a sane one exists. Applied BEFORE the
+  // preference pins so an explicit answer ("same day", "nonstop") can still
+  // pull a candidate forward: the traveller's own choice outranks our
+  // judgement, this only orders what they did not speak to.
+  //
+  // Demoted, never dropped: someone counting every euro may genuinely accept a
+  // long layover, and arrival time never vetoes a real flight.
   let ordered = base;
+  const stretchOf = (candidate: RebookingCandidate) =>
+    journeyStretchFactor(
+      candidate.option.origin,
+      candidate.option.destination,
+      candidate.option.departureTime,
+      candidate.option.arrivalTime,
+    );
+  const excessive = base.filter((c) => (stretchOf(c) ?? 0) > EXCESSIVE_JOURNEY);
+  if (excessive.length > 0 && excessive.length < base.length) {
+    const sane = base.filter((c) => !excessive.includes(c));
+    ordered = [...sane, ...excessive];
+    const worst = excessive
+      .map((c) => ({ c, f: stretchOf(c) ?? 0 }))
+      .sort((a, b) => b.f - a.f)[0];
+    notes.push(
+      `${excessive.length} option(s) take over ${EXCESSIVE_JOURNEY}× the normal flying time ` +
+        `(worst: ${worst.c.option.flightNumber ?? worst.c.option.id} at ${worst.f.toFixed(1)}×) — ` +
+        `offered, but not first`,
+    );
+  }
+
   for (const pin of pins) {
     const pinned = ordered.filter(pin.test);
     if (pinned.length === 0 || pinned.length === ordered.length) continue;
@@ -944,7 +977,14 @@ export class OrchestratorAgent {
       }
       seen.add(canonical);
       canonicals.push(canonical);
-      plans.push({ ...plan, badge, ...(badges !== undefined ? { badges } : {}) });
+      // A badge is the RESULT of a comparison. A plan with no replacement
+      // flight compared nothing, so it claims nothing — "balanced" on an empty
+      // answer is a label about a choice that was never made.
+      if (plan.proposed_resolution.new_flight === undefined) {
+        plans.push(plan);
+      } else {
+        plans.push({ ...plan, badge, ...(badges !== undefined ? { badges } : {}) });
+      }
     }
 
     // Post-dedup collapse: the plan list narrowed to exactly ONE plan that
@@ -1017,6 +1057,24 @@ export class OrchestratorAgent {
         planActivityProposals.push(pipeline.activityProposals);
       }
     }
+    // ── The critic on a mission with NO replacement flight ────────────────
+    // The per-candidate hook above only fires when a flight rederive ran, so
+    // weather, hotel and cancelled-activity missions never reached the critic
+    // at all — 36 of 42 on a live battery. Those are precisely the missions
+    // where knowing what a place IS decides the answer, so the shared walk is
+    // reviewed here instead, with no arrival to measure against.
+    // The condition is "the critic has not spoken yet", not "there was no
+    // flight rail": a flight mission whose provider returned NO candidates
+    // runs the per-candidate hook zero times, so it fell between the two and
+    // 6 of 42 live missions kept slipping through with real activity moves
+    // nobody reviewed.
+    if (this.criticVerdicts.length === 0 && pipeline.activityProposals.length > 0) {
+      const reviewed = await this.critiqueWithoutArrival(pipeline.activityProposals, event, trace);
+      if (reviewed !== pipeline.activityProposals) {
+        for (let i = 0; i < planActivityProposals.length; i += 1) planActivityProposals[i] = reviewed;
+      }
+    }
+
     // Shared field stays plan-0's set for back-compat.
     const sharedActivityProposals = planActivityProposals[0] ?? pipeline.activityProposals;
 
@@ -1487,6 +1545,69 @@ export class OrchestratorAgent {
       return proposal;
     });
     return critiqued;
+  }
+
+  /**
+   * Review a re-planned day that has no replacement flight behind it.
+   *
+   * Same critic, same rulings, same deterministic floor — only the arrival is
+   * missing, so the rules that measure against a landing stand down and the
+   * ones about hours and venues do the work. Returns the proposals untouched
+   * when there is nothing to say.
+   */
+  private async critiqueWithoutArrival(
+    proposals: ActivityRescheduleProposal[],
+    event: DisruptionEvent,
+    trace: string[],
+  ): Promise<ActivityRescheduleProposal[]> {
+    const graph = this.redriveBaseline ?? this.graph;
+    const items: CriticItem[] = [];
+    for (const proposal of proposals) {
+      if (proposal.action === "drop") continue;
+      const node = graph.getNode(proposal.activityNodeId);
+      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
+      if (!name) continue;
+      items.push({
+        node_id: proposal.activityNodeId,
+        name,
+        proposed_start: proposal.newTime,
+        ...(node ? { original_start: new Date(node.scheduledTime).toISOString() } : {}),
+        category: criticCategoryOf("activity", name),
+      });
+    }
+    if (items.length === 0) return proposals;
+
+    const context: CriticContext = {
+      incident: event.description ?? "Disrupted trip",
+      items,
+    };
+    const verdict = this.semanticCritic
+      ? await this.semanticCritic.review(context)
+      : {
+          is_sane: true,
+          criticisms: deterministicCriticisms(context),
+          source: "deterministic" as const,
+        };
+    const settled: CriticVerdict = { ...verdict, is_sane: verdict.criticisms.length === 0 };
+    this.criticVerdicts.push(settled);
+    if (settled.criticisms.length === 0) return proposals;
+
+    const rulings = rulingsFor(settled, context);
+    return proposals.map((proposal) => {
+      const ruling = rulings.get(proposal.activityNodeId);
+      if (!ruling || proposal.action === "swap") return proposal;
+      if (ruling.action === "drop") {
+        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} dropped`);
+        return { ...proposal, action: "drop" as const, rationale: ruling.reason };
+      }
+      if (ruling.action === "retime") {
+        const iso = new Date(ruling.atMs).toISOString();
+        if (iso === proposal.newTime) return proposal;
+        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} re-timed`);
+        return { ...proposal, newTime: iso, rationale: ruling.reason };
+      }
+      return proposal;
+    });
   }
 
   /**
@@ -1969,7 +2090,16 @@ export class OrchestratorAgent {
       const proposedMs = Date.parse(proposal.newTime);
       if (!Number.isFinite(proposedMs)) return proposal;
       const originalMs = originalMsOf.get(proposal.activityNodeId) ?? proposedMs;
-      const atMs = readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
+      // Two floors, in order: the traveller cannot be there before they land,
+      // and an item cannot start before the hour it makes sense at (a night
+      // view is not a 16:00 item). Both RAISE the slot; neither drops it.
+      const landedMs = readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
+      const atMs = clampToWindowStart(
+        classifyItem({ type: "activity", title: name }),
+        name,
+        landedMs,
+        minutesOfDay(originalMs),
+      );
       // An arrival that pushes the only remaining slot onto ANOTHER CALENDAR
       // DAY is a drop, not a move: tomorrow already has its own plan. This is
       // the rule `placeDisplacedItem` enforces on the settlement cascade, and

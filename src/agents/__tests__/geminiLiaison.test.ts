@@ -774,9 +774,12 @@ describe("buildPreferenceTradeoffs — W1 preference builder (primary rail)", ()
       "keep_lisbon_oceanarium_ticket",
       "drop_lisbon_oceanarium_ticket",
     ]);
+    // The choice is between TWO activities, so both options name one. It used
+    // to read "Keep X" / "Drop X" — the same venue on both buttons, which a
+    // traveller reads as a choice between a thing and itself.
     expect(activity.options[0].label).toBe("Keep Lisbon Oceanarium Ticket");
-    expect(activity.options[1].label).toBe("Drop Lisbon Oceanarium Ticket");
-    expect(activity.options[1].detail).toContain("we keep Beach Surf Lesson instead");
+    expect(activity.options[1].label).toBe("Keep Beach Surf Lesson");
+    expect(activity.options[1].detail).toContain("Lisbon Oceanarium Ticket is dropped");
   });
 
   it("builds the activity-priority question from MOVE-ONLY proposals via activityName", () => {
@@ -818,8 +821,8 @@ describe("buildPreferenceTradeoffs — W1 preference builder (primary rail)", ()
       "drop_sintra_palace_walk",
     ]);
     expect(activity.options[0].label).toBe("Keep Sintra Palace Walk");
-    expect(activity.options[1].label).toBe("Drop Sintra Palace Walk");
-    expect(activity.options[1].detail).toContain("we keep Belem Tower Visit instead");
+    expect(activity.options[1].label).toBe("Keep Belem Tower Visit");
+    expect(activity.options[1].detail).toContain("Sintra Palace Walk is dropped");
     // Quiz contract unchanged: ≤2 questions × exactly 2 options.
     expect(questions.length).toBeLessThanOrEqual(2);
     for (const q of questions) expect(q.options).toHaveLength(2);

@@ -72,6 +72,97 @@ const SCHENGEN: ReadonlySet<string> = new Set([
   "FR", "PT", "ES", "DE", "NL", "IT", "BE", "LU", "AT", "CH", "GR", "SE", "DK", "FI", "NO", "PL", "CZ",
 ]);
 
+/**
+ * How far apart two airports are, in kilometres (haversine, spherical earth).
+ *
+ * Distance is the one thing about an unknown route we can actually KNOW, and
+ * it is enough to keep a fallback honest: a schedule and a price invented
+ * without it produced "SQ912, Singapore → London, 3h00, £194" on a live run —
+ * a flight that cannot exist, shown to a traveller who had just missed theirs.
+ */
+export function greatCircleKm(
+  origin: string | null | undefined,
+  destination: string | null | undefined,
+): number | null {
+  const a = airportInfo(origin);
+  const b = airportInfo(destination);
+  if (!a || !b) return null;
+  const R = 6371;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(h))));
+}
+
+/** Ground time at both ends: pushback, taxi out, taxi in, on-stand. */
+const TAXI_MINUTES = 25;
+/** Average block speed. Short sectors spend proportionally more time climbing
+ *  and descending, so they average lower than a long cruise does. */
+const SHORT_HAUL_KMH = 650;
+const LONG_HAUL_KMH = 780;
+const SHORT_HAUL_KM = 1500;
+
+/**
+ * A realistic gate-to-gate time for a NONSTOP sector, in minutes. `null` when
+ * either airport is unknown — the caller then keeps its own documented default
+ * rather than inventing one.
+ *
+ * Checked against real schedules: CDG→FCO 127 (real ~125), SIN→NRT 434
+ * (real ~420), SIN→LHR 859 (real ~830). Close enough to be honest, never
+ * precise enough to be mistaken for a timetable.
+ */
+export function typicalBlockMinutes(
+  origin: string | null | undefined,
+  destination: string | null | undefined,
+): number | null {
+  const km = greatCircleKm(origin, destination);
+  if (km === null) return null;
+  const kmh = km <= SHORT_HAUL_KM ? SHORT_HAUL_KMH : LONG_HAUL_KMH;
+  return Math.round(TAXI_MINUTES + (km / kmh) * 60);
+}
+
+/**
+ * How much longer this itinerary takes than the route physically needs.
+ *
+ * 1.0 is a nonstop flown at typical block speed; a normal one-stop lands
+ * around 1.5–2.5 once a connection is counted. Past {@link EXCESSIVE_JOURNEY}
+ * the routing has stopped being a trade-off and become an ordeal: a live
+ * battery offered a traveller who had just missed their Tokyo flight a
+ * **29h30** routing as the DEFAULT choice, with a 7h24 nonstop sitting one
+ * position below it for 13% more.
+ *
+ * Measured against REAL candidates the provider returned — it only ever
+ * reorders what already exists, and invents nothing.
+ *
+ * `null` when either airport is unknown or the times do not parse — the caller
+ * then leaves the ordering exactly as it was.
+ */
+export function journeyStretchFactor(
+  origin: string | null | undefined,
+  destination: string | null | undefined,
+  departureIso: string | null | undefined,
+  arrivalIso: string | null | undefined,
+): number | null {
+  const block = typicalBlockMinutes(origin, destination);
+  if (block === null || block <= 0) return null;
+  const depart = Date.parse(departureIso ?? "");
+  const arrive = Date.parse(arrivalIso ?? "");
+  if (!Number.isFinite(depart) || !Number.isFinite(arrive) || arrive <= depart) return null;
+  return (arrive - depart) / 60_000 / block;
+}
+
+/**
+ * Beyond this multiple of the route's own block time, an option is never
+ * offered FIRST while a saner one exists. It is not removed: someone on a
+ * tight budget may genuinely accept a long layover, and the engine's standing
+ * policy is that arrival time never vetoes a real flight. It simply stops
+ * being the thing we put in front of a traveller by default.
+ */
+export const EXCESSIVE_JOURNEY = 3;
+
 export function airportInfo(code: string | null | undefined): AirportInfo | null {
   if (typeof code !== "string") return null;
   return AIRPORTS[code.trim().toUpperCase()] ?? null;

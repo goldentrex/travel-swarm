@@ -351,6 +351,41 @@ export interface ProposedMove {
  * Lodging, transit and transfers are always acceptable — a late check-in and a
  * late pickup are real services.
  */
+/**
+ * Pull a start that is too EARLY for what the item is up to the first hour it
+ * makes sense, on the same day.
+ *
+ * `reasonableStartWindow` has always returned both bounds and only `latest`
+ * was ever read — so the floor was dead code from the day it was written. A
+ * live battery printed the consequence: "Kabukicho Godzilla Road Night View"
+ * re-timed to 16:00, in daylight, and a Kabukicho nightlife stroll moved to
+ * 08:00. Both passed every rule, because nothing looked at the floor.
+ *
+ * Raising rather than dropping is the point: a night view at 16:00 is not an
+ * impossible item, it is an item at the wrong hour, and the traveller keeps it.
+ * Returns `atMs` unchanged when there is no floor, when it already clears it,
+ * or when clearing it would cross into the next day.
+ */
+export function clampToWindowStart(
+  category: ItemCategory,
+  title: string | null | undefined,
+  atMs: number,
+  originalMinutes: number = minutesOfDay(atMs),
+): number {
+  const window = reasonableStartWindow(category, title, originalMinutes);
+  if (!window) return atMs;
+  // Sleeping hours keep their EXISTING ruling — an honest drop, decided by
+  // `isSensibleStart`. Rescuing a 02:00 slot up to 07:30 would quietly turn a
+  // documented cancellation into a move the traveller never agreed to. This
+  // floor is only about an item sitting in a perfectly ordinary hour that is
+  // simply the wrong one FOR IT: a night view at 16:00, a lunch at 09:00.
+  if (isSleepingHour(atMs) && !isNightActivity(title)) return atMs;
+  const minutes = minutesOfDay(atMs);
+  if (minutes >= window.earliest) return atMs;
+  const raised = atMs + (window.earliest - minutes) * MINUTE_MS;
+  return utcDayIndex(raised) === utcDayIndex(atMs) ? raised : atMs;
+}
+
 export function isSensibleStart(
   category: ItemCategory,
   title: string | null | undefined,
@@ -390,10 +425,11 @@ export function enforceMoveSanity(
   if (!Number.isFinite(proposedMs)) return proposal;
   const category = classifyItem({ title: proposal.name });
   const originalMinutes = minutesOfDay(context.originalMs ?? proposedMs);
-  const atMs =
+  const landedMs =
     typeof context.readyInCityMs === "number" && Number.isFinite(context.readyInCityMs)
       ? Math.max(proposedMs, context.readyInCityMs)
       : proposedMs;
+  const atMs = clampToWindowStart(category, proposal.name, landedMs, originalMinutes);
   const verdict = isSensibleStart(category, proposal.name, atMs, originalMinutes);
   if (!verdict.ok) {
     const { new_time_iso: _slot, ...rest } = proposal;

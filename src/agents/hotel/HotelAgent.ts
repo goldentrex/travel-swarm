@@ -15,6 +15,7 @@
 
 import type { HotelProvider } from "@/providers/interfaces/HotelProvider";
 import type { IsoTimestamp } from "@/providers/interfaces/types";
+import { hotelQuotaExhausted } from "@/providers/rapidapi/hotelQuota";
 
 /** Request shape per spec §3.3. */
 export interface HotelImpactRequest {
@@ -68,7 +69,17 @@ export class HotelAgent {
   async assessHotelImpact(request: HotelImpactRequest): Promise<HotelAssessment> {
     // Unknown policy must not promise that a room is held or fees are zero.
     // Zero here means no verified charge is added; the proposal flags follow-up.
-    const degradedAssessment: HotelAssessment = {
+    //
+    // WHY the note is chosen rather than fixed: a bare catch told every
+    // traveller "Hotel policy could not be verified — contact the property",
+    // which sends them to argue with a hotel that has done nothing wrong when
+    // the truth is that OUR data plan ran out of requests for the month.
+    // Verified live on 2026-09-18: the gateway answered
+    // `429 You have exceeded the MONTHLY quota … BASIC` and every hotel
+    // verdict in a 42-mission battery degraded with that same misleading
+    // sentence. Blaming someone else for our own blindness is the failure
+    // mode this whole layer exists to avoid.
+    const buildDegraded = (note: string): HotelAssessment => ({
       hotelNodeId: request.hotelNodeId,
       lateCheckInAvailable: false,
       cancellationFee: 0,
@@ -77,10 +88,15 @@ export class HotelAgent {
       recommendation: "keep_as_is",
       feeDelta: 0,
       degraded: true,
-      note: "Hotel policy could not be verified. Contact the property to confirm availability, late arrival and any fees before changing this booking.",
-    };
+      note,
+    });
+    const UNVERIFIED_NOTE =
+      "Hotel policy could not be verified. Contact the property to confirm availability, late arrival and any fees before changing this booking.";
+    const OUTAGE_NOTE =
+      "We couldn't reach our hotel data provider, so this room's terms are unchecked — not a problem with the property. Your booking is untouched; confirm a late arrival with them if you want certainty.";
 
     let policyUnknown = false;
+    let degradedNote = UNVERIFIED_NOTE;
     let policies;
     try {
       policies = await this.provider.getHotelPolicies(
@@ -90,8 +106,12 @@ export class HotelAgent {
       );
     } catch {
       policyUnknown = true;
+      // The provider records a quota refusal when it sees one, so the honest
+      // sentence is available without spending another request to ask.
+      if (hotelQuotaExhausted()) degradedNote = OUTAGE_NOTE;
       policies = { hotelName: request.hotelName, lateCheckInAvailable: false, cancellationFee: 0, currency: "USD" };
     }
+    const degradedAssessment = buildDegraded(degradedNote);
 
     // Alternative rooms are only needed when the late check-in cannot be held.
     let alternativeRooms: HotelAssessment["alternativeRooms"] = [];

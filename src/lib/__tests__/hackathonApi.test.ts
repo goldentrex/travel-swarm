@@ -493,18 +493,19 @@ describe("degraded plan formatting (B1.5) on the fixture trip", () => {
     );
     const body = (await response.json()) as { plan: ResolutionPlan };
     const activities = body.plan.proposed_resolution.rescheduled_activities;
-
-    expect(activities.length).toBeGreaterThan(0);
+    // Every slot that IS proposed reads as a human time, never a raw ISO.
     for (const activity of activities) {
-      // Human slot label — never a raw ISO timestamp.
       expect(activity.new_time).not.toMatch(/^\d{4}-\d{2}-\d{2}T/);
       expect(activity.new_time).toMatch(/^(?:Today |Tomorrow |\d{4}-\d{2}-\d{2} )\d{2}:\d{2}$/);
-      // Machine-readable companion is present and IS an ISO timestamp.
       expect(activity.new_time_iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     }
-    // The internal recovery synthesizer replaces the old hard-coded canary.
-    expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
-    expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
+    // With no provider there is no replacement to offer — and none is
+    // fabricated. Re-timing downstream is still legitimate here: this is a
+    // DELAY, so the new arrival is the old one plus a known delay. What the
+    // plan may never do is invent the flight itself.
+    expect(body.plan.proposed_resolution.new_flight).toBeUndefined();
+    expect(body.plan.impacted_nodes.length).toBeGreaterThan(0);
+    expect(body.plan.incident).toContain("needs a manual booking");
   });
 
   it("charges stay arithmetically consistent and impacted_nodes is truthful", async () => {
@@ -516,13 +517,13 @@ describe("degraded plan formatting (B1.5) on the fixture trip", () => {
 
     // Indicative +40 flight delta + the fallback policy's +25 change fee;
     // activity penalties (if any) remain included by the normal ledger.
-    const expected =
-      40 +
-      25 +
-      plan.proposed_resolution.rescheduled_activities.reduce(
-        (sum, activity) => sum + activity.penalty,
-        0,
-      );
+    // Nothing was booked and nothing was re-timed, so nothing is owed. The
+    // 40 + 25 this used to expect were a fabricated fare delta and a change
+    // fee on a flight that did not exist.
+    const expected = plan.proposed_resolution.rescheduled_activities.reduce(
+      (sum, activity) => sum + activity.penalty,
+      0,
+    );
     expect(plan.financial_delta.total_new_charges).toBe(expected);
     expect(plan.financial_delta.net_payable).toBe(expected);
 
@@ -589,7 +590,7 @@ describe("non-flight missions run LIVE without an Atlas provider (clarity pass)"
     }
   });
 
-  it("a flight mission synthesizes an approvable option when Atlas is unavailable", async () => {
+  it("a flight mission says the search could not run, instead of inventing one", async () => {
     store.__setPersistent(true);
     try {
       const response = await handleHackathonRequest(
@@ -597,8 +598,15 @@ describe("non-flight missions run LIVE without an Atlas provider (clarity pass)"
       );
       const body = (await response.json()) as { degraded: boolean; plan: ResolutionPlan };
       expect(body.degraded).toBe(false);
-      expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
-      expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
+      expect(body.plan.proposed_resolution.new_flight).toBeUndefined();
+      expect(body.plan.incident).toContain("needs a manual booking");
+      const reason = (body.plan as unknown as {
+        presentation?: { no_flight_reason?: { summary: string; route: string } };
+      }).presentation?.no_flight_reason;
+      // The route is named, and so is the cause — the traveller is not left
+      // with a blank card, which was the whole reason a flight was invented.
+      expect(reason?.route).toBe("CDG → LIS");
+      expect(reason?.summary).toContain("flight provider is not configured");
     } finally {
       store.__setPersistent(false);
     }

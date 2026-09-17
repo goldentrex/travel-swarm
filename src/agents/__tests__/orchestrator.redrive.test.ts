@@ -302,14 +302,19 @@ describe("real-arrival re-drive — live-scenario twin", () => {
     expect(calls[0]?.newArrivalTime).toBe(REAL_ARRIVAL_ISO);
     expect(calls[0]?.activities).toHaveLength(2);
 
-    // Moves on the ARRIVAL day (09:55 / 12:55) — not blind next-day shifts.
+    // Moves on the ARRIVAL day — not blind next-day shifts.
     expect(outcome.activityProposals).toHaveLength(2);
     for (const proposal of outcome.activityProposals) {
       expect(proposal.action).toBe("reschedule");
       expect(proposal.reorgSource).toBe("deterministic");
       expect(proposal.newTime.slice(0, 10)).toBe("2026-09-03");
     }
-    expect(outcome.activityProposals[0]?.newTime).toBe("2026-09-03T09:55:00.000Z");
+    // The reorganizer packs the day from the landing, which put the "Night
+    // Food Tour" at 09:55. A live battery produced the same class of answer on
+    // a real trip ("Godzilla Road Night View" at 16:00), so the window floor
+    // now raises a night item to the first hour it makes sense — 17:00 — and
+    // this test records that rather than the morning slot it used to accept.
+    expect(outcome.activityProposals[0]?.newTime).toBe("2026-09-03T17:00:00.000Z");
     expect(outcome.activityProposals[1]?.newTime).toBe("2026-09-03T12:55:00.000Z");
   });
 
@@ -477,12 +482,14 @@ describe("resolveDisruptionMulti — per-plan activity rederive", () => {
     expect(a1).toHaveLength(2);
     // The arrival-aware stub moves slots relative to each arrival — the two
     // sets must disagree on the actual new slots.
+    // Both sets carry the SAME night tour, each raised to its own window floor
+    // (17:00); the second slot is what still distinguishes the two arrivals.
     expect(a2.map((proposal) => proposal.newTime)).toEqual([
-      "2026-09-03T13:30:00.000Z",
+      "2026-09-03T17:00:00.000Z",
       "2026-09-03T16:30:00.000Z",
     ]);
     expect(a1.map((proposal) => proposal.newTime)).toEqual([
-      "2026-09-03T09:55:00.000Z",
+      "2026-09-03T17:00:00.000Z",
       "2026-09-03T12:55:00.000Z",
     ]);
     expect(JSON.stringify(a2)).not.toBe(JSON.stringify(a1));

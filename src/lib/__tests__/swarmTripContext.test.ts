@@ -573,6 +573,11 @@ describe("parseMissionIntentForTrip", () => {
 
 // --------------------------------------------------------------- settlement
 
+/** The day's stay, found by kind — the settlement now keeps days in running
+ *  order, so a positional index no longer names a stable item. */
+const stayOn = (content: unknown, dayIndex = 0): any =>
+  ((content as any).itinerary?.[dayIndex]?.items ?? []).find((i: any) => i?.type === "stay");
+
 describe("applySettlementToContent", () => {
   it("rewrites the disrupted flight leg and reports the change", () => {
     const content = buildFixtureContent();
@@ -798,7 +803,7 @@ describe("applySettlementToContent", () => {
         ],
       },
     );
-    const stay = (next.itinerary as any[])[0].items[1];
+    const stay = stayOn(next);
     expect(stay.check_in).toBe(day2Date);
     // Finding 5: the action reads as words with its time, not an enum.
     expect(stay.swarm_note).toContain("late check-in at 01:00");
@@ -830,7 +835,7 @@ describe("applySettlementToContent", () => {
     });
 
     // Both the date AND the time component land on the stay item.
-    const stay = (settled.itinerary as any[])[0].items[1];
+    const stay = stayOn(settled);
     expect(stay.check_in).toBe(day1Date);
     expect(stay.time).toBe("21:30");
 
@@ -858,7 +863,7 @@ describe("applySettlementToContent", () => {
         ],
       },
     );
-    expect((settledAgain.itinerary as any[])[0].items[1].time).toBe("21:30");
+    expect(stayOn(settledAgain).time).toBe("21:30");
   });
 
   it("keeps the hotel swarm_note idempotent when the same settlement re-applies", () => {
@@ -884,7 +889,7 @@ describe("applySettlementToContent", () => {
       basePlan(),
       operational,
     );
-    const firstNote = (first.content.itinerary as any[])[0].items[1].swarm_note;
+    const firstNote = stayOn(first.content).swarm_note;
     const secondNote = (second.content.itinerary as any[])[0].items[1].swarm_note;
     expect(secondNote).toBe(firstNote);
     // A genuinely DIFFERENT note (e.g. a later settlement event) still

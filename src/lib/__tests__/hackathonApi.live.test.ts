@@ -231,17 +231,17 @@ describe("live real-trip mission — full pipeline", () => {
     ).toBe(true);
   });
 
-  it("uses an approvable synthetic recovery without fabricating atlas_liveness", async () => {
+  it("reports the provider failure honestly, without fabricating atlas_liveness", async () => {
     const providerHooks = AtlasFlightProvider as unknown as { __failSearch: boolean };
     providerHooks.__failSearch = true;
 
     const response = await runMission();
     const body = (await response.json()) as MissionBody;
 
-    // Provider failure ⇒ structured indicative recovery, still approvable.
+    // Provider failure ⇒ an honest empty answer, not an invented flight.
     expect(body.degraded).toBe(false);
-    expect(body.plan.incident).toContain("(simulated — flight provider unavailable)");
-    expect(body.plan.proposed_resolution.new_flight?.id).toMatch(/^SYNTHETIC-RECOVERY-/);
+    expect(body.plan.incident).toContain("needs a manual booking");
+    expect(body.plan.proposed_resolution.new_flight).toBeUndefined();
     // No correlation ids on the degraded rail ⇒ NO liveness row, ever.
     expect(body.swarm_trace.some((entry) => entry.step === "atlas_liveness")).toBe(false);
   });

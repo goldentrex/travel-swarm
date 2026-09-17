@@ -248,114 +248,27 @@ function flightNumbersMatch(fn1: string, fn2: string): boolean {
 
 const HOUR_MS = 3_600_000;
 
-type SyntheticRoute = {
-  airline: string;
-  flightNumber: string;
-  durationMinutes: number;
-  delta: number;
-};
-
-/** Known demo routes first; the origin-based defaults keep the rail global. */
-function syntheticRouteFor(origin: string, destination: string): SyntheticRoute {
-  const known: Record<string, SyntheticRoute> = {
-    "SIN-DPS": { airline: "Scoot", flightNumber: "TR285", durationMinutes: 165, delta: 32 },
-    "SIN-NRT": { airline: "Scoot", flightNumber: "TR882", durationMinutes: 420, delta: 48 },
-    "KIX-SIN": { airline: "Peach", flightNumber: "MM773", durationMinutes: 405, delta: 36 },
-    "SGN-SIN": { airline: "Vietnam Airlines", flightNumber: "VN650", durationMinutes: 140, delta: 28 },
-    "CGK-SIN": { airline: "Indonesia AirAsia", flightNumber: "QZ264", durationMinutes: 115, delta: 24 },
-    "CDG-FCO": { airline: "Air France", flightNumber: "AF1204", durationMinutes: 130, delta: 42 },
-  };
-  const exact = known[`${origin}-${destination}`];
-  if (exact) return exact;
-  if (origin === "SIN") {
-    return { airline: "Singapore Airlines", flightNumber: "SQ912", durationMinutes: 180, delta: 45 };
-  }
-  if (origin === "KIX") {
-    return { airline: "Peach", flightNumber: "MM701", durationMinutes: 180, delta: 35 };
-  }
-  if (origin === "CDG") {
-    return { airline: "Air France", flightNumber: "AF1400", durationMinutes: 150, delta: 40 };
-  }
-  return { airline: "Regional carrier", flightNumber: "RX101", durationMinutes: 180, delta: 35 };
-}
-
 /**
- * Last rung of the zero-abort ladder. This is an INDICATIVE recovery schedule,
- * not provider inventory: the id and airline label both make that provenance
- * visible, while the fare basis prevents the estimate being called verified.
+ * There is no last rung that invents a flight.
+ *
+ * There used to be: when the provider had no inventory, `synthesizeRecoveryCandidate`
+ * fabricated one — a flight number, a real airline's name, a schedule and a
+ * price — under a "zero-abort guarantee". A live battery of 42 missions showed
+ * what that bought: 6 of the 11 flight-bearing plans rested on a flight that
+ * does not exist, including "SQ912 · Singapore → London · 3h00 · £194".
+ *
+ * It also made the honest answer unreachable. `noReplacementReason` below is
+ * only computed when `candidates.length === 0`, and the fabricated candidate
+ * guaranteed that never happened — so `route_not_covered`, `search_declined`,
+ * `pricing_unavailable` and `all_options_rejected`, the four-way verdict built
+ * precisely to decide when we may name the partner, were dead code.
+ *
+ * An empty answer is now an empty answer, with the reason the provider's own
+ * behaviour proves. Everything downstream already handles a flight-less plan:
+ * `noReplacementHeadline`, `presentation.no_flight_reason`, the degraded
+ * single-plan rail, and `noReplacementWording.test.ts` which pins that only
+ * `route_not_covered` may say "partner".
  */
-function synthesizeRecoveryCandidate(
-  flightId: string,
-  newTime: IsoTimestamp,
-  routeContext: FlightRouteContext | undefined,
-): RebookingCandidate | null {
-  const origin = routeContext?.origin?.trim().toUpperCase();
-  const destination = routeContext?.destination?.trim().toUpperCase();
-  if (!origin || !destination || origin === destination) return null;
-
-  const route = syntheticRouteFor(origin, destination);
-  const requestedMs = Date.parse(
-    routeContext?.earliestDeparture ?? routeContext?.departureDate ?? newTime,
-  );
-  // Past fixtures and rejected searches must still produce a sellable recovery
-  // timeline. The provider search itself is anchored at now+2h upstream; this
-  // rung departs three hours after the later of that anchor and now+2h.
-  const anchorMs = Math.max(
-    Number.isFinite(requestedMs) ? requestedMs : 0,
-    Date.now() + 2 * HOUR_MS,
-  );
-  const departureMs = anchorMs + 3 * HOUR_MS;
-  const arrivalMs = departureMs + route.durationMinutes * 60_000;
-  const currency = /^[A-Z]{3}$/i.test(routeContext?.currency ?? "")
-    ? routeContext!.currency!.toUpperCase()
-    : "USD";
-  const originalFare = routeContext?.originalFare;
-  const totalFare =
-    typeof originalFare === "number" && Number.isFinite(originalFare) && originalFare >= 0
-      ? originalFare + route.delta
-      : 149 + route.delta;
-  const departureTime = new Date(departureMs).toISOString();
-  const arrivalTime = new Date(arrivalMs).toISOString();
-  const id = `SYNTHETIC-RECOVERY-${origin}-${destination}-${departureTime.slice(0, 10)}`;
-  return {
-    option: {
-      id,
-      airline: `${route.airline} (indicative fallback)`,
-      flightNumber: route.flightNumber,
-      origin,
-      destination,
-      departureTime,
-      arrivalTime,
-      price: Math.round(totalFare * 100) / 100,
-      currency,
-      stops: 0,
-      durationMinutes: route.durationMinutes,
-      segments: [
-        {
-          carrier: route.flightNumber.replace(/[^A-Z]/g, ""),
-          flightNumber: route.flightNumber,
-          origin,
-          destination,
-          departureTime,
-          arrivalTime,
-        },
-      ],
-      inventorySource: "synthetic_recovery",
-    },
-    fareDifference: {
-      oldFlightId: flightId,
-      newFlightId: id,
-      amount: route.delta,
-      currency,
-      direction: "charge",
-      basis: "synthetic_estimate",
-      ...(typeof originalFare === "number" && Number.isFinite(originalFare) && originalFare >= 0
-        ? { originalFare }
-        : {}),
-      adults: routeContext?.adults ?? 1,
-    },
-  };
-}
 
 export class FlightAgent {
   private readonly fareDeadlineMs: number;
@@ -639,25 +552,19 @@ export class FlightAgent {
       );
     }
 
-    // ZERO-ABORT guarantee for routed flight recovery. Empty inventory,
-    // declined searches, all candidates filtered as already departed, and
-    // permanent pricing failures all converge here. The result remains
-    // structured and drives hotel/activity reflow, but is visibly indicative
-    // and carries no Atlas correlation id.
+    // What the provider's own behaviour says about an empty result — recorded
+    // for the trace and the incident line. It no longer gates a fabricated
+    // candidate; it simply explains the emptiness.
     let fallbackReason: string | undefined;
     if (candidates.length === 0) {
-      const synthetic = synthesizeRecoveryCandidate(flightId, newTime, routeContext);
-      if (synthetic) {
-        candidates.push(synthetic);
-        fallbackReason =
-          windowDeclineReason ??
-          search.searchDeclinedReason ??
-          (providerOptionCount === 0
-            ? "provider returned no inventory after the broadened date search"
-            : usableOptions.length === 0
-              ? "provider options had already departed"
-              : "provider options could not be re-priced");
-      }
+      fallbackReason =
+        windowDeclineReason ??
+        search.searchDeclinedReason ??
+        (providerOptionCount === 0
+          ? "provider returned no inventory after the broadened date search"
+          : usableOptions.length === 0
+            ? "provider options had already departed"
+            : "provider options could not be re-priced");
     }
 
     // Best = smallest net outlay: charges add, refunds subtract.

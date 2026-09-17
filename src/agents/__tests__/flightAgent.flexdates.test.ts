@@ -203,7 +203,7 @@ describe("FlightAgent flexible-date window", () => {
     expect(assessment.bestCandidate?.option.id).toBe("next-day");
   });
 
-  it("synthesizes a structured recovery when EVERY date rejects", async () => {
+  it("reports a declined search as declined when EVERY date rejects", async () => {
     const provider = new DatedProvider(() => [], new Set([day(0), day(1)]));
     const agent = new FlightAgent(provider, { searchWindowDays: 2 });
 
@@ -212,10 +212,12 @@ describe("FlightAgent flexible-date window", () => {
       ORIGINAL_DEPARTURE,
       missedContext,
     );
-    expect(assessment.bestCandidate?.option.inventorySource).toBe("synthetic_recovery");
-    expect(assessment.bestCandidate?.option.id).toMatch(/^SYNTHETIC-RECOVERY-/);
+    // A refusal to look is not evidence about the route: the verdict is
+    // search_declined, and no flight is invented to paper over it.
+    expect(assessment.candidates).toHaveLength(0);
+    expect(assessment.bestCandidate).toBeNull();
     expect(assessment.fallbackReason).toMatch(/sandbox refused to search/);
-    expect(assessment.noReplacementReason).toBeUndefined();
+    expect(assessment.noReplacementReason).toBe("search_declined");
   });
 
   // --------------------------------------------------------- W1 config knobs

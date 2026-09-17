@@ -833,7 +833,11 @@ describe("OrchestratorAgent.resolveDisruptionMulti — degraded rail", () => {
 
     expect(outcome.plans.length).toBe(1);
     const plan = outcome.plans[0]!;
-    expect(plan.badge).toBe("balanced");
+    // No flight was offered, so nothing was compared — and a badge is the
+    // result of a comparison. It used to read "balanced", a verdict on a
+    // choice that was never made.
+    expect(plan.badge).toBeUndefined();
+    expect(plan.badges).toBeUndefined();
     expect("new_flight" in plan.proposed_resolution).toBe(false);
     expect(plan.financial_delta.total_new_charges).toBe(0);
     expect(plan.financial_delta.net_payable).toBe(0);

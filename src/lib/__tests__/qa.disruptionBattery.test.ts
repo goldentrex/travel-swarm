@@ -233,7 +233,18 @@ function assertNoDeadEnd(plan: ResolutionPlan, label: string): void {
 /** The quote countdown must have something to count down to. */
 function assertTtl(plan: ResolutionPlan, label: string): void {
   const expiresAt = (plan as unknown as Record<string, unknown>).expires_at;
-  expect(typeof expiresAt, `${label}: expires_at missing — no TTL to render`).toBe("number");
+  // A TTL fences a QUOTE. With no replacement flight there may still be a
+  // priced room to expire, or nothing at all — a re-stated late check-in at
+  // zero carries no horizon because it is a fact, not an offer. That rule is
+  // not pinned here because it has not been established precisely enough to
+  // assert; what IS asserted is the part that protects the traveller: a plan
+  // that quotes a FLIGHT must carry a live, bounded countdown, and any
+  // countdown that exists must be honest.
+  if (plan.proposed_resolution.new_flight == null && expiresAt === undefined) return;
+  if (plan.proposed_resolution.new_flight != null) {
+    expect(typeof expiresAt, `${label}: a quoted flight with no TTL to render`).toBe("number");
+  }
+  if (expiresAt === undefined) return;
   const remaining = (expiresAt as number) - Date.now();
   expect(remaining, `${label}: TTL already expired at issue time`).toBeGreaterThan(0);
   // Atlas flight quotes are issued with a 15-minute horizon (ATLAS_QUOTE_TTL_MS);
@@ -629,21 +640,19 @@ describe("Scenario D — provider inventory starvation / rate limit", () => {
       const presentation = (plan as unknown as Record<string, unknown>).presentation as
         | { no_flight_reason?: { kind: string; summary: string } }
         | undefined;
-      // Either an indicative recovery option, or a reason stated in words.
-      const indicative =
-        flight !== null &&
-        (String(flight.id).startsWith("SYNTHETIC-RECOVERY") ||
-          String(flight.airline ?? "").includes("indicative"));
+      // The provider has nothing. The engine no longer invents a flight to fill
+      // the gap — it says what happened, in words, with the verdict the
+      // provider's own behaviour proves. A blank card would be the dead end;
+      // a stated reason is not.
+      expect(flight ?? null, `D(${mode}): a flight was offered although the provider had none`).toBeNull();
       expect(
-        indicative || Boolean(presentation?.no_flight_reason?.summary),
-        `D(${mode}): neither an indicative option nor a stated reason`,
-      ).toBe(true);
-      if (indicative) {
-        // An estimate was compared against no real inventory — no comparative claims.
-        for (const claim of ["cheapest", "fastest", "balanced"]) {
-          expect(plan.badges ?? [], `D(${mode}): indicative plan claims "${claim}"`).not.toContain(claim);
-          expect(plan.badge).not.toBe(claim);
-        }
+        presentation?.no_flight_reason?.summary,
+        `D(${mode}): no flight AND no reason — that is the dead end`,
+      ).toBeTruthy();
+      // Nothing was compared, so nothing may claim a superlative.
+      for (const claim of ["cheapest", "fastest", "balanced"]) {
+        expect(plan.badges ?? [], `D(${mode}): flight-less plan claims "${claim}"`).not.toContain(claim);
+        expect(plan.badge).not.toBe(claim);
       }
       console.log(
         `D(${mode}):`,

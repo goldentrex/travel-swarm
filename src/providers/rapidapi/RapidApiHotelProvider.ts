@@ -218,13 +218,22 @@ export class RapidApiHotelProvider implements HotelProvider {
       ? (Array.isArray(body.result) ? body.result : Array.isArray(body.results) ? body.results : []) : [];
     const property = results.find(raw => isRecord(raw) && String(raw.hotel_id) === hotel.hotelId);
     const found = collectPolicyFields(property);
-    if (found.lateCheckIn === undefined || found.cancellationFee === undefined || found.currency === undefined) {
+    // Does the property still take an arrival at the hour we are asking about?
+    // Answered from its OWN stated window when it states one — a 21:30 arrival
+    // at a desk that closes at midnight is accepted, a 01:00 one is not.
+    const arrivalMinutes = arrivalMinutesIntoNight(checkIn);
+    const lateCheckIn =
+      found.lateCheckIn ??
+      (found.checkInUntilMinutes !== undefined && arrivalMinutes !== null
+        ? arrivalMinutes <= found.checkInUntilMinutes
+        : undefined);
+    if (lateCheckIn === undefined || found.cancellationFee === undefined || found.currency === undefined) {
       throw new RapidApiError({ kind: "invalid_response", code: "hotel_policy_unverified",
         message: "The requested hotel's late-arrival and cancellation terms could not be verified." });
     }
     return {
       hotelName: hotel.name,
-      lateCheckInAvailable: found.lateCheckIn,
+      lateCheckInAvailable: lateCheckIn,
       cancellationFee: found.cancellationFee,
       currency: found.currency,
       freeCancellationUntil: found.freeCancellationUntil,
@@ -296,14 +305,30 @@ export class RapidApiHotelProvider implements HotelProvider {
     const params = new URLSearchParams({ name: hotelName, locale: DEFAULT_LOCALE });
     const body = await this.request("GET", `/v1/hotels/locations?${params}`);
     const candidates = Array.isArray(body) ? body : [];
-    for (const raw of candidates) {
+    // The live endpoint answers with `dest_id` / `name` / `dest_type`, not
+    // `hotel_id` / `hotel_name`. Reading the wrong keys made `hotelId` fall
+    // back to the hotel's NAME, and the caller then looked for a property
+    // whose numeric `hotel_id` equalled "Hotel Gracery Shinjuku" — which
+    // nothing ever does. Every hotel assessment in a live battery of 42
+    // missions degraded on exactly that comparison.
+    //
+    // A name search also returns cities and regions, so a `hotel` entry is
+    // preferred; a lone non-hotel match is still better than nothing, but only
+    // after every real property has been considered.
+    const ordered = [
+      ...candidates.filter((raw) => isRecord(raw) && raw.dest_type === "hotel"),
+      ...candidates.filter((raw) => !isRecord(raw) || raw.dest_type !== "hotel"),
+    ];
+    for (const raw of ordered) {
       if (!isRecord(raw)) continue;
       const latitude = asFiniteNumber(raw.latitude);
       const longitude = asFiniteNumber(raw.longitude);
       if (latitude === null || longitude === null) continue;
+      const id = raw.hotel_id ?? raw.dest_id;
+      const label = raw.hotel_name ?? raw.name;
       return {
-        hotelId: String(raw.hotel_id ?? hotelName),
-        name: typeof raw.hotel_name === "string" ? raw.hotel_name : hotelName,
+        hotelId: String(id ?? hotelName),
+        name: typeof label === "string" && label.length > 0 ? label : hotelName,
         latitude,
         longitude,
       };
@@ -449,6 +474,42 @@ interface PolicyFields {
   cancellationFee?: number;
   currency?: string;
   freeCancellationUntil?: IsoTimestamp;
+  /**
+   * The LATEST minute-of-day the property still takes an arrival, as it states
+   * it (`checkin.until`). "00:00" means midnight — the END of the day — so it
+   * reads as 1440, not 0. Absent when the property states no cutoff, which is
+   * genuinely unknown and must stay unknown.
+   */
+  checkInUntilMinutes?: number;
+}
+
+/**
+ * How far into the HOTEL NIGHT an arrival falls, in minutes from that night's
+ * own start — which is what a reception desk actually counts.
+ *
+ * A 01:00 arrival is minute 60 of the calendar day but minute 1500 of the
+ * night before, and a desk that closes at midnight has long shut. Comparing
+ * bare minutes-of-day made 01:00 look earlier than 23:59 and let it through.
+ * The 06:00 pivot is the same one the settlement uses to decide whether a
+ * booked night went unused.
+ */
+const NIGHT_ROLLOVER_MINUTES = 6 * 60;
+function arrivalMinutesIntoNight(iso: string): number | null {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const minutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return minutes < NIGHT_ROLLOVER_MINUTES ? minutes + 1440 : minutes;
+}
+
+/** "23:30" → 1410. "00:00" is the END of the day (1440), never the start. */
+function checkInCutoffMinutes(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const minutes = Number(m[1]) * 60 + Number(m[2]);
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) return null;
+  return minutes === 0 ? 1440 : minutes;
 }
 
 /**
@@ -471,6 +532,15 @@ function collectPolicyFields(body: unknown, depth = 0): PolicyFields {
 
   const record = body as Record<string, unknown>;
   if (typeof record.late_check_in_available === "boolean") found.lateCheckIn = record.late_check_in_available;
+  // Booking.com never sends `late_check_in_available`. What it DOES send is
+  // the property's own stated arrival window, `checkin: {from, until}` — and
+  // reading it is the difference between a working hotel rail and one that
+  // degrades on every single mission, which is what a live battery of 42
+  // found. 16 of 20 real Tokyo properties state a cutoff; the other 4 leave it
+  // blank, and blank stays unknown rather than becoming a convenient "yes".
+  const checkinBlock = isRecord(record.checkin) ? record.checkin : null;
+  const cutoff = checkInCutoffMinutes(checkinBlock?.until);
+  if (cutoff !== null) found.checkInUntilMinutes = found.checkInUntilMinutes ?? cutoff;
   if (typeof record.free_cancellation_until === "string") {
     found.freeCancellationUntil = toIso(record.free_cancellation_until);
   }
@@ -479,7 +549,11 @@ function collectPolicyFields(body: unknown, depth = 0): PolicyFields {
   if (typeof record.currency_code === "string" && record.currency_code.length > 0) {
     found.currency = record.currency_code;
   }
-  if (typeof record.is_free_cancellable === "boolean" && record.is_free_cancellable) {
+  // `is_free_cancellable` arrives as 1/0, not true/false — every one of the 20
+  // live results carried a NUMBER, so the boolean-only test never fired and
+  // the fee stayed unknown alongside it.
+  const freeCancellable = record.is_free_cancellable;
+  if (freeCancellable === true || freeCancellable === 1) {
     found.cancellationFee = found.cancellationFee ?? 0;
   }
   for (const value of Object.values(record)) {
@@ -492,11 +566,13 @@ function collectPolicyFields(body: unknown, depth = 0): PolicyFields {
 
 function mergePolicyFields(target: PolicyFields, source: PolicyFields): void {
   target.lateCheckIn = target.lateCheckIn ?? source.lateCheckIn;
+  target.checkInUntilMinutes = target.checkInUntilMinutes ?? source.checkInUntilMinutes;
   target.cancellationFee = target.cancellationFee ?? source.cancellationFee;
   target.currency = target.currency ?? source.currency;
   target.freeCancellationUntil = target.freeCancellationUntil ?? source.freeCancellationUntil;
 }
 
 function isComplete(found: PolicyFields): boolean {
-  return found.lateCheckIn !== undefined && found.cancellationFee !== undefined && found.currency !== undefined;
+  const arrivalKnown = found.lateCheckIn !== undefined || found.checkInUntilMinutes !== undefined;
+  return arrivalKnown && found.cancellationFee !== undefined && found.currency !== undefined;
 }

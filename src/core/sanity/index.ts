@@ -1,11 +1,20 @@
 /** Barrel exports for the common-sense invariant layer. */
-export { AIRPORTS, airportInfo, crossesBorderControl } from "./airports";
+export {
+  AIRPORTS,
+  airportInfo,
+  EXCESSIVE_JOURNEY,
+  crossesBorderControl,
+  greatCircleKm,
+  journeyStretchFactor,
+  typicalBlockMinutes,
+} from "./airports";
 export type { AirportInfo } from "./airports";
 export {
   IMPORTANCE,
   SLEEP_WINDOW,
   DEFAULT_READY_IN_CITY_MINUTES,
   arrivalBuffer,
+  clampToWindowStart,
   classifyItem,
   describeDropReason,
   earliestAfterLanding,

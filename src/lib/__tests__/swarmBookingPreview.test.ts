@@ -13,8 +13,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const hotelSearch = vi.fn();
 const activitySearch = vi.fn();
+const flightSearch = vi.fn();
 const hotelConfigured = vi.fn(() => true);
 const activityConfigured = vi.fn(() => true);
+/** Atlas has no `*Configured()` helper — its constructor throws without a key,
+ *  so absence is expressed the way the real one expresses it. */
+const atlasConfigured = vi.fn(() => true);
 
 vi.mock("@/providers", () => ({
   RapidApiHotelProvider: class {
@@ -22,6 +26,12 @@ vi.mock("@/providers", () => ({
   },
   ViatorActivityProvider: class {
     searchActivities = activitySearch;
+  },
+  AtlasFlightProvider: class {
+    constructor() {
+      if (!atlasConfigured()) throw new Error("ATLAS_API_KEY is not set");
+    }
+    searchAlternativeFlights = flightSearch;
   },
   rapidApiHotelConfigured: () => hotelConfigured(),
   viatorEdgeConfigured: () => activityConfigured(),
@@ -231,5 +241,130 @@ describe("lines the swarm does not price at all", () => {
     expect(preview.lines.map((l) => l.priceSource)).toEqual(["trip_estimate", "trip_estimate"]);
     expect(hotelSearch).not.toHaveBeenCalled();
     expect(activitySearch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Flights, via Atlas.
+ *
+ * Atlas is an LCC-content API and its search is route-based: it answers with
+ * everything it sells on the route that day. A quote is only honest when one of
+ * those routings IS the planned flight, so these tests are mostly about the
+ * refusal — a fare for a different aircraft presented as this one's price is
+ * exactly what the comparator line already apologises for.
+ */
+describe("flights are quoted by Atlas, but only when Atlas sells THAT flight", () => {
+  /** A planned leg as the client sends it. */
+  function flight(extra: Record<string, unknown> = {}) {
+    return {
+      id: "leg-1",
+      kind: "transport" as const,
+      title: "Singapore → Tokyo",
+      origin: "SIN",
+      destination: "NRT",
+      carrier: "TR",
+      flightNumber: "TR874",
+      departDate: "2099-11-05",
+      estimate: 320,
+      currency: "EUR",
+      ...extra,
+    };
+  }
+
+  /** One Atlas routing, shaped like a FlightOption. */
+  function option(flightNumber: string, price: number) {
+    return {
+      id: `atlas-${flightNumber}`,
+      airline: "Scoot",
+      flightNumber,
+      origin: "SIN",
+      destination: "NRT",
+      departureTime: "2099-11-05T08:10:00Z",
+      arrivalTime: "2099-11-05T18:00:00Z",
+      price,
+      currency: "EUR",
+    };
+  }
+
+  beforeEach(() => {
+    atlasConfigured.mockReturnValue(true);
+    flightSearch.mockReset();
+  });
+
+  it("quotes the planned flight when Atlas sells it", async () => {
+    flightSearch.mockResolvedValue({ options: [option("TR894", 186.85), option("TR874", 289.93)] });
+
+    const { lines, providersUsed } = await buildBookingPreview([flight()], "EUR");
+
+    expect(lines[0]).toMatchObject({
+      priceSource: "live_provider",
+      provider: "Atlas",
+      price: 289.93,
+      currency: "EUR",
+      matchedName: "Scoot TR874",
+    });
+    expect(providersUsed).toContain("Atlas");
+  });
+
+  it("stays SILENT when Atlas flies the route but not this flight", async () => {
+    // The cheaper red-eye is on the route. Quoting it here would put another
+    // aircraft's fare under this traveler's flight.
+    flightSearch.mockResolvedValue({ options: [option("TR894", 186.85)] });
+
+    const [line] = (await buildBookingPreview([flight()], "EUR")).lines;
+
+    expect(line.priceSource).not.toBe("live_provider");
+    expect(line.price).toBe(320); // the trip's own figure, untouched
+    // No reason: the absence is what tells the client to overlay its comparator
+    // fare. A "could not be checked" note under a live fare would be a lie.
+    expect(line.unavailableReason).toBeUndefined();
+  });
+
+  it("does not echo the flight back when the row already says it", async () => {
+    // The checklist titles a flight row "Scoot TR 874". Repeating it as
+    // `matchedName` renders "planned: Scoot TR 874" under a row named the same.
+    flightSearch.mockResolvedValue({ options: [option("TR874", 314.45)] });
+    const [line] = (await buildBookingPreview([flight({ title: "Scoot TR 874" })], "EUR")).lines;
+    expect(line.provider).toBe("Atlas");
+    expect(line.matchedName).toBeUndefined();
+  });
+
+  it("matches a number that already carries its carrier prefix", async () => {
+    flightSearch.mockResolvedValue({ options: [option("TR874", 289.93)] });
+    const [line] = (await buildBookingPreview([flight({ carrier: undefined })], "EUR")).lines;
+    expect(line.provider).toBe("Atlas");
+  });
+
+  it("does not reach for Atlas without a route to search", async () => {
+    const [line] = (
+      await buildBookingPreview([flight({ origin: undefined, destination: undefined })], "EUR")
+    ).lines;
+    expect(flightSearch).not.toHaveBeenCalled();
+    expect(line.unavailableReason).toBeUndefined();
+  });
+
+  it("leaves trains and transfers alone", async () => {
+    const [line] = (
+      await buildBookingPreview(
+        [{ id: "nex", kind: "transport" as const, title: "Narita Express", estimate: 18, currency: "EUR" }],
+        "EUR",
+      )
+    ).lines;
+    expect(flightSearch).not.toHaveBeenCalled();
+    expect(line.price).toBe(18);
+  });
+
+  it("degrades silently when Atlas is unreachable", async () => {
+    flightSearch.mockRejectedValue(new Error("fetch failed"));
+    const [line] = (await buildBookingPreview([flight()], "EUR")).lines;
+    expect(line.priceSource).toBe("trip_estimate");
+    expect(line.unavailableReason).toBeUndefined();
+  });
+
+  it("runs at all when no Atlas key is configured", async () => {
+    atlasConfigured.mockReturnValue(false);
+    const [line] = (await buildBookingPreview([flight()], "EUR")).lines;
+    expect(flightSearch).not.toHaveBeenCalled();
+    expect(line.price).toBe(320);
   });
 });

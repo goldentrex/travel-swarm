@@ -54,9 +54,12 @@ import {
   unstayedNights,
   utcDayIndex,
 } from "@/core/sanity";
+import { VenueHours, decideFromHours } from "@/core/sanity";
+import type { VenueQuery } from "@/core/sanity";
 import type {
   CriticContext,
   CriticItem,
+  CriticRuling,
   CriticVerdict,
   SemanticCritic,
 } from "@/core/sanity";
@@ -114,6 +117,54 @@ export interface DisruptionEvent {
    * asked. Set only for those missions; everything else keeps the strict rule.
    */
   allowsActivityDrops?: boolean;
+  /**
+   * NEW — the traveller asked for TODAY to be lighter, not for one item to be
+   * pushed into tomorrow.
+   *
+   * `allowsActivityDrops` says a drop is permitted; this says what the mission
+   * is actually FOR. The distinction earns its place because the synthesis for
+   * a proactive user_report asks for a slot 24–48h out, which is right for "my
+   * tour was cancelled, find me another slot" and wrong for "I feel ill".
+   * Measured live on 2026-09-18, "I'm feeling unwell, lighten my day" moved
+   * exactly one activity to the following evening on all six trips: today was
+   * not lightened at all, and tomorrow — which may be a departure day — gained
+   * an item the traveller never asked for.
+   */
+  lightenDay?: boolean;
+  /**
+   * NEW — the problem is getting from A to B, and NOTHING about the bookings
+   * themselves has changed.
+   *
+   * A cancelled taxi does not change which flight you are on. Live on
+   * 2026-09-18, "My taxi to the airport is cancelled" landed on the next
+   * flight node, ran a full replacement search over six dates, found none, and
+   * headlined the plan "this route isn't covered by our flight partner yet, so
+   * this change has to be booked with the airline yourself" — a sentence about
+   * a rebooking the traveller never asked for, on a mission about a car.
+   *
+   * With this set the flight rail stands down. The ground rail answers, the
+   * itinerary is left alone, and the plan says the one thing that is true.
+   */
+  groundOnly?: boolean;
+  /**
+   * NEW — the traveller asked a QUESTION about the itinerary as booked.
+   * Nothing is late, nothing is broken, and no booking may change.
+   *
+   * "Is my connection too tight?" arrives as a 0-minute delay on the leg at
+   * risk, which the graph correctly treats as no impact at all — and the
+   * flight rail then went looking for a replacement anyway, because it was
+   * gated on "the source is a flight", not on "something is wrong with it".
+   * With a live provider that returns a seat, the re-drive shifted the day by
+   * the replacement's later arrival, priced a fare and a change fee, and put
+   * "Requires your approval" over a rebooking of a flight nobody had missed.
+   * Without one, the headline gained "this needs a manual booking". Both are
+   * answers to a question that was never asked.
+   *
+   * With this set every rail that could change a booking stands down. The
+   * answer lives in the presentation (the connection verdict), the itinerary
+   * is left exactly as it was, and the plan changes nothing.
+   */
+  adviceOnly?: boolean;
   /** NEW — provider evidence behind proactive alerts. */
   evidence?: {
     kind: "weather" | "event" | "user_report";
@@ -318,9 +369,21 @@ export function effectiveDelayMinutes(
 }
 
 async function geocodeCity(city: string): Promise<{ lat: number; lng: number } | null> {
+  // The STRUCTURED `city=` parameter is strict: it matches a bare city name
+  // and nothing else. A trip is titled by its destination, so what arrives
+  // here is "Rome, Italy", "London, United Kingdom", "Japan (Tokyo, Osaka,
+  // Kyoto)" — and every one of those returned nothing, silently. Measured
+  // live on 2026-09-18, only "Bali" resolved, 1 trip of 6.
+  //
+  // The free-form `q=` parameter is what a person would type, and the first
+  // segment of the name is the place: everything after a comma is the
+  // administrative tail the search does not need, and a parenthesis opens a
+  // list of cities rather than naming one.
+  const query = city.split(/[(,]/)[0].trim() || city.trim();
+  if (!query) return null;
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?city=${encodeURIComponent(city)}&format=json&limit=1`,
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`,
       {
         headers: { "User-Agent": "AIGlobePlanner-Hackathon/1.0" },
       },
@@ -336,6 +399,51 @@ async function geocodeCity(city: string): Promise<{ lat: number; lng: number } |
     // ignore
   }
   return null;
+}
+
+/**
+ * Where the mission actually is, for a provider that needs a point.
+ *
+ * The trip already knows. Its activities and its hotels carry the venue's own
+ * coordinates, hydrated from `content_json`, and the mission names one of
+ * them. Reading that costs no network, cannot fail on a decorated place name,
+ * and is the spot the traveller is standing on rather than a city centroid —
+ * which for "is it raining on this walk" is a better question answered.
+ *
+ * Order: the mission's own node, then the nearest other node in time that has
+ * coordinates (the same day's plans are the same weather), then geocoding the
+ * destination name as a last resort.
+ */
+async function missionCoordinates(
+  graph: ItineraryGraph,
+  nodeId: string,
+  city: string | undefined,
+): Promise<{ lat: number; lng: number } | null> {
+  const coordsOf = (node: ItineraryNode | undefined): { lat: number; lng: number } | null => {
+    if (!node) return null;
+    const point =
+      node.type === "activity" || node.type === "hotel_check_in" ? node.coordinates : undefined;
+    return point && Number.isFinite(point.lat) && Number.isFinite(point.lng) ? point : null;
+  };
+
+  const target = graph.getNode(nodeId);
+  const own = coordsOf(target);
+  if (own) return own;
+
+  const anchor = target?.scheduledTime ?? 0;
+  const nearest = graph
+    .getNodes()
+    .map((node) => ({ node, point: coordsOf(node) }))
+    .filter(
+      (entry): entry is { node: ItineraryNode; point: { lat: number; lng: number } } =>
+        entry.point !== null,
+    )
+    .sort(
+      (a, b) => Math.abs(a.node.scheduledTime - anchor) - Math.abs(b.node.scheduledTime - anchor),
+    )[0];
+  if (nearest) return nearest.point;
+
+  return city ? geocodeCity(city) : null;
 }
 
 /** Signed net fare impact of a rebooking candidate (charge positive, refund negative). */
@@ -421,7 +529,9 @@ export function noReplacementHeadline(reason: NoReplacementReason | undefined): 
  * needs told apart: a provider-verified fare, a search price nobody re-checked,
  * and an estimate nobody sold.
  */
-export function fareBasisOf(candidate: RebookingCandidate): "verified" | "search_reference" | "synthetic_estimate" {
+export function fareBasisOf(
+  candidate: RebookingCandidate,
+): "verified" | "search_reference" | "synthetic_estimate" {
   if (
     candidate.fareDifference.basis === "synthetic_estimate" ||
     candidate.option.inventorySource === "synthetic_recovery"
@@ -432,16 +542,25 @@ export function fareBasisOf(candidate: RebookingCandidate): "verified" | "search
   return "verified";
 }
 
-export function nonDominatedCandidates(candidates: RebookingCandidate[]): RebookingCandidate[] {
+export function nonDominatedCandidates(
+  candidates: RebookingCandidate[],
+  /**
+   * What a candidate costs. Defaults to the fare difference; the orchestrator
+   * passes fare PLUS the carrier's own change fee. Dominance decided on the
+   * fare alone can drop the option that is genuinely cheaper once the fee is
+   * counted — the same blind spot that badged a dearer plan "cheapest".
+   */
+  costOf: (candidate: RebookingCandidate) => number = candidateNetCharge,
+): RebookingCandidate[] {
   return candidates.filter((b) => {
-    const chargeB = candidateNetCharge(b);
+    const chargeB = costOf(b);
     const arrivalB = candidateArrivalMs(b);
     return !candidates.some((a) => {
       if (a === b) return false;
       if (a.fareDifference.currency !== b.fareDifference.currency) return false;
       // Next-day departures are never dominated by same-route earlier days.
       if (sameUtcDay(a.option.departureTime, b.option.departureTime) === false) return false;
-      const chargeA = candidateNetCharge(a);
+      const chargeA = costOf(a);
       const arrivalA = candidateArrivalMs(a);
       return (
         chargeA <= chargeB && arrivalA <= arrivalB && (chargeA < chargeB || arrivalA < arrivalB)
@@ -478,12 +597,24 @@ const BADGE_ORDER: ReadonlyArray<NonNullable<ResolutionPlan["badge"]>> = [
 export function applyConstraintsToCandidates(
   candidates: RebookingCandidate[],
   constraints?: ResolutionConstraints,
+  /**
+   * What one candidate COSTS, for ranking and for the budget ceiling.
+   *
+   * Defaults to the fare difference alone, which is all a caller without the
+   * fare rules can know. `resolveDisruptionMulti` passes the real number: the
+   * fare difference PLUS the change fee that candidate's own carrier
+   * publishes. Without it a plan can be labelled "cheapest" while costing the
+   * most — photographed 2026-09-20 with a €96.25 Scoot plan badged cheapest
+   * beside an AirAsia one that hands €1.65 BACK, because the €120 change fee
+   * was not in the comparison.
+   */
+  costOf: (candidate: RebookingCandidate) => number = candidateNetCharge,
 ): { candidates: RebookingCandidate[]; notes: string[] } {
   const notes: string[] = [];
   let pool = [...candidates];
   if (constraints?.max_price !== undefined && pool.length > 0) {
     const ceiling = constraints.max_price;
-    const within = pool.filter((candidate) => candidateNetCharge(candidate) <= ceiling);
+    const within = pool.filter((candidate) => costOf(candidate) <= ceiling);
     if (within.length === 0) {
       notes.push(`max_price ${ceiling} exceeded by every candidate — keeping the cheapest option`);
     } else if (within.length < pool.length) {
@@ -495,19 +626,27 @@ export function applyConstraintsToCandidates(
       pool = within;
     }
   }
+  // A PREFERENCE, not a filter. It used to drop every option with a stop, and
+  // on a route where one flight is direct that left the traveller with a
+  // single plan and no alternatives — they answered a question and lost their
+  // choices for it. `selectPlanCandidates` PINS the non-stop options to the
+  // front instead, which is what "prefer" has always meant for
+  // `prefer_same_day` and `prefer_earliest`; the rest stay offered behind it.
   if (
     (constraints?.prefer_direct === true || constraints?.prefer_nonstop === true) &&
     pool.length > 0
   ) {
     const direct = pool.filter(isDirectCandidate);
     if (direct.length > 0 && direct.length < pool.length) {
-      notes.push(`prefer_direct — kept ${direct.length} non-stop candidate(s)`);
-      pool = direct;
+      notes.push(
+        `prefer_direct — ${direct.length} non-stop candidate(s) come first, ` +
+          `${pool.length - direct.length} option(s) with a stop still offered`,
+      );
     }
   }
   // Pareto frontier BEFORE selection: an option that is costlier AND later
   // than another same-currency option is never offered.
-  const frontier = nonDominatedCandidates(pool);
+  const frontier = nonDominatedCandidates(pool, costOf);
   if (frontier.length < pool.length) {
     notes.push(
       `${pool.length - frontier.length} dominated option(s) filtered (costlier and later) — not offered`,
@@ -532,11 +671,13 @@ export function selectPlanCandidates(
   candidates: RebookingCandidate[],
   constraints?: ResolutionConstraints,
   anchorDepartureMs?: number,
+  /** See `applyConstraintsToCandidates` — the real cost of a candidate. */
+  costOf: (candidate: RebookingCandidate) => number = candidateNetCharge,
 ): { ordered: RebookingCandidate[]; notes: string[] } {
-  const { candidates: pool, notes } = applyConstraintsToCandidates(candidates, constraints);
+  const { candidates: pool, notes } = applyConstraintsToCandidates(candidates, constraints, costOf);
   const base = [...pool].sort(
     (a, b) =>
-      candidateNetCharge(a) - candidateNetCharge(b) ||
+      costOf(a) - costOf(b) ||
       candidateArrivalMs(a) - candidateArrivalMs(b) ||
       a.option.id.localeCompare(b.option.id),
   );
@@ -583,9 +724,7 @@ export function selectPlanCandidates(
   if (excessive.length > 0 && excessive.length < base.length) {
     const sane = base.filter((c) => !excessive.includes(c));
     ordered = [...sane, ...excessive];
-    const worst = excessive
-      .map((c) => ({ c, f: stretchOf(c) ?? 0 }))
-      .sort((a, b) => b.f - a.f)[0];
+    const worst = excessive.map((c) => ({ c, f: stretchOf(c) ?? 0 })).sort((a, b) => b.f - a.f)[0];
     notes.push(
       `${excessive.length} option(s) take over ${EXCESSIVE_JOURNEY}× the normal flying time ` +
         `(worst: ${worst.c.option.flightNumber ?? worst.c.option.id} at ${worst.f.toFixed(1)}×) — ` +
@@ -658,6 +797,13 @@ export class OrchestratorAgent {
      * every offline test and CI run exercises.
      */
     private readonly semanticCritic: SemanticCritic | null = null,
+    /**
+     * The venue schedules (additive, optional). This is the one source that
+     * can say CATEGORICALLY whether a door is open at a re-planned slot —
+     * Google's published weekly hours, cached, compared by arithmetic. Absent
+     * ⇒ nothing is ever decided from opening hours, exactly as before.
+     */
+    private readonly venueHours: VenueHours | null = null,
   ) {}
 
   // Task 20 — rederive context captured by runDisruptionPipeline: the
@@ -667,6 +813,25 @@ export class OrchestratorAgent {
   private redriveBaseline: ItineraryGraph | null = null;
   private redriveEvent: DisruptionEvent | null = null;
   private redriveNominalMinutes: number | null = null;
+
+  /**
+   * "How far ahead of my flight am I changing it", anchored on the BOOKED
+   * departure, and the flight the change applies to. Captured once per
+   * mission so every per-plan policy read uses the same basis.
+   */
+  private policyDepartureBasisMs: number | null = null;
+  private policySourceFlightId: string | null = null;
+  /**
+   * One policy read per replacement offer, keyed by the offer's own id.
+   *
+   * The carousel asks for a verdict once per PLAN, and several plans often
+   * settle on the same flight; the fare rule is the offer's own and cannot
+   * change between two reads of it.
+   */
+  private readonly policyVerdictByOption = new Map<string, FarePolicyVerdict | null>();
+
+  /** Nodes whose slot the venue's own schedule decided this resolve. */
+  private hoursDecided = new Set<string>();
 
   /** Every criticism acted on during the last resolve, for the session trace. */
   private criticVerdicts: CriticVerdict[] = [];
@@ -688,6 +853,23 @@ export class OrchestratorAgent {
    */
   async resolveDisruption(event: DisruptionEvent): Promise<OrchestrationOutcome> {
     const pipeline = await this.runDisruptionPipeline(event);
+    this.criticVerdicts = [];
+    this.criticNightsUnstayed = new Map();
+    this.hoursDecided = new Set();
+    // The legacy single-plan rail gets the SAME review as the carousel when no
+    // replacement was found. A guardrail test pins the two byte-identical
+    // there, and it is right to: a safety review that only one rail performs
+    // is a rail that ships unreviewed plans.
+    if (
+      (pipeline.rebookingAssessment?.bestCandidate ?? null) === null &&
+      pipeline.activityProposals.length > 0
+    ) {
+      pipeline.activityProposals = await this.critiqueWithoutArrival(
+        pipeline.activityProposals,
+        event,
+        [],
+      );
+    }
     const plan = this.assembleResolutionPlan(
       event,
       pipeline,
@@ -767,6 +949,7 @@ export class OrchestratorAgent {
     const trace: string[] = [];
     this.criticVerdicts = [];
     this.criticNightsUnstayed = new Map();
+    this.hoursDecided = new Set();
     // ONE timestamp for every plan assembled below: the per-plan TTL stamps
     // must be identical so the canonical-JSON dedup can collapse profiles
     // that select the same candidate (a ticking millisecond clock between
@@ -776,7 +959,17 @@ export class OrchestratorAgent {
     // ── Hotel constraint: drop booking-preserving adjustments on request ──
     let hotelAdjustments = pipeline.hotelAdjustments;
     if (constraints?.keep_hotel === false && hotelAdjustments.length > 0) {
-      const kept = hotelAdjustments.filter((adjustment) => adjustment.action === "rebook");
+      // Drop what PRESERVES the booking — not what explains it.
+      //
+      // The filter used to keep only `rebook`, which silently deleted the one
+      // row an overbooked traveller needs: "we could not find a comparable
+      // room, ask the property to rehouse you". That row preserves nothing; it
+      // is the answer. Live on 2026-09-18 the traveller answered "don't keep
+      // the hotel", and the plan came back with no mention of the hotel at all
+      // on a mission that was entirely about the hotel.
+      const kept = hotelAdjustments.filter(
+        (adjustment) => adjustment.action === "rebook" || adjustment.requires_confirmation === true,
+      );
       const dropped = hotelAdjustments.length - kept.length;
       if (dropped > 0) {
         trace.push(`keep_hotel=false — dropped ${dropped} booking-preserving hotel adjustment(s)`);
@@ -791,9 +984,23 @@ export class OrchestratorAgent {
     const rawCandidates = pipeline.rebookingAssessment
       ? [...pipeline.rebookingAssessment.candidates]
       : [];
+    // What each candidate really costs — fare difference AND the change fee
+    // its own carrier publishes — converted to one currency so options quoted
+    // in different money can be compared at all. Resolved BEFORE the Pareto
+    // filter, because dominance judged on the fare alone drops the option
+    // that is cheaper once the fee is counted, and it then never reaches the
+    // carousel to be ranked or badged. The policy read is memoised per offer,
+    // so the plans assembled below reuse these very verdicts.
+    const costByCandidate = new Map<RebookingCandidate, number>();
+    for (const candidate of rawCandidates) {
+      costByCandidate.set(candidate, await this.candidateCostEur(candidate, event));
+    }
+    const costOf = (candidate: RebookingCandidate) =>
+      costByCandidate.get(candidate) ?? candidateNetCharge(candidate);
     const { candidates: constrained, notes: filterNotes } = applyConstraintsToCandidates(
       rawCandidates,
       constraints,
+      costOf,
     );
     trace.push(...filterNotes);
 
@@ -844,6 +1051,7 @@ export class OrchestratorAgent {
         candidates,
         constraints,
         pipeline.originalDepartureMs,
+        costOf,
       );
       trace.push(...notes);
       // Tag derivation (frozen badge order): cheapest = unique min net,
@@ -853,14 +1061,14 @@ export class OrchestratorAgent {
       // the honest no-tag fallback.
       const byNet = [...ordered].sort(
         (a, b) =>
-          candidateNetCharge(a) - candidateNetCharge(b) ||
+          costOf(a) - costOf(b) ||
           candidateArrivalMs(a) - candidateArrivalMs(b) ||
           a.option.id.localeCompare(b.option.id),
       );
       const byArrival = [...ordered].sort(
         (a, b) =>
           candidateArrivalMs(a) - candidateArrivalMs(b) ||
-          candidateNetCharge(a) - candidateNetCharge(b) ||
+          costOf(a) - costOf(b) ||
           a.option.id.localeCompare(b.option.id),
       );
       const cheapest = byNet[0];
@@ -923,11 +1131,40 @@ export class OrchestratorAgent {
         //    amount the traveller sees is computed by the deterministic engine
         //    from the post-critique itinerary. Nothing downstream of this
         //    point asks the model anything.
+        proposals = await this.applyVenueHours(
+          proposals,
+          this.redriveBaseline ?? this.graph,
+          trace,
+        );
         proposals = await this.applySemanticCritique(candidate, proposals, trace);
         rederivedByArrival.set(arrivalIso, proposals);
       }
       return proposals;
     };
+
+    // ── The critic on a mission with NO replacement flight ────────────────
+    // Runs BEFORE assembly, because a verdict reached afterwards is a verdict
+    // thrown away: the first wiring reviewed the proposals once the plans were
+    // already built, so a live mission traced
+    // "UNREALISTIC_TRANSIT — Kabukicho & Omoide Yokocho Stroll dropped"
+    // while the plan it shipped still carried that stroll, rescheduled to
+    // 08:00. The trace said one thing and the traveller got another.
+    //
+    // The per-candidate hook covers plans that HAVE a replacement flight. This
+    // covers the rest: weather, hotel and cancelled-activity missions, and a
+    // flight mission whose provider returned nothing at all.
+    if ((!rederiveActive || candidates.length === 0) && pipeline.activityProposals.length > 0) {
+      pipeline.activityProposals = await this.applyVenueHours(
+        pipeline.activityProposals,
+        this.redriveBaseline ?? this.graph,
+        trace,
+      );
+      pipeline.activityProposals = await this.critiqueWithoutArrival(
+        pipeline.activityProposals,
+        event,
+        trace,
+      );
+    }
 
     // ── Assembly + canonical dedup (badge stamped AFTER the comparison so
     //    two profiles picking the identical resolution collapse — the dedup
@@ -952,11 +1189,15 @@ export class OrchestratorAgent {
       // Task 25 (#1): thread THIS selection's own per-arrival proposal set
       // into the plan body (undefined ⇒ the shared pipeline set, unchanged).
       const selectionProposals = await proposalsForCandidate(chosen);
+      // THIS plan's flight, THIS plan's fare rule. Sharing one verdict across
+      // the carousel put a VietJet change fee, in VND, on an AirAsia plan.
+      const selectionVerdict = await this.policyVerdictForCandidate(chosen, event);
       const plan = this.assembleResolutionPlan(event, pipeline, chosen, {
         hotelAdjustments: this.discloseUnstayedNights(hotelAdjustments, chosen),
         includeTransferRequote,
         stampMs: now,
         ...(selectionProposals !== undefined ? { activityProposals: selectionProposals } : {}),
+        ...(selectionVerdict !== null ? { policyVerdict: selectionVerdict } : {}),
       });
       if (!validateResolutionPlan(plan)) {
         trace.push(`${badge} plan failed Trust Layer validation — dropped`);
@@ -1057,24 +1298,6 @@ export class OrchestratorAgent {
         planActivityProposals.push(pipeline.activityProposals);
       }
     }
-    // ── The critic on a mission with NO replacement flight ────────────────
-    // The per-candidate hook above only fires when a flight rederive ran, so
-    // weather, hotel and cancelled-activity missions never reached the critic
-    // at all — 36 of 42 on a live battery. Those are precisely the missions
-    // where knowing what a place IS decides the answer, so the shared walk is
-    // reviewed here instead, with no arrival to measure against.
-    // The condition is "the critic has not spoken yet", not "there was no
-    // flight rail": a flight mission whose provider returned NO candidates
-    // runs the per-candidate hook zero times, so it fell between the two and
-    // 6 of 42 live missions kept slipping through with real activity moves
-    // nobody reviewed.
-    if (this.criticVerdicts.length === 0 && pipeline.activityProposals.length > 0) {
-      const reviewed = await this.critiqueWithoutArrival(pipeline.activityProposals, event, trace);
-      if (reviewed !== pipeline.activityProposals) {
-        for (let i = 0; i < planActivityProposals.length; i += 1) planActivityProposals[i] = reviewed;
-      }
-    }
-
     // Shared field stays plan-0's set for back-compat.
     const sharedActivityProposals = planActivityProposals[0] ?? pipeline.activityProposals;
 
@@ -1168,7 +1391,11 @@ export class OrchestratorAgent {
       source && source.type === "flight" ? source.arrivalTime : undefined;
     let policyVerdict: FarePolicyVerdict | null = null;
     let rebookingAssessment: FlightRebookingAssessment | null = null;
-    if (source && source.type === "flight") {
+    // `groundOnly`: the flight is fine, the way to reach it is not. Searching
+    // for a replacement seat here produces an answer to a question nobody
+    // asked, and its "no coverage" explanation then headlines the plan.
+    // `adviceOnly`: the same, for a question about the itinerary as booked.
+    if (source && source.type === "flight" && !event.groundOnly && !event.adviceOnly) {
       if (this.policyAgent) {
         policyVerdict = await this.policyAgent.assessFarePolicy({
           originalFlightId: source.id,
@@ -1286,47 +1513,14 @@ export class OrchestratorAgent {
           // Anchored on the ORIGINAL departure: "how far ahead of my flight am
           // I changing it" is measured against the booked time, not the time
           // the simulated delay pushed the node to.
-          const realRule = rebookingAssessment?.bestCandidate?.option.fareRule;
-          if (this.policyAgent && realRule && Object.keys(realRule).length > 0) {
-            const departureBasis = originalDepartureTime ?? source.departureTime;
-            policyVerdict = await this.policyAgent.assessFarePolicy({
-              originalFlightId: source.id,
-              rule: realRule,
-              minutesToDeparture: Math.max(
-                0,
-                Math.round((departureBasis - Date.now()) / 60_000),
-              ),
-              disruptionKind: classifyDisruptionKind(event.description),
-              // One currency in the money panel: the fee follows the ticket it
-              // applies to whenever the rule itself names none.
-              fallbackCurrency: rebookingAssessment?.bestCandidate?.option.currency,
-            });
-            if (policyVerdict) {
-              policyVerdict.ruleSource = "provider_published";
-              // One currency in the money panel. A carrier may publish its
-              // rules in its own currency (VietJet quotes VND against a USD
-              // fare, which put "+VND 1100000" beside "$5.39" in one ledger).
-              // Convert through the SAME EUR rate table the timeline, budget
-              // and PDF use — never a rate invented here — and keep what the
-              // carrier will actually bill alongside it.
-              const fareCurrency = rebookingAssessment?.bestCandidate?.option.currency;
-              if (
-                fareCurrency &&
-                policyVerdict.changeFee > 0 &&
-                policyVerdict.currency !== fareCurrency
-              ) {
-                const from = rateFromEurOf(policyVerdict.currency as Currency);
-                const to = rateFromEurOf(fareCurrency as Currency);
-                if (from > 0 && to > 0) {
-                  policyVerdict.billedChangeFee = policyVerdict.changeFee;
-                  policyVerdict.billedCurrency = policyVerdict.currency;
-                  policyVerdict.changeFee =
-                    Math.round(((policyVerdict.changeFee / from) * to + Number.EPSILON) * 100) / 100;
-                  policyVerdict.currency = fareCurrency;
-                }
-              }
-            }
-          }
+          const departureBasis = originalDepartureTime ?? source.departureTime;
+          this.policyDepartureBasisMs = departureBasis;
+          this.policySourceFlightId = source.id;
+          policyVerdict =
+            (await this.policyVerdictForCandidate(
+              rebookingAssessment?.bestCandidate ?? null,
+              event,
+            )) ?? policyVerdict;
 
           // Spatial constraint: if the replacement flight arrives at a DIFFERENT
           // location than the original booking, re-run the propagation with the
@@ -1411,7 +1605,7 @@ export class OrchestratorAgent {
     // 3) Hotel protection + activity rescheduling run in PARALLEL — the two
     //    specialist fan-outs are independent (both read-only over the graph).
     const [hotelAdjustments, activityProposals] = await Promise.all([
-      this.assessHotels(disruption, event.description),
+      this.assessHotels(disruption, event.description, event.tripContext?.currency),
       this.proposeActivityRescheduling(
         disruption,
         event,
@@ -1494,7 +1688,11 @@ export class OrchestratorAgent {
 
     const verdict = this.semanticCritic
       ? await this.semanticCritic.review(context)
-      : { is_sane: true, criticisms: deterministicCriticisms(context), source: "deterministic" as const };
+      : {
+          is_sane: true,
+          criticisms: deterministicCriticisms(context),
+          source: "deterministic" as const,
+        };
     const settled: CriticVerdict = {
       ...verdict,
       is_sane: verdict.criticisms.length === 0,
@@ -1522,29 +1720,212 @@ export class OrchestratorAgent {
       }
     }
 
-    const critiqued = proposals.map((proposal) => {
+    return this.applyCriticRulings(proposals, rulings, this.redriveBaseline ?? this.graph, trace);
+  }
+
+  /**
+   * Check every proposed slot against the venue's own published schedule, and
+   * enact what it says.
+   *
+   * This runs BEFORE the critic and outranks it: a schedule is a fact, and the
+   * model is an opinion about the world. Where the hours answer, nobody needs
+   * to be asked. Where they do not — an unresolved venue, a name that matched
+   * the wrong entity — nothing is decided from them and the item stands.
+   *
+   * TOTAL: any failure leaves every proposal untouched.
+   */
+  private async applyVenueHours(
+    proposals: ActivityRescheduleProposal[],
+    graph: ItineraryGraph,
+    trace: string[],
+  ): Promise<ActivityRescheduleProposal[]> {
+    if (!this.venueHours || proposals.length === 0) return proposals;
+
+    const queries: VenueQuery[] = [];
+    for (const proposal of proposals) {
+      if (proposal.action === "drop" || proposal.action === "swap") continue;
+      const node = graph.getNode(proposal.activityNodeId);
+      if (!node || node.type !== "activity" || !node.coordinates) continue;
+      const atMs = Date.parse(proposal.newTime);
+      if (!Number.isFinite(atMs)) continue;
+      queries.push({
+        nodeId: proposal.activityNodeId,
+        name: proposal.activityName ?? node.name,
+        lat: node.coordinates.lat,
+        lng: node.coordinates.lng,
+        atIso: new Date(atMs).toISOString(),
+      });
+    }
+    if (queries.length === 0) return proposals;
+
+    const verdicts = await this.venueHours.lookup(queries);
+    if (verdicts.size === 0) return proposals;
+
+    return proposals.map((proposal) => {
+      const node = graph.getNode(proposal.activityNodeId);
+      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
+      const slotMs = Date.parse(proposal.newTime);
+      if (!Number.isFinite(slotMs)) return proposal;
+      const outcome = decideFromHours(verdicts.get(proposal.activityNodeId), name, slotMs);
+      switch (outcome.action) {
+        case "keep":
+          // Open at the proposed hour: the schedule has spoken for it too.
+          if (verdicts.get(proposal.activityNodeId)?.openAtSlot === true) {
+            this.hoursDecided.add(proposal.activityNodeId);
+          }
+          return proposal;
+        case "move": {
+          this.hoursDecided.add(proposal.activityNodeId);
+          trace.push(
+            `hours: ${name} → ${new Date(outcome.atMs).toISOString().slice(11, 16)} (the venue opens then)`,
+          );
+          return {
+            ...proposal,
+            newTime: new Date(outcome.atMs).toISOString(),
+            rationale: outcome.reason,
+          };
+        }
+        case "drop":
+          trace.push(`hours: ${name} cancelled — the venue's own schedule says it is shut`);
+          return { ...proposal, action: "drop" as const, rationale: outcome.reason };
+        case "flag":
+          // The hours are real but may describe the place next door. The
+          // traveller keeps the booking and is told what we checked.
+          trace.push(`hours: ${name} — checked a nearby venue, left as booked`);
+          return { ...proposal, rationale: outcome.reason };
+      }
+    });
+  }
+
+  /**
+   * What the critic is shown: the RESULTING DAY, not just the engine's edits.
+   *
+   * It used to see only the items the engine proposed to move — which are
+   * exactly the items the deterministic rules already have an opinion about.
+   * Measured across three live batteries: the model returned 3 findings in 14
+   * consultations and every one of them was about a node the rules had already
+   * ruled, so the merge dropped it and the model added nothing. It was being
+   * handed a set of solved cases and asked to contribute.
+   *
+   * The absurdity only a model can catch is the item nobody touched — a
+   * nightlife stroll left at 10:00 because nothing displaced it. So every
+   * activity sharing a calendar day with the re-plan is included, whether the
+   * engine moved it or not.
+   */
+  private buildDayItems(
+    proposals: ActivityRescheduleProposal[],
+    graph: ItineraryGraph,
+    extraDayMs: number[] = [],
+  ): CriticItem[] {
+    const items: CriticItem[] = [];
+    const covered = new Set<string>();
+    const days = new Set<number>(extraDayMs.map(utcDayIndex));
+
+    for (const proposal of proposals) {
+      if (proposal.action === "drop") continue;
+      const node = graph.getNode(proposal.activityNodeId);
+      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
+      if (!name) continue;
+      const atMs = Date.parse(proposal.newTime);
+      if (Number.isFinite(atMs)) days.add(utcDayIndex(atMs));
+      covered.add(proposal.activityNodeId);
+      items.push({
+        node_id: proposal.activityNodeId,
+        name,
+        proposed_start: proposal.newTime,
+        ...(node ? { original_start: new Date(node.scheduledTime).toISOString() } : {}),
+        category: criticCategoryOf("activity", name),
+        ...(this.hoursDecided.has(proposal.activityNodeId) ? { hoursVerified: true } : {}),
+      });
+    }
+
+    // …and everything else standing on those same days, untouched.
+    for (const node of graph.getNodes()) {
+      if (node.type !== "activity" || covered.has(node.id)) continue;
+      if (!days.has(utcDayIndex(node.scheduledTime))) continue;
+      const iso = new Date(node.scheduledTime).toISOString();
+      items.push({
+        node_id: node.id,
+        name: node.name,
+        proposed_start: iso,
+        original_start: iso,
+        category: criticCategoryOf("activity", node.name),
+        untouched: true,
+      });
+    }
+    return items;
+  }
+
+  /**
+   * Enact the critic's rulings. A ruling on an item the engine never moved
+   * becomes a NEW proposal — that is the whole point of showing it the day.
+   *
+   * Such a proposal carries penalty 0, because no agent ever quoted terms for
+   * an item nobody intended to touch. That is honest rather than convenient:
+   * the settlement still archives the cancellation and, when the item was
+   * paid, still raises the refund to claim.
+   */
+  private applyCriticRulings(
+    proposals: ActivityRescheduleProposal[],
+    rulings: Map<string, CriticRuling>,
+    graph: ItineraryGraph,
+    trace: string[],
+  ): ActivityRescheduleProposal[] {
+    const label = (id: string) =>
+      graph.getNode(id)?.type === "activity" ? (graph.getNode(id) as ActivityNode).name : id;
+    const applied = proposals.map((proposal) => {
       const ruling = rulings.get(proposal.activityNodeId);
       if (!ruling || proposal.action === "swap") return proposal;
       if (ruling.action === "drop") {
-        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} dropped`);
-        return {
-          ...proposal,
-          action: "drop" as const,
-          // Frozen shape: a drop keeps the original slot as its newTime, and
-          // its penalty, so the ledger is recomputed from unchanged terms.
-          newTime: proposal.newTime,
-          rationale: ruling.reason,
-        };
+        trace.push(
+          `critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} dropped`,
+        );
+        return { ...proposal, action: "drop" as const, rationale: ruling.reason };
       }
       if (ruling.action === "retime") {
         const iso = new Date(ruling.atMs).toISOString();
         if (iso === proposal.newTime) return proposal;
-        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} re-timed`);
+        trace.push(
+          `critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} re-timed`,
+        );
         return { ...proposal, newTime: iso, rationale: ruling.reason };
       }
       return proposal;
     });
-    return critiqued;
+
+    const known = new Set(proposals.map((p) => p.activityNodeId));
+    for (const [nodeId, ruling] of rulings) {
+      if (known.has(nodeId)) continue;
+      const node = graph.getNode(nodeId);
+      if (!node || node.type !== "activity") continue;
+      if (ruling.action === "shift_date") continue;
+      const name = label(nodeId);
+      if (ruling.action === "drop") {
+        trace.push(`critic: ${ruling.issue} — ${name} dropped (untouched by the re-plan)`);
+        applied.push({
+          activityNodeId: nodeId,
+          activityName: name,
+          action: "drop",
+          newTime: new Date(node.scheduledTime).toISOString(),
+          penalty: 0,
+          currency: "EUR",
+          rationale: ruling.reason,
+        } as ActivityRescheduleProposal);
+        continue;
+      }
+      const iso = new Date(ruling.atMs).toISOString();
+      trace.push(`critic: ${ruling.issue} — ${name} re-timed (untouched by the re-plan)`);
+      applied.push({
+        activityNodeId: nodeId,
+        activityName: name,
+        action: "reschedule",
+        newTime: iso,
+        penalty: 0,
+        currency: "EUR",
+        rationale: ruling.reason,
+      } as ActivityRescheduleProposal);
+    }
+    return applied;
   }
 
   /**
@@ -1561,24 +1942,38 @@ export class OrchestratorAgent {
     trace: string[],
   ): Promise<ActivityRescheduleProposal[]> {
     const graph = this.redriveBaseline ?? this.graph;
-    const items: CriticItem[] = [];
-    for (const proposal of proposals) {
-      if (proposal.action === "drop") continue;
-      const node = graph.getNode(proposal.activityNodeId);
-      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
-      if (!name) continue;
-      items.push({
-        node_id: proposal.activityNodeId,
-        name,
-        proposed_start: proposal.newTime,
-        ...(node ? { original_start: new Date(node.scheduledTime).toISOString() } : {}),
-        category: criticCategoryOf("activity", name),
-      });
-    }
+    const items = this.buildDayItems(proposals, graph);
     if (items.length === 0) return proposals;
+
+    // A delayed flight with no rebooking still HAS an arrival — it is simply
+    // later. Supplying it is what lets the "this could only happen on another
+    // day" rule fire honestly, while a weather or activity mission (no flight
+    // source) rightly has none, so a deliberate move to tomorrow stands.
+    const source = this.graph.getNode(event.nodeId);
+    let arrival: CriticContext["arrival"];
+    if (source && source.type === "flight" && Number.isFinite(source.arrivalTime)) {
+      const { readyForPickupMs, readyInCityMs } = arrivalWindows(
+        source.origin,
+        source.destination,
+        source.arrivalTime,
+      );
+      const booked = this.redriveBaseline?.getNode(event.nodeId);
+      const bookedArrivalMs =
+        booked && booked.type === "flight" ? booked.arrivalTime : source.arrivalTime;
+      arrival = {
+        ...(source.origin ? { origin: source.origin } : {}),
+        ...(source.destination ? { airport: source.destination } : {}),
+        iso: new Date(source.arrivalTime).toISOString(),
+        ready_in_city_iso: new Date(readyInCityMs).toISOString(),
+        ready_for_pickup_iso: new Date(readyForPickupMs).toISOString(),
+        is_next_day: utcDayIndex(source.arrivalTime) > utcDayIndex(bookedArrivalMs),
+        original_arrival_iso: new Date(bookedArrivalMs).toISOString(),
+      };
+    }
 
     const context: CriticContext = {
       incident: event.description ?? "Disrupted trip",
+      ...(arrival ? { arrival } : {}),
       items,
     };
     const verdict = this.semanticCritic
@@ -1593,21 +1988,7 @@ export class OrchestratorAgent {
     if (settled.criticisms.length === 0) return proposals;
 
     const rulings = rulingsFor(settled, context);
-    return proposals.map((proposal) => {
-      const ruling = rulings.get(proposal.activityNodeId);
-      if (!ruling || proposal.action === "swap") return proposal;
-      if (ruling.action === "drop") {
-        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} dropped`);
-        return { ...proposal, action: "drop" as const, rationale: ruling.reason };
-      }
-      if (ruling.action === "retime") {
-        const iso = new Date(ruling.atMs).toISOString();
-        if (iso === proposal.newTime) return proposal;
-        trace.push(`critic: ${ruling.issue} — ${proposal.activityName ?? proposal.activityNodeId} re-timed`);
-        return { ...proposal, newTime: iso, rationale: ruling.reason };
-      }
-      return proposal;
-    });
+    return this.applyCriticRulings(proposals, rulings, graph, trace);
   }
 
   /**
@@ -1638,20 +2019,9 @@ export class OrchestratorAgent {
       arrivalMs,
     );
 
-    const items: CriticItem[] = [];
-    for (const proposal of proposals) {
-      if (proposal.action === "drop") continue;
-      const node = baseline.getNode(proposal.activityNodeId);
-      const name = proposal.activityName ?? (node && node.type === "activity" ? node.name : "");
-      if (!name) continue;
-      items.push({
-        node_id: proposal.activityNodeId,
-        name,
-        proposed_start: proposal.newTime,
-        ...(node ? { original_start: new Date(node.scheduledTime).toISOString() } : {}),
-        category: criticCategoryOf("activity", name),
-      });
-    }
+    // The arrival day is included even when nothing on it was moved: that is
+    // where an untouched absurdity is most likely to sit.
+    const items = this.buildDayItems(proposals, baseline, [arrivalMs]);
 
     // The hotel the traveller is heading to: its BOOKED check-in, and the one
     // this candidate implies (the arrival-floor rule — a room is reached when
@@ -1678,7 +2048,8 @@ export class OrchestratorAgent {
         ready_in_city_iso: new Date(readyInCityMs).toISOString(),
         ready_for_pickup_iso: new Date(readyForPickupMs).toISOString(),
         is_next_day:
-          Number.isFinite(originalArrivalMs) && utcDayIndex(arrivalMs) > utcDayIndex(originalArrivalMs),
+          Number.isFinite(originalArrivalMs) &&
+          utcDayIndex(arrivalMs) > utcDayIndex(originalArrivalMs),
         ...(Number.isFinite(originalArrivalMs)
           ? { original_arrival_iso: new Date(originalArrivalMs).toISOString() }
           : {}),
@@ -1702,7 +2073,9 @@ export class OrchestratorAgent {
     const nights = this.criticNightsUnstayed.get(chosen.option.arrivalTime);
     if (nights === undefined || nights <= 0) return adjustments;
     return adjustments.map((adjustment) =>
-      adjustment.action === "late_check_in" ? { ...adjustment, nights_unstayed: nights } : adjustment,
+      adjustment.action === "late_check_in"
+        ? { ...adjustment, nights_unstayed: nights }
+        : adjustment,
     );
   }
 
@@ -1813,6 +2186,96 @@ export class OrchestratorAgent {
   }
 
   /**
+   * The fare policy for ONE replacement offer — the offer this plan proposes,
+   * never another plan's.
+   *
+   * WHY THIS IS PER CANDIDATE. The verdict used to be computed once, from the
+   * pipeline's single cheapest candidate, and then stamped onto every plan in
+   * the carousel. Verified against the live Atlas sandbox on 2026-09-19 for
+   * SIN→HND: the AirAsia routings via KUL publish their rules in MYR/SGD, and
+   * the VietJet routings via SGN publish theirs in VND. Ranking by price alone
+   * made a €46 VietJet routing the pipeline's best candidate, so the AirAsia
+   * plan the traveller was reading carried VietJet's VND 1 100 000 change fee.
+   * The money panel described a flight that plan does not book.
+   *
+   * Returns null when there is nothing better than the caller's existing
+   * verdict: no policy agent, no candidate, or an offer carrying no rule.
+   */
+  private async policyVerdictForCandidate(
+    candidate: RebookingCandidate | null,
+    event: DisruptionEvent,
+  ): Promise<FarePolicyVerdict | null> {
+    const rule = candidate?.option.fareRule;
+    const flightId = this.policySourceFlightId;
+    if (!this.policyAgent || !candidate || !flightId) return null;
+    if (!rule || Object.keys(rule).length === 0) return null;
+
+    const cached = this.policyVerdictByOption.get(candidate.option.id);
+    if (cached !== undefined) return cached;
+
+    const departureBasis = this.policyDepartureBasisMs ?? Date.now();
+    const verdict = await this.policyAgent.assessFarePolicy({
+      originalFlightId: flightId,
+      rule,
+      minutesToDeparture: Math.max(0, Math.round((departureBasis - Date.now()) / 60_000)),
+      disruptionKind: classifyDisruptionKind(event.description),
+      // One currency in the money panel: the fee follows the ticket it
+      // applies to whenever the rule itself names none.
+      fallbackCurrency: candidate.option.currency,
+    });
+    if (verdict) {
+      verdict.ruleSource = "provider_published";
+      // A carrier may publish its rules in its own currency. Convert through
+      // the SAME EUR rate table the timeline, budget and PDF use — never a
+      // rate invented here — and keep what the carrier will actually bill
+      // alongside it.
+      const fareCurrency = candidate.option.currency;
+      if (fareCurrency && verdict.changeFee > 0 && verdict.currency !== fareCurrency) {
+        const from = rateFromEurOf(verdict.currency as Currency);
+        const to = rateFromEurOf(fareCurrency as Currency);
+        if (from > 0 && to > 0) {
+          verdict.billedChangeFee = verdict.changeFee;
+          verdict.billedCurrency = verdict.currency;
+          verdict.changeFee =
+            Math.round(((verdict.changeFee / from) * to + Number.EPSILON) * 100) / 100;
+          verdict.currency = fareCurrency;
+        }
+      }
+    }
+    this.policyVerdictByOption.set(candidate.option.id, verdict);
+    return verdict;
+  }
+
+  /**
+   * What one candidate costs the traveller, in EUR — everything they pay to
+   * take it, not just the fare.
+   *
+   * The fare difference is only half the bill: changing a ticket also costs
+   * whatever the carrier's own rule charges, and that fee is per offer. A
+   * badge derived from the fare alone called a €96.25 plan "cheapest" beside
+   * one that hands €1.65 back, because the €120 change fee sat outside the
+   * comparison. EUR is the common ground: two candidates may be quoted in
+   * different currencies, and unranked is not an option when one of them has
+   * to be called the cheapest.
+   */
+  private async candidateCostEur(
+    candidate: RebookingCandidate,
+    event: DisruptionEvent,
+  ): Promise<number> {
+    const toEur = (amount: number, currency: string | undefined): number => {
+      const rate = rateFromEurOf((currency ?? "EUR") as Currency);
+      return rate > 0 ? amount / rate : amount;
+    };
+    const fare = toEur(candidateNetCharge(candidate), candidate.fareDifference.currency);
+    const verdict = await this.policyVerdictForCandidate(candidate, event);
+    const fee =
+      verdict && verdict.changeFee > 0
+        ? toEur(verdict.changeFee, verdict.currency ?? candidate.option.currency)
+        : 0;
+    return fare + fee;
+  }
+
+  /**
    * Assemble ONE deterministic TrustLayer plan around a SELECTED rebooking
    * candidate (legacy rail passes the cheapest bestCandidate; the multi-plan
    * rail passes the per-profile pick). Financial delta, TTL and the transfer
@@ -1857,6 +2320,13 @@ export class OrchestratorAgent {
        * shared `pipeline.activityProposals`, exactly as pre-fix.
        */
       activityProposals?: ActivityRescheduleProposal[];
+      /**
+       * The fare policy of THIS plan's own replacement offer. Absent ⇒ the
+       * shared pipeline verdict (legacy rail, or an offer that publishes no
+       * rule). See `policyVerdictForCandidate` for why a carousel must not
+       * share one: the fee and the currency belong to a specific flight.
+       */
+      policyVerdict?: FarePolicyVerdict | null;
     },
   ): ResolutionPlan {
     const spatialTransferReport = options.includeTransferRequote
@@ -1865,17 +2335,22 @@ export class OrchestratorAgent {
     // Task 25 (#1): body derives from the per-selection proposal set when
     // supplied, otherwise from the shared pipeline walk.
     const activityProposals = options.activityProposals ?? pipeline.activityProposals;
+    // This plan's own flight policy when the caller resolved one; the shared
+    // pipeline verdict otherwise. `undefined` means "not supplied"; an
+    // explicit `null` is a caller saying there is no verdict for this plan.
+    const policyVerdict =
+      options.policyVerdict !== undefined ? options.policyVerdict : pipeline.policyVerdict;
 
     const proposedResolution = this.buildProposedResolution(event, chosen, {
       hotelAdjustments: options.hotelAdjustments,
       activityProposals,
-      policyVerdict: pipeline.policyVerdict,
+      policyVerdict,
       spatialTransferReport,
     });
     const financialDelta = this.buildFinancialDelta(
       chosen,
       {
-        policyVerdict: pipeline.policyVerdict,
+        policyVerdict,
         hotelAdjustments: options.hotelAdjustments,
         activityProposals,
         rebooked: chosen !== null,
@@ -1951,8 +2426,32 @@ export class OrchestratorAgent {
   private async assessHotels(
     disruption: DisruptionResult,
     intentDesc: string,
+    /** The trip's own currency, so a replacement room is quoted in it. */
+    tripCurrency?: string,
   ): Promise<HotelAdjustment[]> {
-    if (!this.hotelAgent) return [];
+    const roomIsGone = /overbook/i.test(intentDesc);
+    if (!this.hotelAgent) {
+      // Silence is an answer here, and the wrong one. An overbooked traveller
+      // has no bed tonight; returning an empty list produced a plan that
+      // never mentioned the hotel at all, on the one mission that is
+      // ENTIRELY about the hotel. Say plainly that we could not look.
+      const source = this.graph.getNode(disruption.sourceNodeId);
+      if (roomIsGone && source && source.type === "hotel_check_in") {
+        return [
+          {
+            hotel_name: (source as HotelCheckInNode).hotelName,
+            action: "none",
+            fee: 0,
+            requires_confirmation: true,
+            note:
+              "The property says your room is gone, and we cannot search for a replacement right now. " +
+              "Your other bookings are untouched. Ask the property to rehouse you — they owe you a " +
+              "comparable room at their expense when they walk a confirmed booking.",
+          },
+        ];
+      }
+      return [];
+    }
     const reports = [...disruption.affected];
     const sourceNode = this.graph.getNode(disruption.sourceNodeId);
     if (
@@ -1978,8 +2477,7 @@ export class OrchestratorAgent {
       if (!node || node.type !== "hotel_check_in") continue;
       const hotelNode = node as HotelCheckInNode;
       const shiftedMs = report.newScheduledTime ?? hotelNode.scheduledTime;
-      const isOverbooked =
-        report.nodeId === disruption.sourceNodeId && /overbook/i.test(intentDesc);
+      const isOverbooked = report.nodeId === disruption.sourceNodeId && roomIsGone;
       const assessment = await this.hotelAgent.assessHotelImpact({
         hotelNodeId: hotelNode.id,
         hotelName: hotelNode.hotelName,
@@ -1987,6 +2485,8 @@ export class OrchestratorAgent {
         shiftedCheckIn: new Date(shiftedMs).toISOString(),
         guests: 1,
         isOverbooked: isOverbooked,
+        // Quote a replacement room in the money the rest of the plan uses.
+        ...(tripCurrency ? { currency: tripCurrency } : {}),
       });
       // Additive (Phase B): surface the best alternative room (when the
       // provider found one) as display-only presentation feed.
@@ -2093,7 +2593,8 @@ export class OrchestratorAgent {
       // Two floors, in order: the traveller cannot be there before they land,
       // and an item cannot start before the hour it makes sense at (a night
       // view is not a 16:00 item). Both RAISE the slot; neither drops it.
-      const landedMs = readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
+      const landedMs =
+        readyInCityMs !== undefined ? Math.max(proposedMs, readyInCityMs) : proposedMs;
       const atMs = clampToWindowStart(
         classifyItem({ type: "activity", title: name }),
         name,
@@ -2141,7 +2642,9 @@ export class OrchestratorAgent {
           }`,
         };
       }
-      return atMs === proposedMs ? proposal : { ...proposal, newTime: new Date(atMs).toISOString() };
+      return atMs === proposedMs
+        ? proposal
+        : { ...proposal, newTime: new Date(atMs).toISOString() };
     });
   }
 
@@ -2159,6 +2662,18 @@ export class OrchestratorAgent {
     graph: ItineraryGraph = this.graph,
   ): Promise<ActivityRescheduleProposal[]> {
     if (!this.activityAgent) return [];
+    // A broken connection does not reshuffle the itinerary.
+    //
+    // Live on 2026-09-18, "Transit strike tomorrow" produced a correct ground
+    // plan AND moved one restaurant to the following evening — for a strike
+    // that is itself tomorrow. We cannot verify the strike, cannot know which
+    // lines it closes, and therefore cannot say which items become
+    // unreachable. Moving one at random is a guess wearing the clothes of a
+    // plan. The ground card answers the question; the itinerary stands.
+    //
+    // A question about the itinerary as booked (`adviceOnly`) stands the rail
+    // down for the same reason: nothing has moved, so nothing may be moved.
+    if (event.groundOnly || event.adviceOnly) return [];
     const requests = disruption.affected
       .filter(({ action }) => action === "requires_rescheduling")
       .flatMap((report) => {
@@ -2206,38 +2721,79 @@ export class OrchestratorAgent {
     let finalWeatherHint = weatherHintFromEvent(event);
     let eventTitle = event.description;
 
-    // Actually check OpenWeather and PredictHQ if this is a proactive simulation
-    if (event.origin === "proactive") {
-      const city = event.tripContext?.city;
-      if (city) {
-        const coords = await geocodeCity(city);
-        if (coords) {
-          if (event.evidence?.kind === "weather" && this.weatherProvider) {
-            const forecast = await this.weatherProvider.getRainForecast(coords.lat, coords.lng, 48);
-            if (forecast.windows.length === 0) {
-              // No rain expected in reality!
-              eventTitle = `Real weather checked for ${city}: clear skies!`;
-              return []; // Empty requests means no adjustments
-            } else {
-              eventTitle = `Confirmed rain in ${city}: adapting itinerary`;
-              finalWeatherHint = "rain";
-            }
-          } else if (event.evidence?.kind === "event" && this.eventProvider) {
-            // It's a strike/event alert, check PredictHQ
-            const events = await this.eventProvider.findDisruptiveEvents({
-              latitude: coords.lat,
-              longitude: coords.lng,
-              radiusKm: 25,
-              from: new Date().toISOString(),
-              to: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
-            });
-            if (events.events.length === 0) {
-              eventTitle = `Real event check for ${city}: no disruptions found!`;
-              return [];
-            } else {
-              eventTitle = `Confirmed disruption: ${events.events[0].name}`;
-            }
-          }
+    // Corroborate what the traveller told us, and never pretend we did.
+    //
+    // These providers only ever CONFIRM a report. If the check cannot run we
+    // proceed on the traveller's word — but the plan must SAY so, and that is
+    // where this was wrong. The disclosure used to be written only when the
+    // provider was reached and failed. Every earlier exit, a missing city, a
+    // geocode that found nothing, no provider configured, fell through
+    // silently and left the headline asserting "Weather alert — Rome, Italy"
+    // as an established fact. Measured live on 2026-09-18: 1 of 6 weather
+    // missions disclosed, 5 claimed. A plausible claim with no source is the
+    // defect this engine exists to refuse, so the disclosure is now the
+    // DEFAULT and a confirmation has to be earned.
+    if (event.origin === "proactive" && event.evidence !== undefined) {
+      const place = event.tripContext?.city ?? "your destination";
+      const coords = await missionCoordinates(graph, event.nodeId, event.tripContext?.city);
+
+      if (event.evidence.kind === "weather") {
+        const forecast =
+          coords && this.weatherProvider
+            ? await this.weatherProvider
+                .getRainForecast(coords.lat, coords.lng, 48)
+                .catch((error: unknown) => {
+                  console.warn(
+                    "[orchestrator] weather check unavailable — taking the traveller's word:",
+                    error,
+                  );
+                  return null;
+                })
+            : null;
+        // A forecast that stops before the window asked about is not an
+        // answer. Reporting it as clear skies would invent the one thing the
+        // traveller would act on.
+        const usable = forecast !== null && forecast.coversHorizon !== false;
+        if (!usable) {
+          eventTitle = `Weather reported in ${place} (not independently confirmed)`;
+          finalWeatherHint = "rain";
+        } else if (forecast.windows.length === 0) {
+          // Checked, and dry. The finding has to reach the plan BEFORE the
+          // early return, or the traveller reads "Weather alert — Rome" over
+          // a plan that changes nothing, which is the one case where we know
+          // the answer and keep it to ourselves.
+          event.description = `Real weather checked for ${place}: clear skies!`;
+          return []; // Empty requests means no adjustments
+        } else {
+          eventTitle = `Confirmed rain in ${place}: adapting itinerary`;
+          finalWeatherHint = "rain";
+        }
+      } else if (event.evidence.kind === "event") {
+        const found =
+          coords && this.eventProvider
+            ? await this.eventProvider
+                .findDisruptiveEvents({
+                  latitude: coords.lat,
+                  longitude: coords.lng,
+                  radiusKm: 25,
+                  from: new Date().toISOString(),
+                  to: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+                })
+                .catch((error: unknown) => {
+                  console.warn(
+                    "[orchestrator] event check unavailable — taking the traveller's word:",
+                    error,
+                  );
+                  return null;
+                })
+            : null;
+        if (found === null) {
+          eventTitle = `Disruption reported in ${place} (not independently confirmed)`;
+        } else if (found.events.length === 0) {
+          event.description = `Real event check for ${place}: no disruptions found!`;
+          return [];
+        } else {
+          eventTitle = `Confirmed disruption: ${found.events[0].name}`;
         }
       }
     }
@@ -2251,6 +2807,47 @@ export class OrchestratorAgent {
     // a request so the ActivityAgent produces real retime/swap proposals.
     const isProactiveUserReport =
       event.origin === "proactive" && event.evidence?.kind === "user_report";
+
+    // "Lighten my day" is about a DAY, so the whole day is put on the table.
+    // One request per activity, all with a window inside that same day, which
+    // is what routes them to the DayReorganizer as a single unit — and that
+    // rail, with `allowsActivityDrops`, is the only one that can actually
+    // REMOVE something rather than shuffle it into tomorrow.
+    if (event.lightenDay) {
+      const target = graph.getNode(event.nodeId);
+      if (target) {
+        const day = new Date(target.scheduledTime).toISOString().slice(0, 10);
+        const sameDay = graph
+          .getNodes()
+          .filter(
+            (node): node is ActivityNode =>
+              node.type === "activity" &&
+              new Date(node.scheduledTime).toISOString().slice(0, 10) === day,
+          )
+          .sort((a, b) => a.scheduledTime - b.scheduledTime);
+        for (const activityNode of sameDay) {
+          if (targetAlreadyRequested(activityNode.id)) continue;
+          requests.push({
+            activityNodeId: activityNode.id,
+            activityName: activityNode.name,
+            originalTime: new Date(activityNode.scheduledTime).toISOString(),
+            // Inside the SAME calendar day, on purpose: a cross-day window is
+            // routed to the per-item legacy rail, which can only move things.
+            windowStart: `${day}T06:00:00.000Z`,
+            windowEnd: `${day}T23:00:00.000Z`,
+            // Being unwell is not weather: no indoor-swap hint, so the
+            // reorganizer trims the day instead of substituting venues.
+            weatherHint: undefined,
+            location: event.tripContext?.city,
+            currency: event.tripContext?.currency,
+          });
+        }
+      }
+      // No early return: these flow into the SAME dispatch as every other
+      // request below, so a lightened day is reorganized, validated and
+      // costed by exactly the machinery that handles a missed flight.
+    }
+
     if (
       !targetAlreadyRequested(event.nodeId) &&
       ((event.origin === "proactive" && event.evidence?.kind === "weather") ||

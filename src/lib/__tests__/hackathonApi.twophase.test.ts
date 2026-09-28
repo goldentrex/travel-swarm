@@ -244,16 +244,17 @@ describe("POST /mission/assess — phase 1", () => {
     expect(body.error).toBe("trip_required");
   });
 
-  it("free-text without a known category lands on the custom catch-all (200, not 400)", async () => {
+  it("free-text we do not understand is refused before a session is opened", async () => {
+    // Refusing at the door matters twice over: the traveller is not answered
+    // wrongly, and no session, no Gemini call and no provider search is spent
+    // on a sentence nobody can act on.
     const response = await handleHackathonRequest(
       post("mission/assess", { intent: "tell me a joke", tripId: REAL_TRIP_UUID }),
     );
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as AssessBody;
-    expect(body.status).toBe("gathering_preferences");
-    const session = store.__sessions.get(body.resolution_id);
-    const candidates = session?.candidates as Record<string, unknown>;
-    expect(String(candidates.incident)).toMatch(/^Custom request for Lisbon/);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toBe("out_of_scope");
+    expect(store.__sessions.size).toBe(0);
   });
 });
 

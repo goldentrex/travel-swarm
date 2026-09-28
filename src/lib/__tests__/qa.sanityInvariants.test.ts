@@ -453,6 +453,8 @@ describe("the orchestrator never shows an absurd reschedule", () => {
  */
 describe("a replacement flight that lands the NEXT DAY", () => {
   const BOOKED = "2026-11-05";
+  const BOOKED_FLIGHTLESS = "2026-11-05";
+  const LANDS_FLIGHTLESS = "2026-11-06";
   const LANDS = "2026-11-06";
 
   beforeEach(() => {
@@ -589,6 +591,81 @@ describe("a replacement flight that lands the NEXT DAY", () => {
     expect(shrine?.action).toBe("drop");
     // …and the reason is the real one, not a schedule artefact.
     expect(shrine?.reason ?? "").toMatch(/another day|its own plan/i);
+  });
+
+  it("a criticism the trace reports is a criticism the PLAN carries", async () => {
+    // Live run 2026-09-17: the flight-less rail ran the critic AFTER the plans
+    // were assembled, so a mission traced
+    //   "UNREALISTIC_TRANSIT — Shinjuku Kabukicho & Omoide Yokocho Stroll dropped"
+    // and shipped a plan that still carried that stroll, rescheduled to 08:00.
+    // A verdict reached after assembly is a verdict thrown away.
+    const graph = new ItineraryGraph();
+    graph.addNode({
+      id: "flight-0",
+      type: "flight",
+      flightNumber: "NH844",
+      origin: "SIN",
+      destination: "HND",
+      departureTime: Date.parse(`${BOOKED_FLIGHTLESS}T08:00:00Z`),
+      arrivalTime: Date.parse(`${BOOKED_FLIGHTLESS}T16:00:00Z`),
+      scheduledTime: Date.parse(`${BOOKED_FLIGHTLESS}T08:00:00Z`),
+      status: "on_track",
+      dependsOn: [],
+      arrivalLocationId: "HND",
+    });
+    graph.addNode({
+      id: "activity-stroll",
+      type: "activity",
+      name: "Shinjuku Kabukicho & Omoide Yokocho Stroll",
+      durationMinutes: 90,
+      scheduledTime: Date.parse(`${BOOKED_FLIGHTLESS}T20:00:00Z`),
+      status: "on_track",
+      dependsOn: ["flight-0"],
+    });
+
+    // No flight agent at all: this is the rail that had no critic coverage.
+    const activityAgent = {
+      proposeRescheduling: async (
+        requests: Array<{ activityNodeId: string; activityName: string }>,
+      ) =>
+        requests.map(
+          (request): ActivityRescheduleProposal => ({
+            activityNodeId: request.activityNodeId,
+            activityName: request.activityName,
+            action: "reschedule",
+            // The naive answer: the NEXT day, which the rules forbid.
+            newTime: `${LANDS_FLIGHTLESS}T08:00:00.000Z`,
+            penalty: 0,
+            currency: "JPY",
+          }),
+        ),
+    } as unknown as ActivityAgent;
+
+    const orchestrator = new OrchestratorAgent(
+      graph,
+      null,
+      null,
+      null,
+      activityAgent,
+      null,
+      null,
+      null,
+      new SemanticCritic({ apiKey: "" }),
+    );
+    // No flight agent ⇒ no candidates ⇒ the flight-less rail, which is the one
+    // whose critic verdicts were being discarded.
+    const { plans } = await orchestrator.resolveDisruptionMulti({
+      nodeId: "flight-0",
+      delay: 8 * 60,
+      description: "Flight NH844 delayed",
+    });
+
+    const stroll = plans[0].proposed_resolution.rescheduled_activities.find((a) =>
+      a.name.includes("Kabukicho"),
+    );
+    // Whatever the critic decided, the PLAN says the same thing.
+    expect(stroll?.action).toBe("drop");
+    expect(orchestrator.lastCriticVerdicts.length).toBeGreaterThan(0);
   });
 
   it("states the booked night that will not be used, without inventing what it costs", async () => {

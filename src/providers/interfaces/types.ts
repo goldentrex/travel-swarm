@@ -335,7 +335,16 @@ export interface RainForecastResult {
   longitude: number;
   /** Rain windows inside the requested horizon, ordered by start time. */
   windows: RainWindow[];
-  /** Provenance string, e.g. "openweathermap:onecall-3.0". */
+  /**
+   * Did the published forecast actually reach the end of the requested
+   * horizon? Absent means the provider does not report it.
+   *
+   * `windows: []` alone is ambiguous — "we looked and it is dry" and "the
+   * forecast stops before the window you asked about" are not the same fact,
+   * and only the first one may be shown to a traveller as clear skies.
+   */
+  coversHorizon?: boolean;
+  /** Provenance string, e.g. "openweathermap:forecast-2.5". */
   source: string;
 }
 

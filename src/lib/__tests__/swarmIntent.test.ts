@@ -13,6 +13,8 @@
 
 import { describe, expect, it } from "vitest";
 import { hydrateTripFromContent } from "../swarmTripContext";
+import { isGroundMission } from "@/core/ground";
+import type { TripMissionCategory } from "@/lib/swarmIntent";
 import { parseMissionIntentForTrip } from "../swarmIntent";
 
 // ----------------------------------------------------------------- fixture
@@ -141,10 +143,12 @@ describe("parseMissionIntentForTrip — custom free-text branch", () => {
     if (parsed.kind !== "mission") return;
     expect(parsed.mission.kind).toBe("custom");
     expect(parsed.mission.origin).toBe("reactive");
-    expect(parsed.mission.description).toContain("Custom request for");
-    // The custom fallback targets the first UPCOMING node of the trip
-    // (tomorrow's inbound flight in this fixture).
-    expect(parsed.mission.nodeId).toBe("flight-0");
+    expect(parsed.mission.description).toContain("Custom request");
+    // NEVER a flight. Branch 2 owns flight problems, so anything reaching the
+    // custom gate is not one — and putting a flight node on this rail is what
+    // turned "my suitcase didn't arrive" into three rebooking proposals at
+    // 2,306,617 IDR against the live Worker on 2026-09-18.
+    expect(parsed.mission.nodeId).toBe("transfer-2");
   });
 
   it('committed E2E phrase #2: "Custom request:" prefix → custom', () => {
@@ -156,17 +160,24 @@ describe("parseMissionIntentForTrip — custom free-text branch", () => {
     if (parsed.kind !== "mission") return;
     expect(parsed.mission.kind).toBe("custom");
     expect(parsed.mission.origin).toBe("reactive");
-    expect(parsed.mission.nodeId).toBe("flight-0");
+    expect(parsed.mission.nodeId).not.toMatch(/^flight-/);
   });
 
-  it("a literal node id in the text also triggers the custom gate", () => {
+  it("a node id WITH an action passes the gate", () => {
     // A transfer id is the only kind that reaches the gate unscathed:
     // flight-/hotel-/activity-prefixed ids double as branch keywords and
     // would be claimed by branches 2/3/4 first.
-    const parsed = parseMissionIntentForTrip("please look at transfer-2", hydrateFixture());
+    const parsed = parseMissionIntentForTrip("please move transfer-2", hydrateFixture());
     expect(parsed.kind).toBe("mission");
     if (parsed.kind !== "mission") return;
     expect(parsed.mission.kind).toBe("custom");
+  });
+
+  it("a node id with NO action does not", () => {
+    // "Look at this" states a target and no intent. Guessing what to do with
+    // it is how a sentence the parser did not understand became a plan.
+    const parsed = parseMissionIntentForTrip("please look at transfer-2", hydrateFixture());
+    expect(parsed).toMatchObject({ kind: "error", status: 400, code: "out_of_scope" });
   });
 });
 
@@ -257,35 +268,75 @@ describe("a missed flight is recognised in the languages the app ships", () => {
 });
 
 describe("parseMissionIntentForTrip — vague text is rejected", () => {
-  it("vague chatter yields custom fallback", () => {
+  it("vague chatter is refused, and says what we DO handle", () => {
     const parsed = parseMissionIntentForTrip("something is off", hydrateFixture());
-    expect(parsed).toMatchObject({
-      kind: "mission",
-      mission: {
-        kind: "custom",
-      },
-    });
+    expect(parsed).toMatchObject({ kind: "error", status: 400, code: "out_of_scope" });
+    if (parsed.kind !== "error") return;
+    expect(parsed.message).toMatch(/missed or delayed flights/i);
   });
 
   it("an imperative without a plausible trip target is still rejected", () => {
     // Unlike "Change the hotel", "Change the vibe" misses the target keyword;
     // the custom gate requires BOTH halves of the explicit signal.
     const parsed = parseMissionIntentForTrip("change the vibe", hydrateFixture());
-    expect(parsed).toMatchObject({ kind: "mission", mission: { kind: "custom" } });
+    expect(parsed).toMatchObject({ kind: "error", status: 400, code: "out_of_scope" });
+  });
+
+  it("refuses the real sentences that produced confident nonsense", () => {
+    // All three were accepted and answered by the deployed Worker on
+    // 2026-09-18. The last one proposed three flight rebookings.
+    for (const text of [
+      "help",
+      "what's the wifi password at my hotel",
+      "my suitcase didn't arrive",
+    ]) {
+      expect(parseMissionIntentForTrip(text, hydrateFixture())).toMatchObject({
+        kind: "error",
+        code: "out_of_scope",
+      });
+    }
   });
 });
 
 // ----------------------------------------------- strike & unwell (WS4)
 
 describe("parseMissionIntentForTrip — strike branch", () => {
-  it("keeps reactive transfer targeting (with the parsed delay) when a transfer exists", () => {
+  it("targets the transfer reactively, and invents no delay for it", () => {
     const parsed = parseMissionIntentForTrip("trains are on strike in Lisbon", hydrateFixture());
     expect(parsed.kind).toBe("mission");
     if (parsed.kind !== "mission") return;
     expect(parsed.mission.kind).toBe("strike");
     expect(parsed.mission.origin).toBe("reactive");
     expect(parsed.mission.nodeId).toBe("transfer-2");
-    expect(parsed.mission.delayMinutes).toBe(240); // default, unchanged
+    // A strike is not "your transfer is four hours late". Nobody said how
+    // late anything is, so nothing is late: the four-hour default belongs to
+    // a missed flight and to nothing else.
+    expect(parsed.mission.delayMinutes).toBe(0);
+  });
+
+  it("honours a delay the traveller actually states", () => {
+    const parsed = parseMissionIntentForTrip(
+      "trains are on strike in Lisbon, everything is running 2 hours behind",
+      hydrateFixture(),
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.delayMinutes).toBe(120);
+  });
+
+  it("never answers a local transit strike by delaying a long-haul flight", () => {
+    // Live on 2026-09-18, "Transit strike tomorrow" on a trip with no ground
+    // transfer landed on Flight SQ 366 SIN → FCO, delayed it four hours, and
+    // announced "you are not in town until about 14:20" — moving three
+    // activities on a causal link that does not exist.
+    const parsed = parseMissionIntentForTrip(
+      "Transit strike tomorrow",
+      hydrateStayFixture({ withActivity: true }),
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.origin).toBe("proactive");
+    expect(parsed.mission.delayMinutes).toBe(0);
   });
 
   it("targets the first upcoming activity (proactive user_report, delay 0) when no transit node exists", () => {
@@ -361,6 +412,45 @@ describe("parseMissionIntentForTrip — a flight-less trip is not a flight probl
     if (parsed.kind === "mission") {
       expect(parsed.mission.kind).toBe("hotel_overbooked");
     }
+  });
+
+  it("a broken ride to the airport is not read as a cancelled activity", () => {
+    // Live on 2026-09-18 this matched the activity branch on the word
+    // "cancelled", picked "Kansai Airport Departure & Duty-Free" because the
+    // names shared the word "airport", and moved the traveller's duty-free
+    // shopping to the next afternoon. They had asked how to reach the airport.
+    const parsed = parseMissionIntentForTrip(
+      "My taxi to the airport is cancelled, what do I do",
+      hydrateFixture(),
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).not.toBe("activity_cancelled");
+    // And nothing is declared late: no ride was ever said to be running late.
+    expect(parsed.mission.delayMinutes).toBe(0);
+  });
+
+  it("targets the ground leg itself when the trip has one", () => {
+    // So the ground rail answers about the journey that actually broke,
+    // rather than about whatever is next on the calendar.
+    const parsed = parseMissionIntentForTrip("my transfer never showed up", hydrateFixture());
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.nodeId).toMatch(/^transfer-/);
+    expect(parsed.mission.delayMinutes).toBe(0);
+    // Short and derived, never the traveller's own sentence: this string is
+    // the approval sheet's heading, and at accessibility text size the echoed
+    // question filled six bold lines and pushed the answer off the screen.
+    expect(parsed.mission.description).toBe("Your ride is gone");
+    // And it still passes its OWN gate — every check downstream reads it.
+    expect(isGroundMission(parsed.mission.description)).toBe(true);
+  });
+
+  it("leaves strikes to the strike branch, which carries their evidence", () => {
+    const parsed = parseMissionIntentForTrip("trains are on strike in Lisbon", hydrateFixture());
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).toBe("strike");
   });
 
   it("a strike that 'delayed' everything is not answered with 'no flights to reroute'", () => {
@@ -529,3 +619,137 @@ describe("parseMissionIntentForTrip — explicit-node branch classifies like the
   });
 });
 
+
+describe("a mission heading is short enough to leave room for the plan", () => {
+  // It becomes the approval sheet's heading. Photographed at accessibility
+  // text size on 2026-09-18, the traveller's own sentence appended to it
+  // filled six bold lines and pushed the plan entirely below the fold.
+  const LONG = "my hotel is overbooked and honestly this whole trip is going wrong, what do I do now";
+
+  it("never echoes the traveller's sentence back at them", () => {
+    for (const text of [
+      LONG,
+      "heavy rain forecast tomorrow, adapt my outdoor plans please",
+      "my activity got cancelled, the tour operator just called me",
+      "there is a transit strike tomorrow across the whole city",
+      "I'm feeling unwell, lighten my day if you can",
+    ]) {
+      const parsed = parseMissionIntentForTrip(text, hydrateFixture());
+      if (parsed.kind !== "mission") continue;
+      expect(parsed.mission.description.length).toBeLessThan(70);
+      expect(parsed.mission.description).not.toContain("what do I do");
+    }
+  });
+
+  it("keeps the words the pipeline itself reads", () => {
+    // The orchestrator sniffs `/overbook/i` to know the room is gone, and
+    // `classifyDisruptionKind` reads the heading for a cancellation. A
+    // shorter heading that drops them silently breaks both.
+    const overbooked = parseMissionIntentForTrip(LONG, hydrateFixture());
+    expect(overbooked.kind).toBe("mission");
+    if (overbooked.kind !== "mission") return;
+    expect(overbooked.mission.description).toMatch(/overbook/i);
+    expect(overbooked.mission.kind).toBe("hotel_overbooked");
+
+    const cancelled = parseMissionIntentForTrip("my activity got cancelled", hydrateFixture());
+    if (cancelled.kind !== "mission") return;
+    expect(cancelled.mission.description).toMatch(/cancel/i);
+  });
+});
+
+describe("the five languages the app actually ships", () => {
+  // Measured against the deployed Worker on 2026-09-18: six of nine French,
+  // Spanish and German sentences were refused outright, four of them for
+  // problems the swarm handles perfectly well. Only the flight branch had
+  // ever been translated.
+  const CASES: Array<[string, TripMissionCategory]> = [
+    ["mon hôtel est surbooké", "hotel_overbooked"],
+    ["mi hotel está sobrevendido", "hotel_overbooked"],
+    ["mein Hotel ist überbucht", "hotel_overbooked"],
+    ["mon activité a été annulée", "activity_cancelled"],
+    ["mi actividad ha sido cancelada", "activity_cancelled"],
+    ["il y a une grève des transports demain", "strike"],
+    ["hay huelga de transporte mañana", "strike"],
+    ["es gibt morgen einen Streik", "strike"],
+    ["je ne me sens pas bien, allège ma journée", "unwell"],
+    ["me siento enfermo, aligera mi día", "unwell"],
+    ["ich bin krank, entlaste meinen Tag", "unwell"],
+    ["il va pleuvoir demain, adapte mes plans", "weather"],
+    ["va a llover mañana", "weather"],
+    ["es wird morgen regnen", "weather"],
+  ];
+
+  for (const [text, expected] of CASES) {
+    it(`"${text}" → ${expected}`, () => {
+      const parsed = parseMissionIntentForTrip(text, hydrateFixture());
+      expect(parsed.kind).toBe("mission");
+      if (parsed.kind !== "mission") return;
+      expect(parsed.mission.kind).toBe(expected);
+    });
+  }
+
+  it("an overbooking in any language still carries the marker the engine reads", () => {
+    // The orchestrator sniffs `/overbook/i` on the DESCRIPTION to know the
+    // room is gone. A localised heading that dropped it would silently turn
+    // every non-English overbooking back into a late check-in.
+    for (const text of [
+      "mon hôtel est surbooké",
+      "mi hotel está sobrevendido",
+      "mein Hotel ist überbucht",
+    ]) {
+      const parsed = parseMissionIntentForTrip(text, hydrateFixture());
+      if (parsed.kind !== "mission") throw new Error(`${text} was refused`);
+      expect(parsed.mission.description).toMatch(/overbook/i);
+    }
+  });
+});
+
+describe("an airline schedule change is a stated fact, not a default", () => {
+  // Verified on the deployed Worker on 2026-09-18: "the airline moved my
+  // flight to 6am, that's impossible" produced "Delayed flight SQ634" with a
+  // four-hour delay nobody had mentioned, and cancelled three activities off
+  // the back of it. The airline had given a time; we invented another.
+
+  it("uses the stated time when the flight moved LATER", () => {
+    const parsed = parseMissionIntentForTrip(
+      "the airline rescheduled my flight to 18:40",
+      hydrateFixture(),
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    // Never the 240-minute default: the shift is booked-vs-stated arithmetic.
+    expect(parsed.mission.delayMinutes).not.toBe(240);
+    expect(parsed.mission.delayMinutes).toBeGreaterThan(0);
+    expect(parsed.mission.description).toMatch(/moved later/i);
+  });
+
+  it("refuses honestly when the flight moved EARLIER", () => {
+    // `ItineraryGraph.handleDisruption` throws on a negative delay: the whole
+    // propagation model is "things move later", and what an earlier departure
+    // breaks is everything BEFORE it. That is a different algorithm, not a
+    // missing branch — so we say so instead of inventing a delay.
+    const parsed = parseMissionIntentForTrip(
+      "the airline moved my flight to 6am, that's impossible",
+      hydrateFixture(),
+    );
+    expect(parsed).toMatchObject({ kind: "error", code: "earlier_departure_unsupported" });
+    if (parsed.kind !== "error") return;
+    expect(parsed.message).toMatch(/earlier/i);
+  });
+
+  it("leaves an ordinary missed flight on its own rail", () => {
+    // No time stated, no schedule-change wording: the four-hour stand-in for
+    // "I need the next departure" is still exactly right here.
+    const parsed = parseMissionIntentForTrip("I missed my flight, reroute me", hydrateFixture());
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.kind).toBe("missed_flight");
+    expect(parsed.mission.delayMinutes).toBe(240);
+  });
+
+  it("does not read a bare number as a time", () => {
+    // "moved to gate 12" is not 12 o'clock.
+    const parsed = parseMissionIntentForTrip("my flight moved to gate 12", hydrateFixture());
+    if (parsed.kind !== "mission") return;
+    expect(parsed.mission.description).not.toMatch(/moved later/i);
+  });
+});

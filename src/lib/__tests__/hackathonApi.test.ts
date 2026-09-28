@@ -205,13 +205,20 @@ describe("real-trip mission contract — tripId required", () => {
     expect(body.error).toBe("trip_not_hydratable");
   });
 
-  it("free-text without a known category still lands on the custom catch-all (200)", async () => {
+  it("free-text we do not understand is refused, not answered", async () => {
+    // It used to answer. "Tell me a joke" became a mission on the first
+    // upcoming node, and on the live Worker the same path turned "my suitcase
+    // didn't arrive" into three flight rebookings at 2,306,617 IDR. A
+    // confident answer to a question we did not understand is the most
+    // expensive failure this system has.
     const response = await handleHackathonRequest(
       post("mission", { intent: "tell me a joke", tripId: REAL_TRIP_UUID }),
     );
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { plan: ResolutionPlan };
-    expect(body.plan.incident).toMatch(/^Custom request for Lisbon/);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string; message: string };
+    expect(body.error).toBe("out_of_scope");
+    // And the refusal has to be useful: it names what the swarm does handle.
+    expect(body.message).toMatch(/missed or delayed flights/i);
   });
 });
 
@@ -245,6 +252,36 @@ describe("approve-resolution matrix", () => {
     expect(body.error).toBe("degraded_plan_not_bookable");
     expect(store.__sessions.get("res_degraded")?.state).toBe("proposal_ready");
   });
+
+  it("degraded session with NO flight in the plan still applies", async () => {
+    // Caught in the settlement battery of 2026-09-18: a weather mission on
+    // the Bali trip — swap an outdoor activity for an indoor one, no flight
+    // anywhere in it — was refused 409 "cannot be booked" because Atlas
+    // happened to be unreachable. There was nothing to book: the plan moves
+    // activities on the traveller's own itinerary, and blocking it leaves
+    // them unable to act on advice we had already given them.
+    store.__seed({
+      id: "res_degraded_activity",
+      degraded: true,
+      plan: bookablePlan({
+        incident: "Heavy rain in Seminyak",
+        impacted_nodes: ["Seminyak Beach Morning Stroll"],
+        proposed_resolution: {
+          rescheduled_activities: [
+            { name: "Seminyak Beach Morning Stroll", new_time: "Today 15:00", penalty: 0 },
+          ],
+        },
+        financial_delta: { total_refund: 0, total_new_charges: 0, net_payable: 0 },
+      }),
+    });
+
+    const response = await handleHackathonRequest(
+      post("approve-resolution", { resolutionId: "res_degraded_activity", approved: true }),
+    );
+
+    expect(response.status).not.toBe(409);
+  });
+
 
   it("flight-less plan approves with a locally recorded booking (flight-only 409 gate removed)", async () => {
     // Hotel/activity/transfer plans settle the trip without ever calling the
@@ -474,6 +511,55 @@ describe("mission + swarm-status degraded visibility (B2)", () => {
     expect(body.degraded).toBe(true);
     expect(body.degraded_reason).toBe("session_store_memory");
     expect(body.plan).toBeDefined();
+  });
+
+  it("a mission stuck in processing says so instead of staying silent", async () => {
+    // There was no cap at all. Measured across 84 real missions on
+    // 2026-09-18: median 13s, p95 27s, and exactly one run above 60s — which
+    // reached 269s and was still working when the harness gave up. A
+    // traveller stuck at an airport watched a spinner with no way to tell a
+    // slow mission from a dead one.
+    store.__seed({
+      id: "res_stuck",
+      state: "processing",
+      created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+    });
+
+    const status = await handleHackathonRequest(get("swarm-status/res_stuck"));
+    expect(status.status).toBe(200);
+    const body = (await status.json()) as { state: string; stalled?: boolean; stalled_seconds?: number };
+    expect(body.state).toBe("processing");
+    expect(body.stalled).toBe(true);
+    expect(body.stalled_seconds).toBeGreaterThanOrEqual(240);
+  });
+
+  it("a mission that is merely slow is not called stalled", async () => {
+    store.__seed({
+      id: "res_slow",
+      state: "processing",
+      created_at: new Date(Date.now() - 20_000).toISOString(),
+    });
+
+    const body = (await (await handleHackathonRequest(get("swarm-status/res_slow"))).json()) as {
+      stalled?: boolean;
+    };
+    expect(body.stalled).toBeUndefined();
+  });
+
+  it("a finished mission is never called stalled, however long it took", async () => {
+    // The flag is about waiting, not about duration. A plan that landed at
+    // four minutes is a plan.
+    store.__seed({
+      id: "res_slow_but_done",
+      state: "proposal_ready",
+      plan: bookablePlan(),
+      created_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+
+    const body = (await (
+      await handleHackathonRequest(get("swarm-status/res_slow_but_done"))
+    ).json()) as { stalled?: boolean };
+    expect(body.stalled).toBeUndefined();
   });
 
   it("a non-degraded session reports degraded: false without a reason", async () => {
@@ -891,7 +977,10 @@ describe("buildOperational — hotel-source settlement (task #15 fix)", () => {
     expect(originalCheckIn).toBe(Date.parse(`${day1Date}T15:00:00Z`));
 
     // Hotel-source mission: 6h late check-in propagation (mirrors what the
-    // mission pipeline does for a "hotel" intent).
+    // mission pipeline does for a "hotel" intent). Deliberately NOT an
+    // overbooking — this trip's room still exists and is simply reached
+    // late, which is the one situation where deriving a late check-in
+    // without an agent verdict is a fair reading of the graph.
     const delayMinutes = 360;
     const disruption = hydrated.graph.handleDisruption(HOTEL_NODE_ID, delayMinutes);
 
@@ -899,7 +988,7 @@ describe("buildOperational — hotel-source settlement (task #15 fix)", () => {
       {
         nodeId: HOTEL_NODE_ID,
         delayMinutes,
-        description: "Hotel overbooked at Atlantica Surf House",
+        description: "Arriving 6h late at Atlantica Surf House",
         origin: "reactive",
         tripId: REAL_TRIP_UUID,
       },
@@ -925,6 +1014,32 @@ describe("buildOperational — hotel-source settlement (task #15 fix)", () => {
       new Date(originalCheckIn! + delayMinutes * 60_000).toISOString(),
     );
     expect(sourceAction![0].newCheckIn).not.toBe(new Date(originalCheckIn!).toISOString());
+  });
+
+  it("never derives a late check-in for an OVERBOOKING — the room is gone, not late", () => {
+    // Live on 2026-09-18 this produced "Hotel Gracery Shinjuku: late check-in
+    // at 21:30" for a traveller whose room had been given away. Arriving
+    // later is not a remedy for a room that will not exist at any hour, and
+    // no agent had verified anything: `late_check_in` was simply the
+    // fallback when nothing was known.
+    const hydrated = hydrateHotelTrip();
+    const disruption = hydrated.graph.handleDisruption(HOTEL_NODE_ID, 0);
+
+    const operational = buildOperational(
+      {
+        nodeId: HOTEL_NODE_ID,
+        delayMinutes: 0,
+        description: "Hotel issue at Atlantica Surf House: My hotel is overbooked",
+        origin: "reactive",
+        tripId: REAL_TRIP_UUID,
+      },
+      hydrated,
+      { disruption, rebookingAssessment: null, hotelAdjustments: [], activityProposals: [] },
+    );
+
+    const sourceAction = operational!.hotel_actions?.filter((a) => a.nodeId === HOTEL_NODE_ID);
+    expect(sourceAction).toHaveLength(1);
+    expect(sourceAction![0].action).toBe("none");
   });
 
   it("picks up the HotelAgent verdict and never duplicates the source node", () => {
@@ -1126,5 +1241,211 @@ describe("legacy /mission async rail — chunked trace mirror writes (review fix
     } finally {
       store.__setPersistent(false);
     }
+  });
+});
+
+describe("a change of planes is judged, not called a delay", () => {
+  /** SIN → CDG, 50 minutes at CDG, CDG → LIS. Both legs cross a border. */
+  function connectingTripContent(): Record<string, unknown> {
+    const travelDate = fixtureTravelDate();
+    return {
+      title: { en: "Singapore to Lisbon" },
+      destination: { en: "Lisbon" },
+      local_currency_code: "EUR",
+      transit_groups: [
+        {
+          method: "flight",
+          reference: "SQ334",
+          carrier: "Singapore Airlines",
+          depart: `${travelDate}T01:00:00Z`,
+          arrive: `${travelDate}T09:00:00Z`,
+          origin: { code: "SIN", city: "Singapore" },
+          destination: { code: "CDG", city: "Paris" },
+        },
+        {
+          method: "flight",
+          reference: "AF1024",
+          carrier: "Air France",
+          depart: `${travelDate}T09:50:00Z`,
+          arrive: `${travelDate}T11:40:00Z`,
+          origin: { code: "CDG", city: "Paris" },
+          destination: { code: "LIS", city: "Lisbon" },
+        },
+      ],
+      itinerary: [
+        {
+          day: 1,
+          date: travelDate,
+          place: "Lisbon",
+          items: [{ type: "stay", title: "Atlantica Surf House", check_in: travelDate }],
+        },
+      ],
+    };
+  }
+
+  it("answers the question that was asked, with the real numbers", async () => {
+    // Before this, "my connection is too tight, I'll never make the second
+    // flight" produced "Delayed flight SQ634" with a four-hour delay nobody
+    // mentioned and three activities cancelled — the identical plan the
+    // engine gave for "the airline moved my flight to 6am".
+    tripCtx.__setTripContent(REAL_TRIP_UUID, connectingTripContent());
+
+    const response = await handleHackathonRequest(
+      post("mission", {
+        intent: "my connection is too tight, I'll never make the second flight",
+        tripId: REAL_TRIP_UUID,
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { plan: ResolutionPlan };
+    const check = body.plan.presentation?.connection;
+    expect(check).toBeDefined();
+    expect(check!.route).toContain("SQ334");
+    expect(check!.route).toContain("AF1024");
+    // 50 minutes against a floor raised by immigration at CDG.
+    expect(check!.verdict).toBe("below_minimum");
+    expect(check!.detail.join(" ")).toContain("50 min");
+    expect(check!.detail.join(" ")).toMatch(/immigration/);
+    // And it never reads as a promise, in either direction.
+    expect(check!.detail.join(" ")).toMatch(/don't hold the official minimum/);
+  });
+
+  it("targets the SECOND leg — the flight actually at risk", async () => {
+    const { parseMissionIntentForTrip } = await import("@/lib/swarmIntent");
+    const hydrated = hydrateTripFromContent(
+      REAL_TRIP_UUID,
+      "Singapore to Lisbon",
+      "Lisbon",
+      connectingTripContent(),
+    );
+    if (!hydrated) throw new Error("fixture did not hydrate");
+
+    const parsed = parseMissionIntentForTrip(
+      "my connection is too tight, I'll never make the second flight",
+      hydrated,
+    );
+    expect(parsed.kind).toBe("mission");
+    if (parsed.kind !== "mission") return;
+    // The first leg is fine; it is the onward flight that may be lost, and
+    // the one a replacement search should offer later departures for.
+    expect(parsed.mission.nodeId).toBe("flight-1");
+    // Nothing is late. Inventing a delay here is what produced the wrong plan.
+    expect(parsed.mission.delayMinutes).toBe(0);
+  });
+});
+
+describe("a change of planes inside one ticket is judged through the real pipeline", () => {
+  /** QA corpus trip #7's shape, as generate-trip stores it: ONE leg SIN → FCO
+   *  whose `segments` carry the two hops, endpoints as objects, wall-clock
+   *  stamps without a zone. 2 h 30 on the ground at Doha. */
+  function oneStopTripContent(): Record<string, unknown> {
+    const travelDate = fixtureTravelDate();
+    const endpoint = (code: string, city: string) => ({ code, city });
+    return {
+      title: { en: "Rome via the Gulf" },
+      destination: { en: "Rome" },
+      local_currency_code: "EUR",
+      transit_groups: [
+        {
+          id: "tg-1",
+          method: "flight",
+          reference: "QR943",
+          carrier: "Qatar Airways",
+          depart: `${travelDate}T08:00`,
+          arrive: `${travelDate}T18:15`,
+          origin: endpoint("SIN", "Singapore"),
+          destination: endpoint("FCO", "Rome"),
+          stops: 1,
+          stop_airports: ["DOH"],
+          segments: [
+            { reference: "QR943", carrier: "Qatar Airways", from: endpoint("SIN", "Singapore"), to: endpoint("DOH", "Doha"), depart: `${travelDate}T08:00`, arrive: `${travelDate}T11:00` },
+            { reference: "QR115", carrier: "Qatar Airways", from: endpoint("DOH", "Doha"), to: endpoint("FCO", "Rome"), depart: `${travelDate}T13:30`, arrive: `${travelDate}T18:15` },
+          ],
+        },
+      ],
+      itinerary: [
+        {
+          day: 1,
+          date: travelDate,
+          place: "Rome",
+          items: [{ type: "stay", title: "Hotel Monti", check_in: travelDate, time: "20:00" }],
+        },
+      ],
+    };
+  }
+
+  it("answers about the stop the ticket carries, with the ticket's own numbers", async () => {
+    tripCtx.__setTripContent(REAL_TRIP_UUID, oneStopTripContent());
+
+    const response = await handleHackathonRequest(
+      post("mission", {
+        intent: "my connection in Doha is too tight, I'll never make the second flight",
+        tripId: REAL_TRIP_UUID,
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { plan: ResolutionPlan };
+    const check = body.plan.presentation?.connection;
+    expect(check).toBeDefined();
+    expect(check!.route).toBe("QR943 SIN → DOH → QR115 DOH → FCO");
+    expect(check!.verdict).toBe("clears_minimum");
+    const text = check!.detail.join(" ");
+    expect(text).toContain("2 h 30 at Doha (DOH), on your SIN → FCO journey");
+    expect(text).toMatch(/one ticket/);
+    expect(text).toMatch(/don't hold the official minimum/);
+    // Nothing was late and nothing was invented: no activity moved, no money,
+    // no seat searched for, no fare rule quoted, no "needs a manual booking".
+    expect(body.plan.proposed_resolution.rescheduled_activities).toEqual([]);
+    expect(body.plan.proposed_resolution.new_flight).toBeUndefined();
+    expect(body.plan.proposed_resolution.policy_verdict).toBeUndefined();
+    expect(body.plan.financial_delta.net_payable).toBe(0);
+    expect(body.plan.presentation?.no_flight_reason).toBeUndefined();
+    expect(body.plan.incident).toBe("Connection at DOH — QR115 DOH → FCO");
+  });
+});
+
+describe("a mission the platform cut off is reported dead, not slow", () => {
+  // The resolve ack is the instant Cloudflare's 30 s `waitUntil` clock
+  // starts. A session still processing 40 s later has nobody working on it:
+  // telling the traveller to "let it finish" would have them wait for
+  // nothing, when the right advice is the opposite one.
+  const ackRow = (secondsAgo: number) => ({
+    agent: "orchestrator",
+    step: "resolve_received",
+    detail: "building plans from 1 trade-off answer(s)",
+    at: new Date(Date.now() - secondsAgo * 1000).toISOString(),
+  });
+
+  it("names the cause once the ack is 40 s old", async () => {
+    store.__seed({
+      id: "res_dead",
+      state: "processing",
+      created_at: new Date(Date.now() - 50_000).toISOString(),
+      trace: [ackRow(45)],
+    });
+    const body = (await (await handleHackathonRequest(get("swarm-status/res_dead"))).json()) as {
+      stalled?: boolean;
+      stalled_seconds?: number;
+      stalled_reason?: string;
+    };
+    expect(body.stalled).toBe(true);
+    expect(body.stalled_reason).toBe("continuation_cancelled");
+    expect(body.stalled_seconds).toBeGreaterThanOrEqual(45);
+  });
+
+  it("a mission acknowledged 20 s ago is still just working", async () => {
+    store.__seed({
+      id: "res_working",
+      state: "processing",
+      created_at: new Date(Date.now() - 4 * 60_000).toISOString(), // a long trade-off phase
+      trace: [ackRow(20)],
+    });
+    const body = (await (await handleHackathonRequest(get("swarm-status/res_working"))).json()) as {
+      stalled?: boolean;
+      stalled_reason?: string;
+    };
+    // Created four minutes ago, but the WORK only started 20 s ago — the old
+    // creation-based rule alone would have called this stalled.
+    expect(body.stalled_reason).toBeUndefined();
   });
 });

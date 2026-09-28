@@ -443,3 +443,37 @@ export function enforceMoveSanity(
   const iso = new Date(atMs).toISOString();
   return { ...proposal, new_time_iso: iso, new_time: `${iso.slice(0, 10)} ${iso.slice(11, 16)}` };
 }
+
+// ---------------------------------------------------- departure-side policy
+
+/**
+ * How early you must BE at the airport or station, in minutes.
+ *
+ * The mirror image of {@link arrivalBuffer}: that one says when a landing
+ * traveller is really in town, this one says when a departing traveller must
+ * really be at the gate. It exists here because the ground layer has to work
+ * BACKWARDS from a departure to a "leave by" time, and the number it works
+ * back from must be the same one the timeline already warns against — two
+ * different floors would put the timeline and the swarm in open disagreement
+ * on the same flight.
+ *
+ * These are the generate-trip prompt's own floors, kept in step with
+ * `timingRisk.ts` by a parity test rather than by memory.
+ */
+export const DEPARTURE_FLOOR_FLIGHT_SHORT_MINUTES = 120;
+export const DEPARTURE_FLOOR_FLIGHT_LONG_MINUTES = 180;
+export const DEPARTURE_FLOOR_GROUND_MINUTES = 30;
+/** A leg at or above this many hours is treated as long-haul. */
+export const LONG_HAUL_HOURS = 5;
+
+export function departureFloorMinutes(
+  kind: "flight" | "ground",
+  legDurationMinutes?: number,
+): number {
+  if (kind === "ground") return DEPARTURE_FLOOR_GROUND_MINUTES;
+  const long =
+    typeof legDurationMinutes === "number" &&
+    Number.isFinite(legDurationMinutes) &&
+    legDurationMinutes >= LONG_HAUL_HOURS * 60;
+  return long ? DEPARTURE_FLOOR_FLIGHT_LONG_MINUTES : DEPARTURE_FLOOR_FLIGHT_SHORT_MINUTES;
+}

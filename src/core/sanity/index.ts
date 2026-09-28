@@ -42,6 +42,8 @@ export {
   rulingsFor,
   sanitizeCriticisms,
 } from "./semanticCritic";
+export { VenueHours, decideFromHours, isConfidentMatch } from "./venueHours";
+export type { VenueQuery, VenueVerdict, VenueOutcome, VenueHoursConfig } from "./venueHours";
 export type {
   CriticAction,
   CriticContext,

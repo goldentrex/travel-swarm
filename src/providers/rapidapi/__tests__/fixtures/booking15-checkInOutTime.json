@@ -1,0 +1,57 @@
+{
+ "status": true,
+ "message": "Success",
+ "timestamp": 1789731717908,
+ "data": {
+  "checkinCheckoutTimes": {
+   "checkinTimeRange": {
+    "from": "15:00",
+    "fromFormatted": "3:00 PM",
+    "until": null,
+    "untilFormatted": null
+   },
+   "checkoutTimeRange": {
+    "from": null,
+    "fromFormatted": null,
+    "until": "12:00",
+    "untilFormatted": "12:00 PM"
+   }
+  },
+  "paymentMethods": {
+   "acceptedCreditCards": [
+    {
+     "id": 1,
+     "name": "American Express",
+     "nameEn": "American Express"
+    },
+    {
+     "id": 2,
+     "name": "Visa",
+     "nameEn": "Visa"
+    },
+    {
+     "id": 3,
+     "name": "Mastercard",
+     "nameEn": "Euro/Mastercard"
+    },
+    {
+     "id": 7,
+     "name": "JCB",
+     "nameEn": "JCB"
+    },
+    {
+     "id": 10,
+     "name": "Maestro",
+     "nameEn": "Maestro"
+    },
+    {
+     "id": 18,
+     "name": "Cash only",
+     "nameEn": "No creditcards accepted, only cash"
+    }
+   ],
+   "isExclusive": false,
+   "isPropertyBookingManagedPayAtProperty": false
+  }
+ }
+}

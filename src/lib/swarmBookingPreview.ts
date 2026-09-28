@@ -18,6 +18,7 @@
  */
 
 import {
+  AtlasFlightProvider,
   RapidApiHotelProvider,
   ViatorActivityProvider,
   rapidApiHotelConfigured,
@@ -39,6 +40,20 @@ export interface PreviewLineRequest {
   guests?: number;
   /** Activities: the day it happens on (ISO date). */
   date?: string;
+  /**
+   * Flights only — what Atlas needs to find THIS flight rather than a fare for
+   * the route it happens to fly. `searchAlternativeFlights` is route-based, so
+   * the match is made here on carrier + number; without all four fields the
+   * line is left to the client's comparator overlay, exactly as before.
+   */
+  origin?: string;
+  destination?: string;
+  /** IATA carrier code or airline name as the itinerary records it. */
+  carrier?: string;
+  /** The flight number as written on the ticket — "TR874", or "874". */
+  flightNumber?: string;
+  /** ISO departure date/time of the planned leg. */
+  departDate?: string;
   /** The planner's own estimate, so the answer can say how the real price compares. */
   estimate?: number;
   /** The currency THIS LINE's estimate is denominated in (items keep their own
@@ -88,6 +103,12 @@ export interface BookingPreview {
  */
 const MAX_STAY_LOOKUPS = 6;
 const MAX_ACTIVITY_LOOKUPS = 14;
+/**
+ * Flights cost ONE subrequest each (`search.do` is a single POST), and a trip
+ * rarely has more than a couple of legs. Four keeps a long multi-city itinerary
+ * from eating into the stay and activity budgets above.
+ */
+const MAX_FLIGHT_LOOKUPS = 4;
 
 /** Activity lookups run in bounded-concurrency batches: the subrequest count is
  *  identical, but 14 serial Viator calls made the traveler wait ~25s. */
@@ -215,6 +236,89 @@ async function priceActivity(
 }
 
 /**
+ * Normalise a flight designator so "TR 874", "tr874" and "874" with carrier
+ * "TR" all compare equal. Atlas returns the marketing number as "TR874".
+ */
+function flightKey(carrier: string | undefined, flightNumber: string | undefined): string | null {
+  const num = (flightNumber ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!num) return null;
+  const code = (carrier ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  // A number that already carries its carrier prefix is used as-is.
+  if (/^[A-Z0-9]{2}\d+$/.test(num)) return num;
+  if (!code) return null;
+  return `${code.slice(0, 2)}${num}`;
+}
+
+/**
+ * Ask Atlas for THIS flight.
+ *
+ * Atlas is an LCC-content API and its search is route-based, so it answers with
+ * everything it sells on the route that day. We quote a line only when one of
+ * those routings IS the planned flight — same carrier, same number. Anything
+ * else would be a fare for a different aircraft presented as this one's price,
+ * which is the exact dishonesty the comparator line already apologises for
+ * ("market fare for this route, not a quote for this flight").
+ *
+ * On no match the line is returned with NO `unavailableReason`, which is the
+ * signal the client uses to overlay its comparator fare — so a flight Atlas
+ * does not sell behaves exactly as it did before this function existed.
+ */
+async function priceFlight(
+  provider: AtlasFlightProvider,
+  line: PreviewLineRequest,
+  quoteCurrency?: string,
+): Promise<PreviewLine> {
+  const origin = line.origin?.trim().toUpperCase();
+  const destination = line.destination?.trim().toUpperCase();
+  const departure = line.departDate ?? line.date;
+  const wanted = flightKey(line.carrier, line.flightNumber);
+  if (!origin || !destination || !departure || !wanted) return estimateLine(line);
+  if (hasAlreadyPassed(departure)) {
+    return estimateLine(
+      line,
+      "Shown as planned — this flight has already departed.",
+      "Not priced — this flight has already departed.",
+    );
+  }
+  try {
+    const result = await provider.searchAlternativeFlights(line.id, departure, {
+      origin,
+      destination,
+      departureDate: departure,
+      adults: 1,
+      ...(quoteCurrency ?? line.currency
+        ? { currency: (quoteCurrency ?? line.currency) as string }
+        : {}),
+    });
+    const match = (result.options ?? []).find(
+      (option) => flightKey(option.airline, option.flightNumber) === wanted
+        || flightKey(undefined, option.flightNumber) === wanted,
+    );
+    if (!match || typeof match.price !== "number") return estimateLine(line);
+    // `matchedName` exists to show the traveler when a provider answered about
+    // something OTHER than what they planned. Here it is the same flight by
+    // construction, so naming it again only produces "planned: Scoot TR 874"
+    // under a row already titled "Scoot TR874".
+    const matched = `${match.airline} ${match.flightNumber}`.trim();
+    const sameAsPlanned =
+      matched.toUpperCase().replace(/[^A-Z0-9]/g, "") ===
+      line.title.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return {
+      id: line.id,
+      priceSource: "live_provider",
+      price: match.price,
+      currency: match.currency,
+      provider: "Atlas",
+      ...(sameAsPlanned ? {} : { matchedName: matched }),
+    };
+  } catch (error) {
+    console.warn(`[booking-preview] Atlas lookup failed for "${line.title}":`, error);
+    // Silent on purpose: the comparator overlay still has something true to say.
+    return estimateLine(line);
+  }
+}
+
+/**
  * Price every line, within each provider's measured subrequest budget.
  *
  * Stays are serial (two subrequests each); activities run in small concurrent
@@ -233,6 +337,15 @@ export async function buildBookingPreview(
 ): Promise<BookingPreview> {
   const hotelProvider = rapidApiHotelConfigured() ? new RapidApiHotelProvider() : null;
   const activityProvider = viatorEdgeConfigured() ? new ViatorActivityProvider() : null;
+  // The constructor throws when ATLAS_API_KEY is absent rather than returning
+  // null, so presence is discovered by trying — the same graceful degradation
+  // the other two get from their `*Configured()` helpers.
+  let flightProvider: AtlasFlightProvider | null = null;
+  try {
+    flightProvider = new AtlasFlightProvider();
+  } catch {
+    flightProvider = null;
+  }
 
   const used = new Set<string>();
   const degraded = new Set<string>();
@@ -247,6 +360,7 @@ export async function buildBookingPreview(
 
   let stayLookups = 0;
   let activityBudget = 0;
+  let flightLookups = 0;
 
   for (const [index, line] of lines.entries()) {
     if (line.kind === "stay") {
@@ -290,8 +404,31 @@ export async function buildBookingPreview(
       continue;
     }
 
-    // Flights are already priced by the rail that quoted them, and a table is
-    // not inventory anyone sells — both keep the trip's own figure.
+    // Flights: ask Atlas for THIS flight first. It is an LCC-content API, so
+    // it sells the low-cost carriers a trip like this actually flies, and a
+    // match is a real quote for the real aircraft rather than a fare for the
+    // route. Serial like stays — one subrequest each, and the whole point is
+    // that there are only ever a few.
+    if (
+      line.kind === "transport" &&
+      flightProvider &&
+      line.origin &&
+      line.destination &&
+      flightLookups < MAX_FLIGHT_LOOKUPS
+    ) {
+      flightLookups += 1;
+      const priced = await priceFlight(flightProvider, line, quoteCurrency);
+      if (priced.priceSource === "live_provider") used.add("Atlas");
+      out[index] = priced;
+      continue;
+    }
+
+    // Everything else — a train, a transfer, a restaurant, or a flight Atlas
+    // does not sell — carries no quote. It is NOT left at the planner's guess
+    // though: the client overlays the live market fare it is already showing on
+    // the timeline (`LivePrices` / Aviasales) onto this line, which is why this
+    // answer carries no `unavailableReason` — there is nothing to apologise
+    // for, and a "could not be checked" note under a live fare would be a lie.
     out[index] = estimateLine(line);
   }
 

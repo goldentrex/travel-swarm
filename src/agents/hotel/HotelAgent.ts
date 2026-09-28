@@ -27,6 +27,16 @@ export interface HotelImpactRequest {
   shiftedCheckIn: IsoTimestamp;
   guests: number;
   isOverbooked?: boolean;
+  /**
+   * The TRIP's currency, so a replacement room is quoted in the money the
+   * traveller is already counting in.
+   *
+   * Without it the search fell back to a hard-coded USD, and a live mission
+   * on a JPY trip in Tokyo came back offering a room at "97.07 USD" — a
+   * real rate, in a currency nothing else on that plan used. The engine has
+   * a tier-1 check against exactly that mixture.
+   */
+  currency?: string;
 }
 
 /** Output shape per spec §3.3 (+ agent-layer `degraded` / `note` markers). */
@@ -83,13 +93,25 @@ export class HotelAgent {
       hotelNodeId: request.hotelNodeId,
       lateCheckInAvailable: false,
       cancellationFee: 0,
-      currency: "USD",
+      currency: request.currency ?? "USD",
       alternativeRooms: [],
       recommendation: "keep_as_is",
       feeDelta: 0,
       degraded: true,
       note,
     });
+    /**
+     * The room is gone and we found nothing to put in its place.
+     *
+     * It names the remedy the traveller is actually owed. Walking a confirmed
+     * booking obliges the property to rehouse at its own cost nearly
+     * everywhere it happens, and a traveller who does not know that tends to
+     * pay twice.
+     */
+    const NO_REPLACEMENT_NOTE =
+      "We could not find a comparable room for these dates. Your other bookings are untouched. " +
+      "Ask the property to rehouse you — walking a confirmed booking obliges them to find and pay " +
+      "for a comparable room.";
     const UNVERIFIED_NOTE =
       "Hotel policy could not be verified. Contact the property to confirm availability, late arrival and any fees before changing this booking.";
     const OUTAGE_NOTE =
@@ -109,13 +131,33 @@ export class HotelAgent {
       // The provider records a quota refusal when it sees one, so the honest
       // sentence is available without spending another request to ask.
       if (hotelQuotaExhausted()) degradedNote = OUTAGE_NOTE;
-      policies = { hotelName: request.hotelName, lateCheckInAvailable: false, cancellationFee: 0, currency: "USD" };
+      // The policy lookup is what usually NAMES the currency. When it fails
+      // the trip's own is the next best truth, and far better than a
+      // hard-coded one: a fallback should not change the money a traveller
+      // reads.
+      policies = {
+        hotelName: request.hotelName,
+        lateCheckInAvailable: false,
+        cancellationFee: 0,
+        currency: request.currency ?? "USD",
+      };
     }
     const degradedAssessment = buildDegraded(degradedNote);
 
     // Alternative rooms are only needed when the late check-in cannot be held.
+    //
+    // "We could not read the policy" is NOT "the property will not hold the
+    // room". The degraded branch sets `lateCheckInAvailable: false` because it
+    // must not PROMISE a late arrival — but treating that as a refusal sent us
+    // shopping for a replacement on every failed policy read, and the rooms
+    // came back attached to a verdict of `keep_as_is`. The traveller then saw
+    // a different hotel presented as their new plan under a line saying "no
+    // change needed", and we spent two provider calls to produce it.
+    //
+    // So: search when we KNOW the room cannot be held, or when it is gone.
+    // Not when we simply could not ask.
     let alternativeRooms: HotelAssessment["alternativeRooms"] = [];
-    if (!policies.lateCheckInAvailable || request.isOverbooked) {
+    if ((!policyUnknown && !policies.lateCheckInAvailable) || request.isOverbooked) {
       try {
         const search = await this.provider.searchAlternativeRooms({
           hotelName: request.hotelName,
@@ -143,7 +185,15 @@ export class HotelAgent {
       }
     }
 
-    if (policyUnknown) return { ...degradedAssessment, alternativeRooms };
+    if (policyUnknown) {
+      // A degraded verdict on an overbooking must still name the situation:
+      // the generic note talks about confirming a LATE ARRIVAL, which is not
+      // what a walked traveller needs to hear.
+      if (request.isOverbooked && alternativeRooms.length === 0) {
+        return { ...degradedAssessment, alternativeRooms, note: NO_REPLACEMENT_NOTE };
+      }
+      return { ...degradedAssessment, alternativeRooms };
+    }
 
     // Deterministic recommendation ladder:
     //  1. Late check-in feasible (and not overbooked) → protect the existing
@@ -176,11 +226,17 @@ export class HotelAgent {
       recommendation,
       feeDelta,
       note:
-        recommendation === "keep_late_checkin"
-          ? "Late Check-in (confirmed)"
-          : policies.freeCancellationUntil
-            ? `Free cancellation until ${policies.freeCancellationUntil}.`
-            : undefined,
+        // An overbooked traveller with no replacement found must not be left
+        // with a blank row. "keep_as_is" is honest about OUR side — we
+        // changed nothing — but on its own it reads as "all fine", which is
+        // the opposite of the situation.
+        request.isOverbooked && recommendation !== "rebook_room"
+          ? NO_REPLACEMENT_NOTE
+          : recommendation === "keep_late_checkin"
+            ? "Late Check-in (confirmed)"
+            : policies.freeCancellationUntil
+              ? `Free cancellation until ${policies.freeCancellationUntil}.`
+              : undefined,
     };
   }
 }

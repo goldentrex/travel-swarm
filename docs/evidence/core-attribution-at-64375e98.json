@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "revision": "64375e98",
+  "generated_from_commit": "64375e9857e79fba0202e24273ea36aec0beccd7",
+  "working_tree_modified": false,
+  "method": "git blame -w -M -C over the swarm closure; each surviving line credited to the commit that last wrote it. Lines rewritten after the window count AGAINST the window, so the Qoder share is a lower bound.",
+  "qoder_window": {
+    "from": "2026-08-19",
+    "to": "2026-08-25"
+  },
+  "total": {
+    "lines": 14638,
+    "before": 57,
+    "qoder_window": 14581,
+    "after": 0,
+    "files": 33,
+    "qoder_pct": 99.61
+  },
+  "groups": {
+    "dag_and_agents": {
+      "files": 12,
+      "lines": 4182,
+      "before": 0,
+      "qoder_window": 4182,
+      "after": 0,
+      "qoder_pct": 100
+    },
+    "swarm_api": {
+      "files": 5,
+      "lines": 4202,
+      "before": 0,
+      "qoder_window": 4202,
+      "after": 0,
+      "qoder_pct": 100
+    },
+    "providers": {
+      "files": 11,
+      "lines": 2389,
+      "before": 0,
+      "qoder_window": 2389,
+      "after": 0,
+      "qoder_pct": 100
+    },
+    "ios_surfaces": {
+      "files": 5,
+      "lines": 3865,
+      "before": 57,
+      "qoder_window": 3808,
+      "after": 0,
+      "qoder_pct": 98.53
+    }
+  },
+  "commits": [
+    {
+      "date": "2026-08-22",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): complete Nexus Swarm — TTL quote enforcement, spatial DAG, iOS drill UI & swarm-monitor",
+      "sha": "98621ca7",
+      "bucket": "qoder_window",
+      "lines": 7509
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): two-phase assess/resolve flow with Gemini liaison and multi-plan carousel",
+      "sha": "0a3c6e4a",
+      "bucket": "qoder_window",
+      "lines": 2037
+    },
+    {
+      "date": "2026-08-22",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): Nexus Swarm real-data overhaul — live Atlas sandbox, all agents wired, rich Trust Layer UX",
+      "sha": "79adf106",
+      "bucket": "qoder_window",
+      "lines": 1903
+    },
+    {
+      "date": "2026-08-19",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): initial Level-4 Nexus Graph Engine & Trust Layer",
+      "sha": "2ecd4a1a",
+      "bucket": "qoder_window",
+      "lines": 1242
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "Swarm production real-data mode: real trips/settlement, cancel mission, strike+unwell plans, demo rail retirement, UX polish, CI migrations-before-deploy",
+      "sha": "4dda1127",
+      "bucket": "qoder_window",
+      "lines": 1156
+    },
+    {
+      "date": "2026-08-24",
+      "author": "VictorGAYA",
+      "subject": "Fix intent hijacking and clean up Trust Layer UI",
+      "sha": "b1b2fe28",
+      "bucket": "qoder_window",
+      "lines": 527
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "Swarm trip-load hardening: 503 session_store_unavailable on store failures, storeHealthy health probe, secret rotation runbook",
+      "sha": "64375e98",
+      "bucket": "qoder_window",
+      "lines": 101
+    },
+    {
+      "date": "2026-08-24",
+      "author": "VictorGAYA",
+      "subject": "feat(orchestrator): wire OpenWeather and PredictHQ into proactive scenarios",
+      "sha": "71633aed",
+      "bucket": "qoder_window",
+      "lines": 85
+    },
+    {
+      "date": "2026-06-27",
+      "author": "VictorGAYA",
+      "subject": "fix variability",
+      "sha": "f567dde3",
+      "bucket": "before",
+      "lines": 57
+    },
+    {
+      "date": "2026-08-23",
+      "author": "VictorGAYA",
+      "subject": "Implemented E2E",
+      "sha": "f8ab79ec",
+      "bucket": "qoder_window",
+      "lines": 21
+    }
+  ]
+}

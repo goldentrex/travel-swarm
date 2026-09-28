@@ -66,6 +66,7 @@ export type {
 
 export {
   GEMINI_CALLS_PER_MISSION,
+  GEMINI_CRITIC_RESERVED_CALLS,
   GEMINI_QUOTA_RETRIES,
   GEMINI_RETRY_BACKOFF_MS,
 } from "./geminiDegrade";

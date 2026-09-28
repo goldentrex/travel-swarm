@@ -34,7 +34,12 @@ function option(
     origin: "SIN",
     destination: "CTS",
     departureTime,
-    arrivalTime: "2026-12-22T17:20:00Z",
+    // Derived from the departure, so every fixture option is the SAME journey
+    // length. A fixed arrival made a 04:00 departure an eleven-hour flight and
+    // a 14:00 one a three-hour flight, which `rankReplacements` is right to
+    // treat as different products — these tests are about which departures are
+    // USABLE, and should not accidentally exercise the duration ceiling too.
+    arrivalTime: new Date(Date.parse(departureTime) + 3.5 * 3_600_000).toISOString(),
     price,
     currency: "USD",
   };
@@ -408,26 +413,29 @@ describe("an empty provider answer stays empty", () => {
     ["SIN", "NRT", "TR882"],
     ["KIX", "SIN", "MM773"],
     ["SGN", "SIN", "VN650"],
-  ])("offers no flight for %s → %s when Atlas is empty, and says why", async (origin, destination, flightNumber) => {
-    const departureDate = "2026-12-22T06:10:00Z";
-    const agent = new FlightAgent(new Provider([]));
-    const assessment = await agent.assessRebookingOptions("disrupted", departureDate, {
-      origin,
-      destination,
-      departureDate,
-      earliestDeparture: departureDate,
-      currency: "SGD",
-      originalFare: 200,
-    });
-    // Atlas is empty on this route. There is no flight to offer, and the
-    // engine says so with the reason its own search proves — it does not put
-    // `${flightNumber}` on the screen, because nobody checked that such a
-    // flight exists.
-    expect(assessment.candidates).toHaveLength(0);
-    expect(assessment.bestCandidate).toBeNull();
-    expect(assessment.noReplacementReason).toBe("route_not_covered");
-    expect(assessment.fallbackReason).toContain("no inventory");
-  });
+  ])(
+    "offers no flight for %s → %s when Atlas is empty, and says why",
+    async (origin, destination, flightNumber) => {
+      const departureDate = "2026-12-22T06:10:00Z";
+      const agent = new FlightAgent(new Provider([]));
+      const assessment = await agent.assessRebookingOptions("disrupted", departureDate, {
+        origin,
+        destination,
+        departureDate,
+        earliestDeparture: departureDate,
+        currency: "SGD",
+        originalFare: 200,
+      });
+      // Atlas is empty on this route. There is no flight to offer, and the
+      // engine says so with the reason its own search proves — it does not put
+      // `${flightNumber}` on the screen, because nobody checked that such a
+      // flight exists.
+      expect(assessment.candidates).toHaveLength(0);
+      expect(assessment.bestCandidate).toBeNull();
+      expect(assessment.noReplacementReason).toBe("route_not_covered");
+      expect(assessment.fallbackReason).toContain("no inventory");
+    },
+  );
 });
 
 describe("rebooking candidates", () => {

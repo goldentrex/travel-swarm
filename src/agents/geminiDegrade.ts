@@ -41,6 +41,17 @@ export type GeminiCallResult =
  */
 export const GEMINI_CALLS_PER_MISSION = 5;
 
+/**
+ * Calls held for the semantic critic alone, on top of the allowance above.
+ *
+ * The critic runs LAST — after the liaison's trade-off translation and the day
+ * reorganizer — so on a shared budget it is served only when the others leave
+ * something, which on a live battery of 18 missions meant four `quota_429`
+ * degradations and zero findings. Two is enough for one review plus one ladder
+ * retry.
+ */
+export const GEMINI_CRITIC_RESERVED_CALLS = 2;
+
 /** Exactly ONE retry on 429/503 (quota_429), async resolve rail only. */
 export const GEMINI_QUOTA_RETRIES = 2;
 

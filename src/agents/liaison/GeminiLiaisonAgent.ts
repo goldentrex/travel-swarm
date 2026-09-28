@@ -102,7 +102,7 @@ export interface GeminiLiaisonConfig {
   /** Per-call deadline in ms (default 20s) — shared by the attempt AND its
    *  fallback-model retry, so it must leave room for both. */
   timeoutMs?: number;
-  /** Model id (default gemini-3.7-flash). */
+  /** Model id (defaults to the cascade's first rung, a lite tier). */
   model?: string;
   /**
    * Ordered fallbacks are shared, not per-agent: see `geminiCascade.ts`. Set
@@ -1675,7 +1675,22 @@ export class GeminiLiaisonAgent {
     this.degradeReason = undefined;
     this.constraintRoute = "model";
     const deterministic = deriveConstraintsFromAnswers(questions, answers);
+    // Every id the deterministic question builder itself emits, and nothing
+    // else. Each one has an exact branch in deriveConstraintsFromAnswers that
+    // produces precisely what the question's own detail text promised the
+    // traveler — `airport_now` is "at least 1 hour from now" on both sides,
+    // `need_time` is "at least 3 hours". Asking a model to re-read our own
+    // structured output was a call spent restating it.
+    //
+    // MEASURED 2026-09-20: without the two airport ids this set never matched
+    // a real mission. A missed-flight assess asks TWO questions — the airport
+    // buffer and the travel day — and the gate below is all-or-nothing, so one
+    // unlisted id sent the whole payload to the model and the routing flag was
+    // inert in production. Anything genuinely unfamiliar (an activity
+    // arbitration, a question a later version adds) still goes to the model.
     const exactRules = new Set([
+      "airport_now",
+      "need_time",
       "nonstop",
       "cheaper_with_stop",
       "with_stop",

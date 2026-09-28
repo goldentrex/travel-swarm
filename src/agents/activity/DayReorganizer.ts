@@ -41,6 +41,7 @@ import {
   type GeminiDegradeReason,
 } from "../geminiDegrade";
 import { GeminiJsonClient, parseGeminiJson } from "@/agents/geminiJsonClient";
+import { classifyItem } from "@/core/sanity";
 
 // ------------------------------------------------------------------ contract
 
@@ -111,7 +112,7 @@ export interface DayReorganizerConfig {
   apiKey?: string;
   /** Per-call deadline in ms (default 10s). */
   timeoutMs?: number;
-  /** Model id (default gemini-3.7-flash). */
+  /** Model id (defaults to the cascade's first rung, a lite tier). */
   model?: string;
   /** Injectable fetch implementation (tests). */
   fetchImpl?: typeof fetch;
@@ -155,9 +156,25 @@ const HOUR_MS = 3_600_000;
 // deadline on EVERY swarm call, so the whole rail silently ran on its
 // deterministic fallback. 3.6-flash answers promptly under the same load.
 const DEFAULT_MODEL = GEMINI_MODEL_CASCADE[0];
-/** Covers the primary attempt AND the fallback-model retry (was 10s, which the
- *  503-then-retry sequence blew through, degrading with reason "timeout"). */
-const DEFAULT_TIMEOUT_MS = 20_000;
+/**
+ * Per-ATTEMPT deadline — and therefore also the headroom this agent claims
+ * against the mission clock, because `GeminiCallBudget.tryReserve` refuses any
+ * call that could still be running at the continuation cut-off.
+ *
+ * It was 20s, which made the reorganizer price itself out of its own mission.
+ * Measured on the deployed Worker (wrangler tail, 26 September): five swarm
+ * calls, every one `text_received`, 1.49s–3.31s. But the reorganizer runs after
+ * the flight, hotel and activity agents, so it typically arrives with ~13s left
+ * of the 27s continuation budget — and 13 < 20, so the call was refused BEFORE
+ * being made: `Gemini call skipped — 13 s left […] less than one call needs`.
+ * Eight of the last twelve live missions degraded that way, on a model that had
+ * answered in three seconds every time it was asked.
+ *
+ * 12s is four times the measured worst case, and the retry gets its own fresh
+ * attempt (and its own reservation) rather than sharing this one — the comment
+ * this replaces claimed otherwise.
+ */
+const DEFAULT_TIMEOUT_MS = 12_000;
 const DEFAULT_RETRY_DELAY_MS = 1_500;
 
 /** Gemini response schema: a decisions array with a tight per-entry shape. */
@@ -293,15 +310,38 @@ export function resequenceDeterministically(request: DayReorgRequest): DayReorgD
     return placements;
   };
 
+  // "Lighten my day" asks for FEWER, and the rail below only ever drops on
+  // proven infeasibility — so on that mission it returned the same day,
+  // re-spaced. Measured live on 2026-09-18 across six trips: when Gemini
+  // answered, the day was properly trimmed; when it degraded (11 of 42
+  // missions), London came back with both its items kept and simply moved.
+  // The traveller who said they were ill got a full day with new times.
+  //
+  // The trim keeps what a person still needs: the one item they most want,
+  // and their meals — you still eat when you are unwell. Everything else
+  // goes. That is a POLICY, stated plainly and put to the traveller for
+  // approval, not a claim about the world; and it uses the priority order
+  // and the meal category the codebase already defines rather than a new
+  // scale invented here.
+  let ordered_ = ordered;
+  if (request.allowDiscretionaryDrops && ordered.length > 1) {
+    const keepers = ordered.filter(
+      (activity, index) =>
+        index === 0 || classifyItem({ type: "activity", title: activity.name }) === "meal",
+    );
+    if (keepers.length > 0 && keepers.length < ordered.length) ordered_ = keepers;
+  }
+  const discretionary = ordered.filter((a) => !ordered_.includes(a));
+
   // Drop the lowest-priority entries (tail of the ordered list) one at a
   // time until the day is feasible.
-  let kept = ordered;
+  let kept = ordered_;
   let placements = fits(kept);
   while (placements === null && kept.length > 0) {
     kept = kept.slice(0, kept.length - 1);
     placements = fits(kept);
   }
-  const dropped = ordered.slice(kept.length);
+  const dropped = [...ordered_.slice(kept.length), ...discretionary];
 
   const windowHours = (bounds.end - arrivalFloorMs) / HOUR_MS;
   const decisions: DayReorgDecision[] = [];
@@ -324,12 +364,21 @@ export function resequenceDeterministically(request: DayReorgRequest): DayReorgD
     }
   }
   for (const activity of dropped) {
+    const discretionaryDrop = discretionary.includes(activity);
     decisions.push({
       nodeId: activity.nodeId,
       action: "drop",
-      reason:
-        `The day holds only ${windowHours.toFixed(1)}h after the new arrival — ` +
-        `${activity.name} is the lowest-priority item and was cancelled to keep the rest feasible.`,
+      reason: discretionaryDrop
+        ? `Cancelled to give you a lighter day — your meals and ${ordered_[0]?.name ?? "the main plan"} are kept.`
+        // `windowHours` is the day's remaining bound MINUS the arrival floor,
+        // so a traveller who now lands after the day closes leaves it negative
+        // — and "the day holds only -10.2h" is the kind of sentence that reads
+        // as a bug to the person we are asking to trust the plan. Below zero
+        // there is no window left to quote: say that, and drop the number.
+        : windowHours <= 0
+          ? `You now land after this day is over — ${activity.name} cannot be held and was cancelled.`
+          : `The day holds only ${windowHours.toFixed(1)}h after the new arrival — ` +
+            `${activity.name} is the lowest-priority item and was cancelled to keep the rest feasible.`,
     });
   }
   // Emit in the ORIGINAL input order for stable downstream presentation.

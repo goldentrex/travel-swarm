@@ -102,7 +102,11 @@ describe("the sanity rules, with no model at all", () => {
       (c) => c.node_id === "activity-0-2",
     );
     expect(shrine?.issue_type).toBe("UNREALISTIC_TRANSIT");
-    expect(shrine?.suggested_action).toBe("DROP");
+    // RETIME, not DROP: everywhere else the engine raises a slot to the first
+    // hour that works and cancels only when none does. `rulingsFor` turns this
+    // into a drop when the day has nothing left, which for this 20:00 shrine
+    // against a 20:00 arrival it does.
+    expect(shrine?.suggested_action).toBe("RETIME");
   });
 
   it("counts the booked night nobody will sleep in — and only when there is one", () => {
@@ -144,9 +148,12 @@ describe("the sanity rules, with no model at all", () => {
     expect(deterministicCriticisms(sane)).toEqual([]);
   });
 
-  it("flags a dusk-closing venue after dark even when the clock rules pass", () => {
-    // 18:30 is inside the generic activity window (07:30–21:00) and is not a
-    // sleeping hour, so ONLY venue knowledge can reject it.
+  it("does NOT guess at sunset — that is the model's job, and only the model knows", () => {
+    // A coarse rule used to cancel anything shrine/garden/park/trail after
+    // 17:00. It cancelled a coastal hike at 18:00 in Lisbon in September,
+    // where the sun sets near 19:30. Sunset depends on latitude and date;
+    // guessing it with a constant is an invention dressed as a rule, and a
+    // wrong cancellation costs the traveller something they had.
     const found = deterministicCriticisms(
       tokyoContext({
         arrival: {
@@ -169,8 +176,7 @@ describe("the sanity rules, with no model at all", () => {
         ],
       }),
     );
-    expect(found[0]?.issue_type).toBe("CLOSED_VENUE");
-    expect(found[0]?.suggested_action).toBe("DROP");
+    expect(found).toEqual([]);
   });
 
   it("never rules against lodging or a transfer for being late — those are real services", () => {
@@ -298,6 +304,37 @@ describe("the model rail", () => {
     expect(merged).toHaveLength(2);
     expect(merged[0].suggested_action).toBe("DROP");
     expect(merged[1].node_id).toBe("activity-0-3");
+  });
+
+  it("labels everything it returns as the MODEL's, whatever the model claims", () => {
+    // The guard that stops an opinion cancelling a booking keys on `origin`.
+    // A scripted edit once stamped "rules" here — inside the function that
+    // handles the MODEL's output — so every model finding was treated as a
+    // proof and could cancel. The test that was supposed to catch it built
+    // criticisms by hand with origin already set, and passed while the code
+    // never set it at all. So this one goes through the sanitizer.
+    const kept = sanitizeCriticisms(
+      {
+        criticisms: [
+          {
+            node_id: "a",
+            issue_type: "CLOSED_VENUE",
+            explanation: "Shut by then.",
+            suggested_action: "DROP",
+            // Even if the payload says otherwise, it came from the model.
+            origin: "rules",
+          },
+        ],
+      },
+      new Set(["a"]),
+    );
+    expect(kept?.[0].origin).toBe("model");
+  });
+
+  it("marks the pure rules as rules", () => {
+    for (const criticism of deterministicCriticisms(tokyoContext())) {
+      expect(criticism.origin).toBe("rules");
+    }
   });
 
   it("discards criticisms of nodes it was never shown", () => {
@@ -506,5 +543,106 @@ describe("what the orchestrator is told to do about it", () => {
       // Moved to the arrival day, at the first hour the traveller is in town.
       expect(new Date(hotel.toMs).toISOString()).toBe("2026-11-06T20:00:00.000Z");
     }
+  });
+});
+
+// ───────── 5. a proof may cancel; an opinion may only move
+
+describe("the model can move something, but it can never cancel it", () => {
+  /**
+   * Live on 2026-09-18, with the model finally seeing the whole day, it
+   * reported: "Tokyo Metropolitan Government Building Observation Deck closes
+   * much earlier than 21:00" and the engine cancelled the visit.
+   *
+   * The South deck is open until 22:00, last entry 21:30. The traveller lost
+   * something they could have done, on a confident sentence that was untrue.
+   * A rule is a proof about the clock and the geography; a model is an opinion
+   * about the world, and only one of those may end a booking.
+   */
+  const observationDeck = (): CriticContext => ({
+    incident: "Flight delayed",
+    arrival: {
+      origin: "SIN",
+      airport: "HND",
+      iso: "2027-01-15T12:00:00.000Z",
+      ready_for_pickup_iso: "2027-01-15T13:30:00.000Z",
+      ready_in_city_iso: "2027-01-15T14:30:00.000Z",
+      is_next_day: false,
+    },
+    items: [
+      {
+        node_id: "activity-1-4",
+        name: "Tokyo Metropolitan Government Building Observation Deck",
+        proposed_start: "2027-01-15T21:00:00.000Z",
+        original_start: "2027-01-15T21:00:00.000Z",
+        category: "timed_activity",
+      },
+    ],
+  });
+
+  it("keeps the booking when the model wants it gone and no hour is left", () => {
+    const context = observationDeck();
+    const rulings = rulingsFor(
+      {
+        is_sane: false,
+        source: "gemini",
+        criticisms: [
+          {
+            origin: "model",
+            node_id: "activity-1-4",
+            issue_type: "CLOSED_VENUE",
+            explanation: "It closes much earlier than 21:00.",
+            suggested_action: "DROP",
+          },
+        ],
+      },
+      context,
+    );
+    // 21:00 is past the generic activity window, so there is no later slot —
+    // and the item survives anyway, because the claim is an opinion.
+    expect(rulings.get("activity-1-4")).toBeUndefined();
+  });
+
+  it("still lets the model MOVE it when the day has room", () => {
+    const context = observationDeck();
+    context.items[0].proposed_start = "2027-01-15T06:00:00.000Z";
+    const rulings = rulingsFor(
+      {
+        is_sane: false,
+        source: "gemini",
+        criticisms: [
+          {
+            origin: "model",
+            node_id: "activity-1-4",
+            issue_type: "CLOSED_VENUE",
+            explanation: "It does not open until 09:30.",
+            suggested_action: "DROP",
+          },
+        ],
+      },
+      context,
+    );
+    expect(rulings.get("activity-1-4")?.action).toBe("retime");
+  });
+
+  it("a RULE still cancels — a proof is not an opinion", () => {
+    const context = observationDeck();
+    const rulings = rulingsFor(
+      {
+        is_sane: false,
+        source: "deterministic",
+        criticisms: [
+          {
+            origin: "rules",
+            node_id: "activity-1-4",
+            issue_type: "UNREALISTIC_TRANSIT",
+            explanation: "You are not in town until 14:30.",
+            suggested_action: "DROP",
+          },
+        ],
+      },
+      context,
+    );
+    expect(rulings.get("activity-1-4")?.action).toBe("drop");
   });
 });

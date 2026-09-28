@@ -14,13 +14,15 @@
  *                           upcoming (or last) flight
  *   3. hotel              → first hotel_check_in node
  *   4. activity_cancelled → activity matched by name, else first activity
- *   5. strike             → first transfer/train node, else first flight
- *                           (reactive); when NO transit node exists, proactive
- *                           user_report on the first upcoming activity/hotel
+ *   5. strike             → a GROUND transit node (reactive), never a flight;
+ *                           when the trip has none, proactive user_report on
+ *                           the first upcoming activity
  *   6. unwell/lighten     → proactive on the first activity (user_report);
  *                           400 no_actionable_nodes when the trip has none
  */
 
+import { findConnections, isConnectionMission, pickConnection } from "@/core/sanity/connections";
+import { groundHeadline, isGroundMission } from "@/core/ground";
 import type { HydratedTrip, SwarmNodeRef } from "./swarmTripContext";
 
 // ------------------------------------------------------------------ types
@@ -58,6 +60,14 @@ export interface TripMissionOptions {
   evidence?: TripMissionEvidence;
   /** Parsed category (trace/UI metadata, not part of the DisruptionEvent). */
   kind: TripMissionCategory;
+  /**
+   * When the intent named no flight and the swarm PICKED one: which, and
+   * why. Disclosed on the Activity Stream as its own row rather than
+   * prefixed to the headline — photographed on 2026-09-18, "Nearest upcoming
+   * flight SQ366 chosen as the disruption target." opened the plan's title
+   * and, at accessibility text size, filled the whole first screen.
+   */
+  targetNote?: string;
 }
 
 export type TripMissionParse =
@@ -86,21 +96,71 @@ function normalizeFlightNo(raw: string): string {
 }
 /** Delay magnitude in hours, e.g. "4h", "2.5 hours". */
 const DELAY_HOURS_PATTERN = /\b(\d+(?:[.,]\d+)?)\s*(?:hours?|hrs?|h)\b/i;
+/**
+ * THE APP SHIPS FIVE LANGUAGES; THIS PARSER UNDERSTOOD ONE.
+ *
+ * Only the flight branch was ever translated (see FLIGHT_INTENT_PATTERN_INTL).
+ * Measured against the deployed Worker on 2026-09-18, six of nine French,
+ * Spanish and German sentences were refused outright — including four the
+ * swarm handles perfectly well:
+ *
+ *   "mon hôtel est surbooké"                    → refused
+ *   "mon activité a été annulée"                → refused
+ *   "je ne me sens pas bien, allège ma journée" → refused
+ *   "il va pleuvoir demain, adapte mes plans"   → refused
+ *
+ * Before the scope gate they fell through to the greedy catch-all instead,
+ * which is not better: that is the path that answered "my suitcase didn't
+ * arrive" with three flight rebookings. Either way the engine only really
+ * worked for travellers who happened to type English.
+ *
+ * NOTE ON THE MISSING \b: JavaScript word boundaries are ASCII-only, so
+ * `\bhôtel\b` never matches — "ô" is not a word character and the trailing
+ * boundary fails on the very word this exists to catch. The stems below are
+ * therefore written without a closing boundary where an accent can fall, the
+ * same compromise FLIGHT_INTENT_PATTERN_INTL already documents.
+ */
+
 /** Weather vocabulary ⇒ proactive mission (mirrors hackathonApi's set). */
 const WEATHER_INTENT_PATTERN =
   /\b(rain|rainy|storm|stormy|thunder|weather|forecast|snow|wind|heat|heatwave|hurricane|typhoon)\b/i;
+const WEATHER_INTENT_INTL =
+  /(pluie|pleuv|orage|neige|vent\b|canicule|temp[êe]te|m[ée]t[ée]o|lluvia|llov|tormenta|nieve|viento|calor|regn|regen|sturm|schnee|hitze|unwetter|下雨|暴雨|台风|风暴|天气)/i;
 /** Hotel trouble keywords — hotel-specific vocabulary ONLY: generic
  *  "cancelled/cancellation" must NOT land here (it belongs to the activity
  *  branch below), so a "my activity got cancelled" intent never misfires
  *  onto the hotel node. */
 const HOTEL_INTENT_PATTERN =
   /\b(overbook\w*|no-show|no show|hotel|room|reservation|check-in|check in)\b/i;
+const HOTEL_INTENT_INTL =
+  /(h[ôo]tel|chambre|r[ée]servation|logement|habitaci[óo]n|reserva|alojamiento|zimmer|unterkunft|buchung|酒店|旅馆|房间|预订)/i;
+/**
+ * The noun alone is not a problem. Something has to be WRONG with the room,
+ * or the traveller has to be asking for it to change.
+ *
+ * Verified against the deployed Worker on 2026-09-18: "what's the wifi
+ * password at my hotel" matched on the bare word "hotel", was classified as a
+ * hotel disruption, and came back with "your booking is untouched; confirm a
+ * late arrival with them if you want certainty." The traveller asked for a
+ * password.
+ */
+const HOTEL_TROUBLE_PATTERN =
+  /\b(overbook\w*|no-show|no show|walked|cancel\w*|annul\w*|chang\w*|mov\w*|switch|rebook|reschedul\w*|postpone|earlier|later|late|delay\w*|miss\w*|problem|issue|wrong|dirty|unsafe|refus\w*|denied|lost|double[- ]?booked|not (available|ready)|won'?t|can'?t)\b/i;
+const HOTEL_TROUBLE_INTL =
+  /(surbook|surr[ée]serv|annul|d[ée]cal|chang|probl[èe]me|sale|refus|perdu|complet|sobrevend|cancel|cambi|problema|sucia|rechaz|completo|[üu]berbucht|storn|[äa]nder|problem|schmutzig|abgelehnt|超订|取消|问题|换)/i;
 /** Activity cancellation keywords. */
 const ACTIVITY_INTENT_PATTERN = /\b(cancel\w*|activity|tour|lesson|excursion|class|booking)\b/i;
+const ACTIVITY_INTENT_INTL =
+  /(activit[ée]|visite|excursion|cours\b|atelier|annul[ée]|actividad|visita|excursi[óo]n|clase|cancelad|aktivit[äa]t|besichtigung|ausflug|kurs\b|abgesagt|活动|游览|课程|取消)/i;
 /** Transport strike keywords. */
 const STRIKE_INTENT_PATTERN = /\bstrike\w*\b/i;
+const STRIKE_INTENT_INTL = /(gr[èe]ve|huelga|streik|罢工)/i;
+/** "The room is GONE" in every shipped language — the orchestrator reads it too. */
+const OVERBOOKED_LIKE = /(overbook\w*|surbook|surr[ée]serv|sobrevend|[üu]berbucht|超订)/i;
 /** Traveler wellbeing / lighten-the-day keywords. */
 const UNWELL_INTENT_PATTERN = /\b(unwell|lighten\w*|sick|exhausted|tired)\b/i;
+const UNWELL_INTENT_INTL =
+  /(malade|fatigu[ée]|[ée]puis[ée]|all[èe]g|pas bien|souffrant|enferm|cansad|agotad|aligerar|mal\b|krank|m[üu]de|ersch[öo]pft|entlasten|不舒服|生病|累|疲)/i;
 /** Explicit "custom request" phrasing — the ONLY free-text trigger for the
  *  generic custom fallback (vague chatter must return a 400 instead). */
 const CUSTOM_REQUEST_PATTERN = /\bcustom request\b/i;
@@ -135,6 +195,15 @@ const FLIGHT_INTENT_PATTERN_INTL =
  * "this trip has no flights to reroute" is confidently wrong, so only an
  * explicit air-travel word (or a real flight number) short-circuits to 404.
  */
+/** English OR any shipped language, per branch. */
+const weatherIntentLike = (t: string) => WEATHER_INTENT_PATTERN.test(t) || WEATHER_INTENT_INTL.test(t);
+const hotelIntentLike = (t: string) => HOTEL_INTENT_PATTERN.test(t) || HOTEL_INTENT_INTL.test(t);
+const hotelTroubleLike = (t: string) => HOTEL_TROUBLE_PATTERN.test(t) || HOTEL_TROUBLE_INTL.test(t);
+const activityIntentLike = (t: string) =>
+  ACTIVITY_INTENT_PATTERN.test(t) || ACTIVITY_INTENT_INTL.test(t);
+const strikeIntentLike = (t: string) => STRIKE_INTENT_PATTERN.test(t) || STRIKE_INTENT_INTL.test(t);
+const unwellIntentLike = (t: string) => UNWELL_INTENT_PATTERN.test(t) || UNWELL_INTENT_INTL.test(t);
+
 /** English OR any shipped language. */
 function flightIntentLike(text: string): boolean {
   return FLIGHT_INTENT_PATTERN.test(text) || FLIGHT_INTENT_PATTERN_INTL.test(text);
@@ -201,12 +270,48 @@ function truncate(text: string, max = 140): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
-function delayMinutesFromIntent(intent: string): number {
+/**
+ * The delay the traveller actually STATED, or `null` when they stated none.
+ *
+ * Kept separate from the defaulting below because the difference between
+ * "they said four hours" and "we assumed four hours" is the difference
+ * between a fact and an invention, and only one of them may move a schedule.
+ */
+function statedDelayMinutes(intent: string): number | null {
   const match = DELAY_HOURS_PATTERN.exec(intent);
-  if (!match) return DEFAULT_DELAY_MINUTES;
+  if (!match) return null;
   const hours = Number.parseFloat(match[1].replace(",", "."));
-  if (!Number.isFinite(hours) || hours <= 0) return DEFAULT_DELAY_MINUTES;
+  if (!Number.isFinite(hours) || hours <= 0) return null;
   return Math.min(Math.round(hours * 60), MAX_DELAY_MINUTES);
+}
+
+/**
+ * How late is this, in minutes?
+ *
+ * ONLY ASK THIS ABOUT A TRANSPORT DELAY. Every mission used to run through
+ * here, so any wording without an explicit duration silently became a
+ * four-hour delay — and that number was then propagated through the graph as
+ * if the traveller had reported it.
+ *
+ * Measured live on 2026-09-18, that one default produced most of the
+ * nonsense in the battery. "My hotel is overbooked" shifted check-in four
+ * hours and reshuffled the whole day to "match your new arrival", when
+ * nothing about the traveller's arrival had changed. "Transit strike
+ * tomorrow" put a Singapore→Rome flight four hours late and then announced
+ * "you are not in town until 14:20" — a local strike cannot delay a
+ * long-haul flight, and the engine said it anyway.
+ *
+ * Four hours is a reasonable stand-in for "I missed my flight, I need the
+ * next departure". It is a fabrication everywhere else, so everywhere else
+ * now gets the stated duration or zero.
+ */
+function flightDelayMinutes(intent: string): number {
+  return statedDelayMinutes(intent) ?? DEFAULT_DELAY_MINUTES;
+}
+
+/** Nothing is late unless the traveller said something is late. */
+function nonTransportDelayMinutes(intent: string): number {
+  return statedDelayMinutes(intent) ?? 0;
 }
 
 /** Deterministic weather hint from the intent text (drives activity swaps). */
@@ -247,6 +352,55 @@ function flightNumberOf(entry: RefEntry): string | null {
  * `explicitNodeId` (Copilot tapped a specific node) wins over keyword
  * resolution when it exists in the trip's nodeRefs.
  */
+/**
+ * A new departure time the traveller STATED — "moved to 6am", "now leaves at
+ * 18:40", "décalé à 21h30".
+ *
+ * The airline told them a time. Using it is reading a fact; falling back to
+ * the four-hour default here is inventing one. Verified on the deployed
+ * Worker on 2026-09-18, "the airline moved my flight to 6am, that's
+ * impossible" produced "Delayed flight SQ634" with a four-hour delay nobody
+ * mentioned, and cancelled three activities off the back of it.
+ *
+ * Returns minutes past midnight, or null when no time was stated.
+ */
+const STATED_TIME_PATTERN =
+  /\b(?:to|at|for|à|a|auf|um|para)\s*(\d{1,2})\s*(?::|h|\.)?\s*(\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?/i;
+
+function statedDepartureMinutes(intent: string): number | null {
+  const match = STATED_TIME_PATTERN.exec(intent);
+  if (!match) return null;
+  let hour = Number.parseInt(match[1], 10);
+  const minutes = match[2] ? Number.parseInt(match[2], 10) : 0;
+  const meridiem = match[3]?.toLowerCase().replace(/\./g, "");
+  if (!Number.isFinite(hour) || !Number.isFinite(minutes)) return null;
+  if (minutes > 59) return null;
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+  if (hour > 23) return null;
+  // Without am/pm a bare hour is ambiguous; only a 24-hour-looking value or an
+  // explicit meridiem is trustworthy enough to move a flight on.
+  if (!meridiem && !match[2] && hour < 13) return null;
+  return hour * 60 + minutes;
+}
+
+/** The traveller is reporting a SCHEDULE CHANGE, not a delay they suffered. */
+const SCHEDULE_CHANGE_PATTERN =
+  /\b(moved|rescheduled|changed|shifted|brought forward|now (leaves|departs)|d[ée]cal|avanc|chang|adelant|cambiad|verlegt|vorverlegt|ge[äa]ndert)\b/i;
+
+/**
+ * A mission's `description` becomes the approval sheet's HEADING.
+ *
+ * Every branch below used to append the traveller's own sentence to it.
+ * Photographed at accessibility text size on 2026-09-18, that filled six bold
+ * lines and pushed the plan itself entirely below the fold. The headings are
+ * therefore short and derived — but they stay machine-readable, because
+ * several checks downstream sniff this very string: the orchestrator reads
+ * `/overbook/i` to know a room is gone, `classifyDisruptionKind` reads it for
+ * a cancellation, and the ground rail's own gate reads it for trouble and
+ * failure words. Anything that classifies has to survive into the heading.
+ */
+
 export function parseMissionIntentForTrip(
   intent: string,
   hydrated: HydratedTrip,
@@ -275,7 +429,7 @@ export function parseMissionIntentForTrip(
         message: `Node "${explicitNodeId}" is not part of the trip "${meta.title}".`,
       };
     }
-    const weather = WEATHER_INTENT_PATTERN.test(text);
+    const weather = weatherIntentLike(text);
     const weatherHint = weatherHintFromIntent(text);
     if (weather) {
       return {
@@ -303,7 +457,7 @@ export function parseMissionIntentForTrip(
         /(错过|误机|没赶上)/.test(text); // zh-Hans
       category = missed ? "missed_flight" : "delay";
     } else if (ref.kind === "hotel") {
-      category = /\b(overbook\w*)\b/i.test(text) ? "hotel_overbooked" : "hotel";
+      category = OVERBOOKED_LIKE.test(text) ? "hotel_overbooked" : "hotel";
     } else if (ref.kind === "activity") {
       const cancelled = /\bcancel\w*\b/i.test(text);
       category = cancelled ? "activity_cancelled" : "delay";
@@ -317,7 +471,7 @@ export function parseMissionIntentForTrip(
       kind: "mission",
       mission: {
         nodeId: explicitNodeId,
-        delayMinutes: delayMinutesFromIntent(text),
+        delayMinutes: nonTransportDelayMinutes(text),
         description,
         origin: "reactive",
         kind: category,
@@ -326,7 +480,7 @@ export function parseMissionIntentForTrip(
   }
 
   // ── 1. Weather → proactive on the first OUTDOOR activity ─────────────────
-  if (WEATHER_INTENT_PATTERN.test(text)) {
+  if (weatherIntentLike(text)) {
     const activities = entriesOf(nodeRefs, "activity");
     let target = activities.find((a) => looksOutdoor(a.ref.label)) ?? activities[0];
     // Trips without activity nodes (e.g. transit-only): protect the first
@@ -346,7 +500,7 @@ export function parseMissionIntentForTrip(
         mission: {
           nodeId: target.id,
           delayMinutes: 0,
-          description: `Weather alert in ${meta.city || "the destination"}: ${shortIntent}`,
+          description: `Weather alert — ${meta.city || "the destination"}`,
           origin: "proactive",
           ...(weatherHint ? { weatherHint } : {}),
           evidence: {
@@ -359,6 +513,50 @@ export function parseMissionIntentForTrip(
         },
       };
     }
+  }
+
+  // ── 1b. A connection, judged before anything is called "delayed" ─────────
+  //
+  // This has to precede branch 2: "my connection is too tight, I'll never make
+  // the SECOND FLIGHT" is full of flight vocabulary, so the generic rail
+  // claimed it, picked the nearest upcoming leg, declared it four hours late
+  // on no evidence and cancelled three activities. Nothing was late. The
+  // question was whether a gap the traveller had already booked is survivable,
+  // and the graph could answer it all along.
+  //
+  // The SECOND leg is the target: that is the flight at risk, and the one a
+  // replacement search should be offering later departures for. Delay stays 0
+  // — a tight connection is not a delay, and inventing one here is what
+  // produced the wrong plan in the first place.
+  if (isConnectionMission(text)) {
+    const nowMs = Date.now();
+    const connections = findConnections(hydrated.graph.getNodes());
+    // The airport they named wins ("my connection at Doha" on a trip that
+    // changes there out AND back), then the next change still ahead of them.
+    const at = pickConnection(connections, { text, nowMs });
+    if (at) {
+      return {
+        kind: "mission",
+        mission: {
+          nodeId: at.toId,
+          delayMinutes: 0,
+          description: `Connection at ${at.atAirport} — ${at.toLabel}`,
+          origin: "reactive",
+          kind: "delay",
+        },
+      };
+    }
+    // The trip has no change of plane at all. Saying so beats answering about
+    // whichever flight happened to be next.
+    return {
+      kind: "error",
+      status: 400,
+      code: "no_connection_found",
+      message:
+        "We can't find a change of planes on this trip — no flight lists a stop, and every " +
+        "flight either leaves from somewhere else or has a stay between it and the one before. " +
+        "Tell us which flight you're worried about and we'll look at that.",
+    };
   }
 
   // ── 2. Missed flight / delay ──────────────────────────────────────────────
@@ -435,7 +633,43 @@ export function parseMissionIntentForTrip(
   }
 
   if (flightTarget) {
-    const delayMinutes = delayMinutesFromIntent(text);
+    // The airline gave them a new time — read it rather than defaulting.
+    const statedMinutes = statedDepartureMinutes(text);
+    const scheduleChange = SCHEDULE_CHANGE_PATTERN.test(text);
+    if (scheduleChange && statedMinutes !== null) {
+      const bookedMs = flightTarget.ref.time;
+      const bookedMinutes = new Date(bookedMs).getUTCHours() * 60 + new Date(bookedMs).getUTCMinutes();
+      const shift = statedMinutes - bookedMinutes;
+      if (shift <= 0) {
+        // A flight moved EARLIER is not something this engine can re-plan.
+        // `ItineraryGraph.handleDisruption` refuses a negative delay outright
+        // — the whole propagation model is "things move later", and what an
+        // earlier departure breaks is everything BEFORE it, which is a
+        // different algorithm rather than a missing branch. Saying so beats
+        // inventing a four-hour delay and cancelling three activities, which
+        // is what the default did here.
+        return {
+          kind: "error",
+          status: 400,
+          code: "earlier_departure_unsupported",
+          message:
+            "Your airline moved this flight EARLIER, and re-planning around that isn't something " +
+            "we can do yet — everything before the flight would have to move, not after it. " +
+            "Check in with the airline, and tell us if you need the day around it re-planned.",
+        };
+      }
+      return {
+        kind: "mission",
+        mission: {
+          nodeId: flightTarget.id,
+          delayMinutes: shift,
+          description: `Flight moved later — ${flightNumberOf(flightTarget) ?? "your flight"}`,
+          origin: "reactive",
+          kind: "delay",
+        },
+      };
+    }
+    const delayMinutes = flightDelayMinutes(text);
     // Unnamed leg ⇒ say "Missed flight", not "Missed flight your flight".
     const flightNo = flightNumberOf(flightTarget);
     // Localized, because the app is. The tiles send canonical English, but a
@@ -459,19 +693,21 @@ export function parseMissionIntentForTrip(
       mission: {
         nodeId: flightTarget.id,
         delayMinutes,
-        // When the intent named no flight, the swarm PICKED one — say which,
-        // and say it first so the note survives truncation. Silently
-        // targeting a flight the traveler did not name is exactly the kind of
-        // guess the Trust Layer exists to prevent.
-        description: truncate(targetNote ? `${targetNote} ${base}` : base),
+        // When the intent named no flight, the swarm PICKED one — say which.
+        // Silently targeting a flight the traveler did not name is exactly
+        // the kind of guess the Trust Layer exists to prevent. It travels as
+        // its own field: the headline stays the incident, the Activity Stream
+        // carries the choice, and neither can push the other off the screen.
+        description: truncate(base),
         origin: "reactive",
         kind: missed ? "missed_flight" : "delay",
+        ...(targetNote ? { targetNote } : {}),
       },
     };
   }
 
   // ── 3. Hotel trouble → first hotel_check_in node ─────────────────────────
-  if (HOTEL_INTENT_PATTERN.test(text)) {
+  if (hotelIntentLike(text) && hotelTroubleLike(text)) {
     const hotels = entriesOf(nodeRefs, "hotel");
     if (hotels.length > 0) {
       const words = text
@@ -481,13 +717,15 @@ export function parseMissionIntentForTrip(
       const target =
         hotels.find((h) => words.some((word) => h.ref.label.toLowerCase().includes(word))) ??
         hotels[0];
-      const isOverbooked = /\b(overbook\w*)\b/i.test(text);
+      const isOverbooked = OVERBOOKED_LIKE.test(text);
       return {
         kind: "mission",
         mission: {
           nodeId: target.id,
-          delayMinutes: delayMinutesFromIntent(text),
-          description: `Hotel issue at ${target.ref.label}: ${shortIntent}`,
+          delayMinutes: nonTransportDelayMinutes(text),
+          description: isOverbooked
+            ? `Hotel overbooked — ${target.ref.label}`
+            : `Hotel issue — ${target.ref.label}`,
           origin: "reactive",
           evidence: isOverbooked
             ? { kind: "event", source: "user_report", confidence: 1, detail: "overbooked" }
@@ -503,8 +741,62 @@ export function parseMissionIntentForTrip(
     }
   }
 
+  // ── 3b. A broken ground connection ───────────────────────────────────────
+  //
+  // Its own branch, ahead of the activity and custom rails, for two reasons.
+  // It stops "my taxi is cancelled" being read as a cancelled ACTIVITY (it
+  // matched on the word "cancelled" and rescheduled a duty-free stop). And it
+  // targets the ground leg itself when the trip has one, which is what lets
+  // the ground rail answer about the journey that actually broke rather than
+  // about the next thing on the calendar.
+  //
+  // The traveller's own words are kept in the description: everything
+  // downstream — the ground rail's own gate, the airport check — reads them.
+  // Strikes keep their own branch below: it already targets the ground leg and
+  // carries the category and evidence the rest of the pipeline reads. This one
+  // exists for the ground failures that had NO branch at all — a taxi that
+  // never came, a cancelled transfer, a no-show pickup.
+  if (isGroundMission(text) && !strikeIntentLike(text)) {
+    const transfers = entriesOf(nodeRefs, "transfer");
+    const nowMs = Date.now();
+    const all = Object.entries(nodeRefs)
+      .map(([id, ref]) => ({ id, ref }))
+      .sort((a, b) => a.ref.time - b.ref.time);
+    const target =
+      transfers.find((t) => t.ref.time >= nowMs) ??
+      transfers[0] ??
+      all.find((n) => n.ref.time >= nowMs) ??
+      all[0];
+    if (target) {
+      return {
+        kind: "mission",
+        mission: {
+          nodeId: target.id,
+          // Nothing is late. A ride that never came is not a delay, and
+          // shifting the schedule by a made-up amount is how this used to
+          // move three activities for a cancelled taxi.
+          delayMinutes: nonTransportDelayMinutes(text),
+          // Derived, not echoed: this string is the approval sheet's heading,
+          // and the traveller's own sentence filled six bold lines at
+          // accessibility text size, pushing the answer off the screen.
+          description: groundHeadline(text),
+          origin: "reactive",
+          kind: "custom",
+        },
+      };
+    }
+  }
+
   // ── 4. Activity cancelled → name match, else first activity ─────────────
-  if (ACTIVITY_INTENT_PATTERN.test(text)) {
+  //
+  // A BROKEN CONNECTION IS NOT A CANCELLED ACTIVITY. "My taxi to the airport
+  // is cancelled" matches this branch on the word "cancelled", and live on
+  // 2026-09-18 it picked the activity whose name shared a word — "Kansai
+  // Airport Departure & Duty-Free" — and moved the traveller's duty-free
+  // shopping to the following afternoon. They had asked how to reach the
+  // airport. The ground rail answers that question with real durations; this
+  // branch must not answer it with a rescheduled souvenir stop.
+  if (activityIntentLike(text)) {
     const activities = entriesOf(nodeRefs, "activity");
     if (activities.length > 0) {
       const words = text
@@ -518,8 +810,8 @@ export function parseMissionIntentForTrip(
         kind: "mission",
         mission: {
           nodeId: target.id,
-          delayMinutes: delayMinutesFromIntent(text),
-          description: `Activity "${target.ref.label}" needs a new slot: ${shortIntent}`,
+          delayMinutes: nonTransportDelayMinutes(text),
+          description: `Activity cancelled — ${target.ref.label}`,
           origin: "reactive",
           kind: "activity_cancelled",
         },
@@ -527,17 +819,27 @@ export function parseMissionIntentForTrip(
     }
   }
 
-  // ── 5. Strike → first transfer/train node, else first flight ────────────
-  if (STRIKE_INTENT_PATTERN.test(text)) {
+  // ── 5. Strike → a GROUND transit leg, never a flight ────────────────────
+  //
+  // This used to fall back to `flights[0]` when the trip had no transfer
+  // node, and that fallback was a fabrication with visible consequences.
+  // Live on 2026-09-18, "Transit strike tomorrow" on the Rome trip landed on
+  // Flight SQ 366 SIN → FCO, put it four hours late, and told the traveller
+  // "You are not in town until about 14:20" — three activities moved because
+  // of a causal link that does not exist. A metro/bus/rail strike at the
+  // destination does not delay a long-haul flight; what it threatens is the
+  // traveller's ability to MOVE AROUND, which is what the branches below
+  // address.
+  if (strikeIntentLike(text)) {
     const transfers = entriesOf(nodeRefs, "transfer");
-    const transitTarget = transfers[0] ?? flights[0];
+    const transitTarget = transfers[0];
     if (transitTarget) {
       return {
         kind: "mission",
         mission: {
           nodeId: transitTarget.id,
-          delayMinutes: delayMinutesFromIntent(text),
-          description: `Strike affecting ${transitTarget.ref.label}: ${shortIntent}`,
+          delayMinutes: nonTransportDelayMinutes(text),
+          description: `Transit strike — ${transitTarget.ref.label}`,
           origin: "reactive",
           kind: "strike",
         },
@@ -565,7 +867,7 @@ export function parseMissionIntentForTrip(
       mission: {
         nodeId: fallbackTarget.id,
         delayMinutes: 0,
-        description: `Strike in ${meta.city || meta.title}: re-planning around ${fallbackTarget.ref.label}: ${shortIntent}`,
+        description: `Transit strike — ${meta.city || meta.title}`,
         origin: "proactive",
         evidence: {
           kind: "user_report",
@@ -579,7 +881,7 @@ export function parseMissionIntentForTrip(
   }
 
   // ── 6. Unwell / lighten the day → proactive on the first activity ───────
-  if (UNWELL_INTENT_PATTERN.test(text)) {
+  if (unwellIntentLike(text)) {
     const activities = entriesOf(nodeRefs, "activity");
     if (activities.length === 0) {
       // Nothing to lighten: a trip without activity nodes has no actionable
@@ -591,12 +893,18 @@ export function parseMissionIntentForTrip(
         message: `This trip has no activities to lighten ("${meta.title}").`,
       };
     }
+    // The day they are LIVING, not day one. Targeting `activities[0]` lightened
+    // the first day of the trip however far into it the traveller was — and
+    // the day being lightened is the day the target sits on.
+    const nowMs = Date.now();
+    const target =
+      activities.find((a) => a.ref.time >= nowMs) ?? activities[activities.length - 1];
     return {
       kind: "mission",
       mission: {
-        nodeId: activities[0].id,
+        nodeId: target.id,
         delayMinutes: 0,
-        description: `Lighten the day in ${meta.city || meta.title}: ${shortIntent}`,
+        description: `Lighten the day — ${meta.city || meta.title}`,
         origin: "proactive",
         evidence: {
           kind: "user_report",
@@ -609,34 +917,72 @@ export function parseMissionIntentForTrip(
     };
   }
 
-  // ── 7. Custom fallback (Greedy Catch-All) ────────────────────────────────
-  // Interpret as a general/custom issue applying to the trip. We target the
-  // first upcoming node (or the first node overall if none are in the future).
-  const allNodes = Object.entries(nodeRefs)
-    .map(([id, ref]) => ({ id, ref }))
-    .sort((a, b) => a.ref.time - b.ref.time);
+  // ── 7. A custom request — but only when it really is one ─────────────────
+  //
+  // THIS BRANCH USED TO ACCEPT EVERYTHING. The gate below was written,
+  // documented in SPEC-QA §3, described at length in the UI-test fixtures —
+  // and never wired up: `CUSTOM_REQUEST_PATTERN` and the two IMPERATIVE
+  // patterns sat unused while the branch took the first upcoming node for any
+  // text at all. Measured against the deployed Worker on 2026-09-18, every
+  // one of these was accepted and answered:
+  //
+  //   "help"                              → a mission
+  //   "what's the wifi password at my hotel"
+  //                                       → classified as a HOTEL ISSUE, and
+  //                                         answered "your booking is
+  //                                         untouched; confirm a late arrival"
+  //   "my suitcase didn't arrive"         → the first upcoming node was a
+  //                                         FLIGHT, so the flight rail ran and
+  //                                         proposed three rebookings at
+  //                                         2,306,617 IDR (~€135), cancelling
+  //                                         four activities
+  //
+  // A traveller with a lost suitcase being shown a €135 ticket is the worst
+  // failure this system can produce, and it needed no disruption at all —
+  // only a sentence the parser did not understand.
+  //
+  // So the swarm now knows its own edges. A request qualifies when it names
+  // one ("custom request"), or asks for an ACTION on something the engine can
+  // actually act on. Everything else is refused, out loud, with what we do
+  // handle — because answering a question we did not understand, confidently
+  // and expensively, is worse than admitting we cannot.
+  const isCustomRequest =
+    CUSTOM_REQUEST_PATTERN.test(text) ||
+    (IMPERATIVE_ACTION_PATTERN.test(text) && IMPERATIVE_TARGET_PATTERN.test(text));
 
-  if (allNodes.length > 0) {
+  if (isCustomRequest) {
+    // A flight is never a custom target: branch 2 owns flight problems, so
+    // anything reaching here is not one — and putting a flight node on this
+    // rail is exactly what turned a lost suitcase into a rebooking.
     const now = Date.now();
-    const target = allNodes.find((n) => n.ref.time >= now) ?? allNodes[0];
-    return {
-      kind: "mission",
-      mission: {
-        nodeId: target.id,
-        delayMinutes: delayMinutesFromIntent(text),
-        description: `Custom request for ${meta.city || meta.title}: ${shortIntent}`,
-        origin: "reactive",
-        kind: "custom",
-      },
-    };
+    const actionable = Object.entries(nodeRefs)
+      .map(([id, ref]) => ({ id, ref }))
+      .filter(({ ref }) => ref.kind !== "flight")
+      .sort((a, b) => a.ref.time - b.ref.time);
+    const target = actionable.find((n) => n.ref.time >= now) ?? actionable[0];
+    if (target) {
+      return {
+        kind: "mission",
+        mission: {
+          nodeId: target.id,
+          delayMinutes: nonTransportDelayMinutes(text),
+          description: `Custom request — ${meta.city || meta.title}`,
+          origin: "reactive",
+          kind: "custom",
+        },
+      };
+    }
   }
 
   return {
     kind: "error",
     status: 400,
-    code: "invalid_intent",
+    code: "out_of_scope",
     message:
-      "Could not determine a mission target from the intent (mention a flight, hotel, activity, weather or strike).",
+      "We couldn't match that to something the swarm can re-plan. It handles missed or delayed " +
+      "flights, hotel trouble, cancelled activities, weather, transport strikes, a broken ride to " +
+      "the airport, and lightening a day you can't face — tell us which of those it is, or name " +
+      "the booking you want changed.",
   };
 }
 

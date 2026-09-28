@@ -279,3 +279,74 @@ describe("HotelAgent", () => {
     });
   });
 });
+
+/**
+ * What an unreadable policy may and may not set in motion.
+ *
+ * Reported from a live mission 2026-09-19: the Trust Layer showed "Hotel
+ * Gracery Shinjuku: no change needed" and, two panels down, APA Hotel Shinjuku
+ * Kabukicho Chuo with photos and a nightly rate as "YOUR NEW PLAN". Nobody had
+ * decided to move hotels. The policy lookup had failed, the degraded branch
+ * reported `lateCheckInAvailable: false` so as not to promise a late arrival,
+ * and that was read as a refusal — so the agent went shopping.
+ */
+describe("an unreadable policy is not a refusal", () => {
+  it("does not search for a replacement room when the policy could not be read", async () => {
+    let searches = 0;
+    const provider = {
+      providerName: "test",
+      getHotelPolicies: async () => {
+        throw new Error("quota exhausted");
+      },
+      searchAlternativeRooms: async () => {
+        searches += 1;
+        return {
+          rooms: [{ roomId: "r1", hotelName: "APA Hotel", ratePerNight: 32_085, currency: "JPY" }],
+        };
+      },
+    } as unknown as ConstructorParameters<typeof HotelAgent>[0];
+
+    const result = await new HotelAgent(provider).assessHotelImpact({
+      hotelNodeId: "hotel-checkin",
+      hotelName: "Hotel Gracery Shinjuku",
+      originalCheckIn: "2026-11-12T15:00:00.000Z",
+      shiftedCheckIn: "2026-11-12T23:40:00.000Z",
+      guests: 1,
+    });
+
+    expect(searches).toBe(0);
+    expect(result.alternativeRooms).toEqual([]);
+    expect(result.recommendation).toBe("keep_as_is");
+    expect(result.degraded).toBe(true);
+  });
+
+  it("still finds a replacement when the room is actually GONE", async () => {
+    // An overbooking is not an unknown: the property has said the room is not
+    // there. Someone must sleep somewhere, so we look whatever the policy read.
+    let searches = 0;
+    const provider = {
+      providerName: "test",
+      getHotelPolicies: async () => {
+        throw new Error("quota exhausted");
+      },
+      searchAlternativeRooms: async () => {
+        searches += 1;
+        return {
+          rooms: [{ roomId: "r1", hotelName: "APA Hotel", ratePerNight: 32_085, currency: "JPY" }],
+        };
+      },
+    } as unknown as ConstructorParameters<typeof HotelAgent>[0];
+
+    const result = await new HotelAgent(provider).assessHotelImpact({
+      hotelNodeId: "hotel-checkin",
+      hotelName: "Hotel Gracery Shinjuku",
+      originalCheckIn: "2026-11-12T15:00:00.000Z",
+      shiftedCheckIn: "2026-11-12T23:40:00.000Z",
+      guests: 1,
+      isOverbooked: true,
+    });
+
+    expect(searches).toBe(1);
+    expect(result.alternativeRooms).toHaveLength(1);
+  });
+});

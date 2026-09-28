@@ -38,6 +38,7 @@ import {
   GEMINI_CALLS_PER_MISSION,
   type GeminiDegradeReason,
 } from "@/agents/geminiDegrade";
+import { configuredGeminiModel } from "@/agents/geminiUsage";
 import type { GeminiCallBudget, GeminiUsageObserver } from "@/agents/geminiUsage";
 import { airportInfo } from "./airports";
 import {
@@ -75,6 +76,19 @@ export interface Criticism {
   /** One sentence, in the traveller's own terms. Shown to them on a drop. */
   explanation: string;
   suggested_action: CriticAction;
+  /**
+   * Who said so. A rule is a PROOF about the clock and the geography; the
+   * model is an OPINION about the world, and it can be wrong in a way a rule
+   * cannot.
+   *
+   * Live on 2026-09-18 the model reported "Tokyo Metropolitan Government
+   * Building Observation Deck closes much earlier than 21:00" and the engine
+   * cancelled the visit. The South deck is open until 22:00, last entry 21:30
+   * — the traveller lost something they could have done, on a confident
+   * sentence that was simply untrue. So provenance is carried, and
+   * {@link rulingsFor} never lets an opinion cancel.
+   */
+  origin?: "rules" | "model";
 }
 
 export interface CriticVerdict {
@@ -82,6 +96,16 @@ export interface CriticVerdict {
   criticisms: Criticism[];
   /** Which rail produced it — `gemini` means the model ADDED to the rules. */
   source: "gemini" | "deterministic";
+  /**
+   * How many findings the MODEL returned, after sanitizing and BEFORE the
+   * merge discards those about nodes the rules already ruled.
+   *
+   * Without it "the model contributed nothing" and "the model spoke and the
+   * merge swallowed it" look identical in a trace, and they call for opposite
+   * fixes. Three live batteries reported zero world-knowledge criticisms and
+   * neither question could be answered from the evidence.
+   */
+  modelCriticisms?: number;
   /** Why the model was not used (absent when it was). */
   degradeReason?: GeminiDegradeReason;
 }
@@ -101,6 +125,29 @@ export interface CriticItem {
   category: ItemCategory;
   /** Where it happens, when the trip says so. */
   city?: string;
+  /**
+   * The venue's OWN published schedule already decided this slot.
+   *
+   * The clock rules below are heuristics about when meals and activities
+   * usually happen; a published opening time is a fact about when the door is
+   * open. When both speak, the fact wins. Without this the engine moved a
+   * breakfast booking to the hour the restaurant actually opens — and the
+   * critic then cancelled it, because "lunchtime" is outside the breakfast
+   * window it had inferred from the original 08:00 slot.
+   */
+  hoursVerified?: boolean;
+  /**
+   * True for an item the engine did NOT propose to change — included so the
+   * MODEL can see the resulting day, not just the edits.
+   *
+   * The deterministic rules deliberately skip these. They were built to judge
+   * a MOVE against an arrival, and applied to something nobody moved they fire
+   * on items that were always fine: wiring the wider context without this
+   * split cancelled activities the engine had correctly left alone. Venue
+   * knowledge is the reason an untouched item is worth looking at, and venue
+   * knowledge is exactly what the rules do not have.
+   */
+  untouched?: boolean;
 }
 
 /** Everything the critic is allowed to reason about. Nothing else is sent. */
@@ -137,20 +184,6 @@ export interface CriticContext {
 }
 
 // ------------------------------------------------------ the deterministic rail
-
-/**
- * Venue classes that shut at or near dusk, whatever the season says. A shrine,
- * a garden or a castle keep "sunset hours": the gate closes, the grounds empty
- * and the ticket office is long shut. This is a FLOOR, deliberately coarse —
- * the model is what knows that Meiji Jingu specifically closes around 16:30 in
- * November. The floor exists so the offline rail is not blind to the whole
- * issue class.
- */
-const SUNSET_CLOSING_PATTERN =
-  /\b(shrine|jingu|jinja|temple|tera|wat |pagoda|garden|gardens|park|zoo|botanic\w*|castle|palace|fort|ruins|cemetery|necropolis|viewpoint|lookout|summit|trail|hike|hiking|safari|vineyard|orchard|archaeolog\w*|acropolis|forum|colosseum)\b/i;
-
-/** Past this hour a sunset-closing venue is assumed shut. */
-const SUNSET_CLOSE_MINUTES = 17 * 60;
 
 function parse(iso: string | undefined): number {
   return iso ? Date.parse(iso) : Number.NaN;
@@ -195,6 +228,7 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
       const nightsLost = unstayedNights(bookedMs, remedyMs);
       const city = airportInfo(context.arrival?.airport)?.city ?? "the city";
       out.push({
+        origin: "rules",
         node_id: context.hotel.node_id,
         issue_type: "HOTEL_PRECEDES_ARRIVAL",
         explanation:
@@ -207,6 +241,7 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
   }
 
   for (const item of context.items) {
+    if (item.untouched === true) continue;
     const startMs = parse(item.proposed_start);
     if (!Number.isFinite(startMs)) continue;
 
@@ -215,13 +250,19 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
     const floorMs = item.category === "ground_transfer" ? readyForPickupMs : readyInCityMs;
     if (Number.isFinite(floorMs) && startMs < floorMs) {
       out.push({
+        origin: "rules",
         node_id: item.node_id,
         issue_type: "UNREALISTIC_TRANSIT",
         explanation:
           item.category === "ground_transfer"
             ? `The flight lands at ${hhmm(arrivalMs)}; you clear immigration and baggage at about ${hhmm(floorMs)}, so a ${hhmm(startMs)} pickup would be waiting for you.`
             : `You are not in town until about ${hhmm(floorMs)} — ${item.name} at ${hhmm(startMs)} cannot happen.`,
-        suggested_action: item.category === "ground_transfer" ? "RETIME" : "DROP",
+        // RETIME, not DROP: everywhere else the engine raises a slot to the
+        // first hour that works and only cancels when none does, and
+        // `rulingsFor` does exactly that. Ruling DROP here made the critic the
+        // one component that cancelled what the rest of the engine would have
+        // rescued — a surf lesson simply waiting for the traveller to land.
+        suggested_action: "RETIME",
       });
       continue;
     }
@@ -232,14 +273,28 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
     //     — the same rule `placeDisplacedItem` enforces on the cascade path,
     //     which the proposal path used to be able to slip past once the
     //     arrival clamp had pushed a slot over midnight.
+    //     …but ONLY when the ARRIVAL is what forced it. A move to another day
+    //     is otherwise the agent's own decision — the weather rail deliberately
+    //     puts a rained-off walk on tomorrow — and overriding a decision is not
+    //     the critic's job. The test is whether the traveller now reaches town
+    //     on a different day than the item was booked for: then no placement on
+    //     its own day was ever possible. This mirrors the `clampCrossedDay`
+    //     rule at the deterministic choke point, which has the same intent and
+    //     more information; the critic covers the rails that choke point never
+    //     sees.
     const originalMs = parse(item.original_start);
-    if (
+    const arrivalForcedTheDay =
+      Number.isFinite(readyInCityMs) &&
       Number.isFinite(originalMs) &&
+      utcDayIndex(readyInCityMs) !== utcDayIndex(originalMs);
+    if (
+      arrivalForcedTheDay &&
       utcDayIndex(startMs) !== utcDayIndex(originalMs) &&
       item.category !== "lodging" &&
       item.category !== "primary_transit"
     ) {
       out.push({
+        origin: "rules",
         node_id: item.node_id,
         issue_type: "UNREALISTIC_TRANSIT",
         explanation: `${item.name} was booked for ${dayKey(originalMs)} and could now only happen on ${dayKey(startMs)}, which already has its own plan.`,
@@ -249,10 +304,12 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
     }
 
     // 3. Human hours. Lodging, transit and transfers are exempt by rule — a
-    //    late check-in and a 01:00 pickup are real, bookable services.
-    const verdict = isSensibleStart(item.category, item.name, startMs);
+    //    late check-in and a 01:00 pickup are real, bookable services. So is
+    //    anything the venue's own schedule has already ruled on.
+    const verdict = item.hoursVerified === true ? { ok: true as const } : isSensibleStart(item.category, item.name, startMs);
     if (!verdict.ok) {
       out.push({
+        origin: "rules",
         node_id: item.node_id,
         issue_type:
           verdict.reason === "sleeping_hours" ? "CIRCADIAN_CONFLICT" : "CLOSED_VENUE",
@@ -265,19 +322,15 @@ export function deterministicCriticisms(context: CriticContext): Criticism[] {
       continue;
     }
 
-    // 4. The coarse dusk floor (see SUNSET_CLOSING_PATTERN).
-    if (
-      SUNSET_CLOSING_PATTERN.test(item.name) &&
-      !isNightActivity(item.name) &&
-      minutesOfDay(startMs) >= SUNSET_CLOSE_MINUTES
-    ) {
-      out.push({
-        node_id: item.node_id,
-        issue_type: "CLOSED_VENUE",
-        explanation: `${item.name} is an outdoor/grounds visit that closes around dusk — ${hhmm(startMs)} is after the gates shut.`,
-        suggested_action: "DROP",
-      });
-    }
+    // There is deliberately NO rule about dusk here.
+    //
+    // A coarse one existed: anything matching shrine/garden/park/trail after
+    // 17:00 was cancelled. It cancelled a coastal hike at 18:00 in Lisbon in
+    // September, where the sun sets near 19:30. Sunset depends on latitude and
+    // date, and guessing it with a constant is an invention dressed as a rule
+    // — a wrong cancellation costs the traveller something real, a missed one
+    // costs them nothing they had. Venue hours and daylight are exactly what
+    // the model is asked for, and the model is the only one of us that knows.
   }
   return out;
 }
@@ -381,6 +434,7 @@ export function sanitizeCriticisms(value: unknown, knownNodeIds: ReadonlySet<str
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
+      origin: "model",
       node_id: nodeId,
       issue_type: issueType as CriticIssueType,
       explanation: explanation.slice(0, EXPLANATION_MAX),
@@ -422,7 +476,19 @@ export interface SemanticCriticConfig {
 }
 
 const DEFAULT_TIMEOUT_MS = 8_000;
-const DEFAULT_MODEL = GEMINI_MODEL_CASCADE[0];
+/**
+ * The critic leads on a `-lite` tier, not on the most capable one.
+ *
+ * The `-flash` tiers allow 20 requests a DAY; the `-lite` tiers allow 500. On a
+ * live battery of 18 missions the critic degraded on `quota_429` four times and
+ * produced zero findings, because the liaison and the day reorganizer had
+ * already spent the day's flash allowance before it was asked.
+ *
+ * Knowing that Kabukicho is a nightlife district does not need the strongest
+ * model — it needs to be ASKED. A lite tier that answers beats a capable one
+ * that is out of quota, and the ladder still falls through to the others.
+ */
+const DEFAULT_MODEL = GEMINI_MODEL_CASCADE.find((m) => m.includes("lite")) ?? GEMINI_MODEL_CASCADE[0];
 
 export class SemanticCritic {
   private readonly client: GeminiJsonClient;
@@ -431,10 +497,14 @@ export class SemanticCritic {
 
   constructor(config: SemanticCriticConfig = {}) {
     this.enabled = config.enabled ?? true;
+    this.modelInUse = config.model ?? configuredGeminiModel("critic", DEFAULT_MODEL);
     this.client = new GeminiJsonClient({
       label: "critic",
+      // Allowed into the shared budget's reserve: the critic is asked last,
+      // and without this it is the only consumer that never gets served.
+      privileged: true,
       ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
-      model: config.model ?? DEFAULT_MODEL,
+      model: this.modelInUse,
       // Tighter than the liaison's 10s: the critic sits on the resolve path,
       // between the traveller's answer and the plans they are shown, and a
       // slow opinion is worth less than a fast deterministic one.
@@ -452,6 +522,9 @@ export class SemanticCritic {
     });
   }
 
+  /** The tier the critic leads with — audit feed, and what the quota test pins. */
+  readonly modelInUse: string;
+
   /** Why the last review degraded to the rules alone (undefined = it did not). */
   get lastDegradeReason(): GeminiDegradeReason | undefined {
     return this.degradeReason;
@@ -468,10 +541,12 @@ export class SemanticCritic {
   async review(context: CriticContext): Promise<CriticVerdict> {
     this.degradeReason = undefined;
     const rules = deterministicCriticisms(context);
+    let modelCriticisms: number | undefined;
     const settle = (criticisms: Criticism[], source: CriticVerdict["source"]): CriticVerdict => ({
       is_sane: criticisms.length === 0,
       criticisms,
       source,
+      ...(modelCriticisms !== undefined ? { modelCriticisms } : {}),
       ...(this.degradeReason !== undefined ? { degradeReason: this.degradeReason } : {}),
     });
 
@@ -503,6 +578,7 @@ export class SemanticCritic {
         console.error("[critic] verdict payload invalid — rules only (degrade: invalid_output)");
         return settle(rules, "deterministic");
       }
+      modelCriticisms = model.length;
       return settle(mergeCriticisms(rules, model), "gemini");
     } catch (error) {
       this.degradeReason = "exception";
@@ -615,7 +691,11 @@ export function rulingsFor(
     if (!Number.isFinite(startMs)) continue;
     const bookedMs = parse(item.original_start);
 
-    if (criticism.suggested_action === "DROP") {
+    // A PROOF may cancel. An OPINION may only move. The model's DROP is read
+    // as "this does not work here", and the engine answers by looking for an
+    // hour that does — cancelling only when a rule agrees, never on a
+    // sentence that could be wrong about a venue.
+    if (criticism.suggested_action === "DROP" && criticism.origin !== "model") {
       rulings.set(item.node_id, { action: "drop", reason, issue: criticism.issue_type });
       continue;
     }
@@ -630,10 +710,18 @@ export function rulingsFor(
       Number.isFinite(bookedMs) ? bookedMs : startMs,
     );
     if (slotMs === null) {
-      rulings.set(item.node_id, { action: "drop", reason, issue: criticism.issue_type });
-    } else {
+      // Nothing left today. A rule may end it there; the model may not — the
+      // traveller keeps the booking they made and nothing is lost to a
+      // sentence nobody checked.
+      if (criticism.origin !== "model") {
+        rulings.set(item.node_id, { action: "drop", reason, issue: criticism.issue_type });
+      }
+    } else if (slotMs !== startMs) {
       rulings.set(item.node_id, { action: "retime", atMs: slotMs, reason, issue: criticism.issue_type });
     }
+    // slotMs === startMs: the objection stands but the item is already at the
+    // only sensible hour it has. Moving it to where it already is would add a
+    // change line about nothing.
   }
   return rulings;
 }
@@ -647,6 +735,11 @@ export function rulingsFor(
  */
 function nextSensibleSlot(item: CriticItem, fromMs: number, originalMs: number): number | null {
   if (item.category === "ground_transfer" || item.category === "lodging") return fromMs;
+  // The venue's published schedule already placed this. Re-judging it against
+  // a guessed meal window cancels the very booking the real hours rescued: a
+  // restaurant that opens at noon is not "outside the breakfast window", it is
+  // simply a restaurant that opens at noon.
+  if (item.hoursVerified === true) return fromMs;
   const window = reasonableStartWindow(item.category, item.name, minutesOfDay(originalMs));
   if (!window) return fromMs;
   const minutes = minutesOfDay(fromMs);

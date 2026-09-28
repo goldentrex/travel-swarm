@@ -33,9 +33,15 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const API = `${process.env.SWARM_API_ORIGIN ?? "http://127.0.0.1:8787"}/api/hackathon`;
-const SUPABASE_URL = process.env.SUPABASE_URL ?? "";
-const TEST_USER = process.env.SIM_TEST_USER ?? ""; // a user id in YOUR Supabase project
+/** The deployed Worker by default; `--api` points the battery at a local
+ *  `wrangler dev` so a change can be measured BEFORE it reaches production. */
+const API_BASE =
+  process.argv.includes("--api")
+    ? process.argv[process.argv.indexOf("--api") + 1]
+    : "https://swarm.globeplanner.app";
+const API = `${API_BASE}/api/hackathon`;
+const SUPABASE_URL = "https://swlhcemlqaqnrmyguflx.supabase.co";
+const TEST_USER = "c4fb4880-37d6-4a10-ab5d-cdaab5b72df7"; // victor.gaya@icloud.com
 
 // --------------------------------------------------------------------- env
 
@@ -53,9 +59,12 @@ function loadEnv() {
 }
 
 const ENV = loadEnv();
-const TOKEN = ENV.SWARM_DEMO_TOKEN;
+// A real environment variable WINS over the dotenv files, so pointing the
+// battery at a preview worker never means editing the traveller's own
+// .env.local — which is a file they use, not a scratch pad.
+const TOKEN = process.env.SWARM_DEMO_TOKEN || ENV.SWARM_DEMO_TOKEN;
 const SERVICE_KEY = ENV.SUPABASE_SERVICE_ROLE_KEY;
-const TEST_EMAIL = process.env.SIM_TEST_EMAIL ?? "";
+const TEST_EMAIL = "victor.gaya@icloud.com";
 /** The traveler's own Supabase token — the Worker's per-user gate needs it. */
 let USER_TOKEN = null;
 if (!TOKEN || !SERVICE_KEY) {
@@ -74,6 +83,15 @@ const SCENARIOS = [
   { key: "transit_strike", intent: "Transit strike tomorrow" },
   { key: "unwell", intent: "I'm feeling unwell, lighten my day" },
   { key: "free_text", intent: "My taxi to the airport is cancelled, what do I do" },
+  // A question, not a disruption. On a trip with no change of planes the
+  // RIGHT answer is a refusal that says so; on one that has a stop the answer
+  // is a verdict over the ticket's own times — and nothing else may move.
+  {
+    key: "tight_connection",
+    intent: "my connection is too tight, I'll never make the second flight",
+    expect: (trip) =>
+      trip.connections.length > 0 ? { outcome: "plans" } : { refusedWith: "no_connection_found" },
+  },
 ];
 
 // ------------------------------------------------------------------ plumbing
@@ -84,6 +102,13 @@ const argOf = (name, fallback) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 const LIMIT = Number(argOf("limit", "0")) || 0;
+/** Run ONE trip — an id prefix or a fragment of the title — to reproduce a
+ *  single mission under `wrangler tail` without spending the whole corpus. */
+const TRIP = argOf("trip", "");
+/** Run ONLY trips whose title starts with this — the QA corpus carries
+ *  "[QA-SIM]", so the battery can disrupt and settle purpose-built trips
+ *  without ever touching the traveller's own. */
+const TITLE_PREFIX = argOf("title-prefix", "");
 const ONLY = argOf("scenarios", "").split(",").filter(Boolean);
 const OUT_DIR = argOf("out", join(ROOT, "scripts", "swarm-sim", "runs"));
 /** `--settle` also approves each plan (then restores the trip). Off by default:
@@ -91,6 +116,9 @@ const OUT_DIR = argOf("out", join(ROOT, "scripts", "swarm-sim", "runs"));
 const SETTLE = args.includes("--settle");
 const PREVIEW = args.includes("--preview");
 const QUOTE_CCY = argOf("currency", "EUR").toUpperCase();
+/** Local calendar day, as `SwarmBookableWindow.todayISO()` computes it: a leg
+ *  that has already gone by is never priced, so the harness must drop it too. */
+const TODAY = new Date().toLocaleDateString("en-CA");
 
 let httpCalls = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -203,6 +231,131 @@ const iso = (v) => {
 const dayOf = (v) => (typeof v === "string" ? v.slice(0, 10) : null);
 const round2 = (n) => Math.round(n * 100) / 100;
 
+/** An endpoint however the content spelt it: "DOH", {code}, or {city}. */
+const codeOf = (e) => (typeof e === "string" ? e : (e?.code ?? e?.city ?? "")).trim().toUpperCase();
+
+/**
+ * Where a person reading this trip would say "you change planes here".
+ *
+ * Written from the trip's own transit_groups and NOT from the engine's rule,
+ * so the two can disagree. Inside a leg that lists its hops, every adjacent
+ * pair is a change. Between two legs it is a change when they meet at the
+ * same airport and the traveller is still in the building — less than a day
+ * apart. (The engine reads the graph for that; a person reads the clock.)
+ */
+function connectionsOf(content) {
+  const flights = (content.transit_groups ?? [])
+    .map((leg, idx) => ({ ...leg, idx, departMs: iso(leg.depart), arriveMs: iso(leg.arrive) }))
+    .filter((leg) => (leg.method ?? "").toLowerCase() === "flight" && Number.isFinite(leg.departMs))
+    .sort((a, b) => a.departMs - b.departMs);
+  const out = [];
+  for (const leg of flights) {
+    const hops = Array.isArray(leg.segments) ? leg.segments : [];
+    for (let i = 0; i < hops.length - 1; i += 1) {
+      const arriveMs = iso(hops[i].arrive);
+      const departMs = iso(hops[i + 1].depart);
+      if (!Number.isFinite(arriveMs) || !Number.isFinite(departMs) || departMs < arriveMs) continue;
+      out.push({
+        where: "inside_leg",
+        legIndex: leg.idx,
+        hop: i,
+        atAirport: codeOf(hops[i].to),
+        arriveMs,
+        departMs,
+        gapMinutes: Math.round((departMs - arriveMs) / 60_000),
+        onward: hops[i + 1].reference ?? leg.reference ?? null,
+      });
+    }
+  }
+  for (let i = 0; i < flights.length - 1; i += 1) {
+    const a = flights[i];
+    const b = flights[i + 1];
+    if (!codeOf(a.destination) || codeOf(a.destination) !== codeOf(b.origin)) continue;
+    if (!Number.isFinite(a.arriveMs) || !(b.departMs > a.arriveMs)) continue;
+    if (b.departMs - a.arriveMs > 24 * 3_600_000) continue;
+    out.push({
+      where: "between_legs",
+      legIndex: b.idx,
+      hop: null,
+      atAirport: codeOf(b.origin),
+      arriveMs: a.arriveMs,
+      departMs: b.departMs,
+      gapMinutes: Math.round((b.departMs - a.arriveMs) / 60_000),
+      onward: b.reference ?? null,
+    });
+  }
+  return out.sort((x, y) => x.arriveMs - y.arriveMs);
+}
+
+/** "2 h 30" / "50 min" / "1 h" → minutes, the way the plan's copy says it. */
+const spokenMinutes = (h, hm, m) => (m !== undefined ? Number(m) : Number(h) * 60 + Number(hm ?? 0));
+
+/**
+ * Checks that only make sense for one scenario. Same contract as tier1():
+ * every entry is a hard violation. Written against what a traveller would
+ * accept from an answer to THEIR question, not against the engine.
+ */
+const SCENARIO_CHECKS = {
+  tight_connection(run) {
+    const bad = [];
+    const push = (check, at, detail) => bad.push({ check, at, detail });
+    const DETAIL0 = /— (?:(\d+) h(?: (\d{2}))?|(\d+) min) at (.+?)(?:, on your .+? journey)?\.$/;
+    const ALLOWANCE = /(?:short of|clears) the (?:(\d+) h(?: (\d{2}))?|(\d+) min) this itinerary allows/;
+    for (const [i, plan] of (run.plans ?? []).entries()) {
+      const at = `plan[${i}]`;
+      const cx = plan.presentation?.connection;
+      if (!cx) {
+        push("connection_verdict_missing", at, "asked about a connection; the plan carries no verdict");
+        continue;
+      }
+      // 1. The gap the plan states is the gap the ticket carries, to the minute.
+      const m = DETAIL0.exec(cx.detail?.[0] ?? "");
+      if (!m) {
+        push("connection_detail_unparsed", at, `cannot read the gap from: "${cx.detail?.[0] ?? ""}"`);
+      } else {
+        const stated = spokenMinutes(m[1], m[2], m[3]);
+        const code = /\(([A-Z]{3})\)/.exec(m[4])?.[1] ?? m[4].toUpperCase();
+        const here = (run.connections ?? []).filter((c) => c.atAirport === code);
+        if (here.length === 0) {
+          push("connection_airport_unknown", at, `the plan judges a change at ${code}; the trip has none there`);
+        } else if (!here.some((c) => c.gapMinutes === stated)) {
+          push(
+            "connection_gap_mismatch",
+            at,
+            `plan says ${stated} min at ${code}; the ticket says ${here.map((c) => c.gapMinutes).join("/")} min`,
+          );
+        }
+        // 2. The verdict agrees with its own two numbers.
+        const a = ALLOWANCE.exec(cx.detail?.[1] ?? "");
+        if (a) {
+          const allowance = spokenMinutes(a[1], a[2], a[3]);
+          const shouldBe = stated < allowance ? "below_minimum" : "clears_minimum";
+          if (cx.verdict !== shouldBe) {
+            push("connection_verdict_inconsistent", at, `${stated} min against ${allowance} min reads "${cx.verdict}"`);
+          }
+        }
+      }
+      // 3. It never promises the connection will hold.
+      if (!/don't hold the official minimum/.test((cx.detail ?? []).join(" "))) {
+        push("connection_promised", at, "no caveat that we hold no airport minimum connection time");
+      }
+      // 4. A question changes nothing: no seat, no move, no money, no headline
+      //    about a rebooking nobody asked for.
+      const res = plan.proposed_resolution ?? {};
+      const moved =
+        Boolean(res.new_flight) ||
+        (res.rescheduled_activities ?? []).length > 0 ||
+        (res.hotel_adjustments ?? []).some((h) => h.action && h.action !== "none") ||
+        Number(plan.financial_delta?.net_payable ?? 0) !== 0;
+      if (moved) push("question_changed_bookings", at, "a connection question produced a booking change");
+      if (/manual booking|no replacement|isn't covered|not covered/i.test(String(plan.incident ?? ""))) {
+        push("connection_headline_invented", at, `headline talks about a rebooking: "${plan.incident}"`);
+      }
+    }
+    return bad;
+  },
+};
+
 /**
  * TIER 1 — feasibility. Every entry returned here is a hard violation.
  */
@@ -285,12 +438,35 @@ function tier1(run) {
       }
     }
 
+    // 4b. A weather alert we never verified must not read as established
+    //     fact. Measured live on 2026-09-18: five of six weather missions
+    //     headlined "Weather alert — Rome, Italy" and moved a booked
+    //     activity on the strength of it, because the check had silently
+    //     been skipped. This is written from what the PLAN says, not from
+    //     the engine's rule: a headline that neither confirms nor discloses,
+    //     over a plan that moves something, is a claim with no source.
+    if (/weather|rain|storm/i.test(run.intent)) {
+      const incident = String(plan.incident ?? "");
+      const verified = /confirmed rain|clear skies|real weather checked/i.test(incident);
+      const disclosed = /not independently confirmed/i.test(incident);
+      const movedSomething =
+        (plan.proposed_resolution?.rescheduled_activities ?? []).length > 0 ||
+        (plan.operational?.activity_moves ?? []).length > 0;
+      if (!verified && !disclosed && movedSomething) {
+        bad.push({
+          check: "weather_claimed_not_verified",
+          at,
+          detail: `"${incident.slice(0, 90)}" — neither confirmed nor disclosed, yet the plan moves the day`,
+        });
+      }
+    }
+
     // 5. Nothing found must SAY so, never present as a clean fix — and it must
     //    say WHICH of the four reasons applies, because they ask the traveller
     //    to do four different things. Matching one literal phrase was too
     //    brittle: the moment the copy became reason-specific this check started
     //    flagging the very honesty it was written to enforce.
-    if (!nf && /flight/i.test(run.intent)) {
+    if (!nf && /flight/i.test(run.intent) && !plan.presentation?.connection) {
       const incident = String(plan.incident ?? "");
       const reason = plan.presentation?.no_flight_reason;
       const saysSomething =
@@ -355,8 +531,46 @@ function tier1(run) {
       }
     }
     // 7. Approving twice must never settle twice, and approval REQUIRES the flag.
-    if (run.replayStatus !== undefined && run.replayStatus === 200) {
-      bad.push({ check: "double_settlement", at, detail: "the same resolution settled twice" });
+    //
+    // "replay answered 200" is NOT that. Measured across three 42-mission
+    // batteries: content_rev advanced by exactly 1 across two approvals in 40
+    // of 42 missions (never 2) and no budget moved, because the API replays
+    // the STORED receipt. The old rule flagged every one of those — 47
+    // "violations" that were the system behaving correctly, and they drowned
+    // out everything else in the report.
+    //
+    // A real double settlement shows up as a DIFFERENT receipt, or as the trip
+    // moving again.
+    // Key ORDER is not meaning: JSON.stringify preserves insertion order, and
+    // the two responses do not build the object identically. Comparing raw
+    // strings flagged 14 receipts that were the same receipt.
+    const stable = (value) =>
+      JSON.stringify(value, (_k, v) =>
+        v && typeof v === "object" && !Array.isArray(v)
+          ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)))
+          : v,
+      );
+    const replayedSameReceipt =
+      run.replayBody != null &&
+      run.settlement != null &&
+      stable(run.replayBody.settlement ?? null) === stable(run.settlement);
+    const tripMovedTwice =
+      typeof run.settleBefore?.rev === "number" &&
+      typeof run.settleAfter?.rev === "number" &&
+      run.settleAfter.rev - run.settleBefore.rev > 1;
+    if (run.replayStatus === 200 && !replayedSameReceipt) {
+      bad.push({
+        check: "double_settlement",
+        at,
+        detail: "a replayed approval returned a DIFFERENT receipt — it settled again",
+      });
+    }
+    if (tripMovedTwice) {
+      bad.push({
+        check: "double_settlement",
+        at,
+        detail: `the trip advanced ${run.settleAfter.rev - run.settleBefore.rev} revisions for one approval`,
+      });
     }
     if (run.unflaggedStatus !== undefined && run.unflaggedStatus === 200) {
       bad.push({
@@ -418,6 +632,13 @@ function tier2(run) {
     detail: policy?.detail ?? "no policy row",
   });
 
+  const cx = trace.find((t) => t.agent === "orchestrator" && /^connection_(check|none)$/.test(String(t.step)));
+  signals.push({
+    signal: "connection",
+    value: cx ? (cx.step === "connection_none" ? "none" : (/— (\w+)/.exec(cx.detail)?.[1] ?? "checked")) : "not_asked",
+    detail: cx?.detail ?? "no connection row",
+  });
+
   // Proportionality: did any activity cross a calendar day?
   for (const plan of run.plans ?? []) {
     for (const move of (plan.operational ?? {}).activity_moves ?? []) {
@@ -437,6 +658,55 @@ function tier2(run) {
 
 // --------------------------------------------------------------- one mission
 
+/**
+ * The settled itinerary as a human reads it: one line per item per day, with
+ * the day's own date, so an item sitting on the wrong day is obvious at a
+ * glance. Only days that CHANGED are kept — a 8-day trip where one day moved
+ * should not print 8 days of noise.
+ */
+function digestDays(before, after) {
+  const dayLines = (content) =>
+    (content?.itinerary ?? []).map((day) => ({
+      date: day.date ?? null,
+      items: (day.items ?? []).map((item) => {
+        const title = typeof item.title === "string" ? item.title : (item.title?.en ?? "?");
+        const flags = [
+          item.booked ? "booked" : null,
+          item.paid ? "paid" : null,
+          item.unstayed ? "UNSTAYED" : null,
+          item.nights_unstayed ? `nights_unstayed=${item.nights_unstayed}` : null,
+        ].filter(Boolean);
+        return `${item.time ?? "--:--"} ${item.type ?? "?"} · ${title}${flags.length ? ` [${flags.join(",")}]` : ""}`;
+      }),
+    }));
+  const b = dayLines(before.content_json);
+  const a = dayLines(after.content_json);
+  const changed = [];
+  const seen = new Set();
+  for (const day of a) {
+    const prior = b.find((d) => d.date === day.date);
+    const same = prior && JSON.stringify(prior.items) === JSON.stringify(day.items);
+    if (!same) changed.push({ date: day.date, before: prior?.items ?? null, after: day.items });
+    if (day.date) seen.add(day.date);
+  }
+  // A day that vanished entirely is a change too.
+  for (const day of b) {
+    if (day.date && !seen.has(day.date)) changed.push({ date: day.date, before: day.items, after: null });
+  }
+  const legs = (content) =>
+    (content?.transit_groups ?? []).map(
+      (l) => `${l.method ?? "?"} ${l.reference ?? ""} ${l.origin?.code ?? "?"}→${l.destination?.code ?? "?"} ${l.depart ?? ""}${l.booked ? " [booked]" : ""}`,
+    );
+  return {
+    changedDays: changed,
+    legsBefore: legs(before.content_json),
+    legsAfter: legs(after.content_json),
+    cancellations: (after.content_json?.swarm_cancellations ?? []).map(
+      (c) => `${c.title}${c.was_booked ? " [was booked]" : ""}${c.paid_amount ? ` [paid ${c.paid_amount} ${c.paid_currency ?? ""}]` : ""} — ${c.reason}`,
+    ),
+  };
+}
+
 async function runMission(trip, scenario) {
   const started = Date.now();
   const record = {
@@ -446,7 +716,13 @@ async function runMission(trip, scenario) {
     intent: scenario.intent,
     originalDepartureIso: trip.firstFlightDepart ?? null,
     activityDays: trip.activityDays ?? {},
+    connections: trip.connections ?? [],
   };
+  const expected = scenario.expect?.(trip) ?? {};
+  // The flight at risk on a connection question is the ONWARD one.
+  if (scenario.key === "tight_connection" && record.connections[0]) {
+    record.originalDepartureIso = new Date(record.connections[0].departMs).toISOString().slice(0, 16);
+  }
 
   const assess = await api("/mission/assess", {
     method: "POST",
@@ -454,8 +730,26 @@ async function runMission(trip, scenario) {
   });
   record.assessStatus = assess.status;
   if (assess.status !== 200 || !assess.body.resolution_id) {
-    record.outcome = "assess_failed";
-    record.error = assess.body;
+    if (expected.refusedWith && assess.status === 400 && assess.body?.error === expected.refusedWith) {
+      // The engine said what a person would say: there is nothing here.
+      record.outcome = "refused_as_expected";
+      record.tier1 = [];
+      record.tier2 = [];
+    } else {
+      record.outcome = "assess_failed";
+      record.error = assess.body;
+      // A refusal on a trip that DOES change planes is the defect this
+      // scenario exists to catch, not a failed call.
+      if (expected.outcome === "plans" && assess.body?.error === "no_connection_found") {
+        record.tier1 = [
+          {
+            check: "connection_not_found_but_present",
+            at: "assess",
+            detail: `refused, yet the ticket changes planes at ${record.connections.map((c) => c.atAirport).join(", ")}`,
+          },
+        ];
+      }
+    }
     record.ms = Date.now() - started;
     return record;
   }
@@ -509,12 +803,18 @@ async function runMission(trip, scenario) {
       record.settlement = approve.body?.settlement ?? null;
       record.booking = approve.body?.booking ?? null;
 
-      // Approving twice must never settle twice.
+      // Approving twice must never settle TWICE — which is not the same thing
+      // as answering 200 twice. The API stores the receipt and replays it
+      // verbatim, which is idempotency done right: the caller gets the same
+      // answer and nothing is written again. A 409 would read as a failure for
+      // a client that merely retried on a flaky network.
       const replay = await api("/approve-resolution", {
         method: "POST",
         body: JSON.stringify({ resolutionId: rid, approved: true, planIndex: 0 }),
       });
       record.replayStatus = replay.status;
+      // Kept so the rule below can tell a replayed receipt from a second one.
+      record.replayBody = replay.body ?? null;
 
       // Approval without the explicit flag must be refused outright.
       const unflagged = await api("/approve-resolution", {
@@ -526,6 +826,13 @@ async function runMission(trip, scenario) {
       const after = await readTrip(trip.id);
       record.settleBefore = { rev: before.content_rev, budget: before.total_budget_eur };
       record.settleAfter = after ? { rev: after.content_rev, budget: after.total_budget_eur } : null;
+      // Keep a READABLE picture of what settlement actually wrote, before the
+      // trip is put back. Tier 1 can only prove the write was well-formed; the
+      // defects that reached a real traveller's screen — an airport bus at
+      // 08:35 on a day they were still in Singapore until 16:55 — are only
+      // visible by reading the day as a person would. Compact on purpose: a
+      // whole content_json per mission is unreadable at 42 missions.
+      record.settledDays = after ? digestDays(before, after) : null;
       await restoreTrip(trip.id, before);
     }
   }
@@ -533,7 +840,7 @@ async function runMission(trip, scenario) {
   record.ms = Date.now() - started;
   record.outcome =
     record.plans.length > 0 ? "plans" : record.state === "processing" ? "timed_out" : "no_plans";
-  record.tier1 = tier1(record);
+  record.tier1 = [...tier1(record), ...(SCENARIO_CHECKS[scenario.key]?.(record) ?? [])];
   record.tier2 = tier2(record);
   return record;
 }
@@ -577,6 +884,41 @@ function previewLinesFor(content) {
       : lead;
   };
   const currency = content.currency ?? content.budget_currency ?? undefined;
+
+  // Transit legs FIRST, mirroring `BookingChecklist.derive`, which walks
+  // transit_groups before the itinerary — the 20-line cap must never be spent
+  // on activities while the flights fall off the end.
+  //
+  // A flight carries origin/destination/carrier/flightNumber/departDate so the
+  // server can ask Atlas for THIS flight instead of a fare for the route. The
+  // iOS sheet sends all five or none; so does this.
+  const todayISO = TODAY;
+  (content.transit_groups ?? []).forEach((leg, li) => {
+    if (leg.booked === true) return;                       // a booked leg is not re-quoted
+    const depart = leg.depart ?? "";
+    if (depart && depart.slice(0, 10) < todayISO) return;   // past legs are dropped by the sheet
+    const o = leg.origin?.code ?? leg.origin?.city ?? "";
+    const d = leg.destination?.code ?? leg.destination?.city ?? "";
+    const base = [leg.carrier, leg.reference]
+      .map((x) => (x ?? "").trim())
+      .filter(Boolean)
+      .join(" ");
+    const route = `${o} \u2192 ${d}`.trim();
+    const title = base || (route === "\u2192" ? (leg.method ?? "transport") : route);
+    lines.push({
+      id: `transit-${li}`,
+      kind: "transport",
+      title,
+      ...(typeof leg.price?.amount === "number" ? { estimate: leg.price.amount } : {}),
+      ...(leg.price?.currency || currency ? { currency: leg.price?.currency ?? currency } : {}),
+      ...(o ? { origin: o } : {}),
+      ...(d ? { destination: d } : {}),
+      ...(leg.carrier ? { carrier: leg.carrier } : {}),
+      ...(leg.reference ? { flightNumber: leg.reference } : {}),
+      ...(depart ? { departDate: depart } : {}),
+    });
+  });
+
   const days = content.itinerary ?? [];
   days.forEach((day, di) => {
     const city = cityFor(text(day.place ?? day.city ?? day.location), text(content.destination));
@@ -724,6 +1066,20 @@ async function previewPass(trip) {
     providersDegraded: body.providersDegraded ?? [],
     tier1: checked.violations,
     notes: checked.notes,
+    // What each flight got, so an Atlas substitution can never be invisible in
+    // the log: `matchedName` is the sheet's own disclosure that the fare quoted
+    // is for a DIFFERENT flight than the one planned.
+    flights: lines
+      .filter((l) => String(l.id).startsWith("transit-"))
+      .map((l) => ({
+        id: l.id,
+        planned: (sent.find((x) => x.id === l.id) ?? {}).title ?? null,
+        provider: l.provider ?? null,
+        priceSource: l.priceSource,
+        price: typeof l.price === "number" ? l.price : null,
+        currency: l.currency ?? null,
+        matchedName: l.matchedName ?? null,
+      })),
     // Every line the sheet cannot price at all, with the reason it will show.
     unpriced: lines
       .filter((l) => l.priceSource === "unknown")
@@ -756,8 +1112,18 @@ async function main() {
       firstFlightDepart: firstFlight?.depart ?? null,
       hasFlight: Boolean(firstFlight),
       activityDays,
+      connections: connectionsOf(c),
     };
   });
+  if (TITLE_PREFIX) {
+    const before = trips.length;
+    trips = trips.filter((t) => (t.title ?? "").startsWith(TITLE_PREFIX));
+    console.log(`  ${trips.length}/${before} trips match "${TITLE_PREFIX}"`);
+  }
+  if (TRIP) {
+    trips = trips.filter((t) => t.id.startsWith(TRIP) || (t.title ?? "").includes(TRIP));
+    console.log(`  --trip "${TRIP}" → ${trips.length} trip(s)`);
+  }
   if (LIMIT) trips = trips.slice(0, LIMIT);
 
   // `--preview` exercises the trust layer's own rail instead of the mission
@@ -864,7 +1230,7 @@ function report(results, calls) {
   };
   lines.push("## Rail liveness");
   lines.push("");
-  for (const s of ["gemini", "atlas", "viator", "hotel", "policy_rule"]) {
+  for (const s of ["gemini", "atlas", "viator", "hotel", "policy_rule", "connection"]) {
     lines.push(`- **${s}** — ${bySignal(s) || "n/a"}`);
   }
   lines.push("");

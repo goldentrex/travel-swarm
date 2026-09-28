@@ -1,0 +1,775 @@
+{
+  "schema_version": 1,
+  "revision": "HEAD",
+  "generated_from_commit": "26daa9f96df117bc96a9b7ad7c2b6f9e93e5bd52",
+  "working_tree_modified": true,
+  "method": "git blame -w -M -C over the swarm closure; each surviving line credited to the commit that last wrote it. Lines rewritten after the window count AGAINST the window, so the Qoder share is a lower bound.",
+  "qoder_window": {
+    "from": "2026-08-19",
+    "to": "2026-08-25"
+  },
+  "total": {
+    "lines": 33306,
+    "before": 81,
+    "qoder_window": 13765,
+    "after": 19460,
+    "files": 53,
+    "qoder_pct": 41.33
+  },
+  "groups": {
+    "dag_and_agents": {
+      "files": 24,
+      "lines": 12973,
+      "before": 0,
+      "qoder_window": 3967,
+      "after": 9006,
+      "qoder_pct": 30.58
+    },
+    "swarm_api": {
+      "files": 8,
+      "lines": 9061,
+      "before": 0,
+      "qoder_window": 3896,
+      "after": 5165,
+      "qoder_pct": 43
+    },
+    "providers": {
+      "files": 12,
+      "lines": 3504,
+      "before": 0,
+      "qoder_window": 2251,
+      "after": 1253,
+      "qoder_pct": 64.24
+    },
+    "ios_surfaces": {
+      "files": 9,
+      "lines": 7768,
+      "before": 81,
+      "qoder_window": 3651,
+      "after": 4036,
+      "qoder_pct": 47
+    }
+  },
+  "commits": [
+    {
+      "date": "2026-08-22",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): complete Nexus Swarm — TTL quote enforcement, spatial DAG, iOS drill UI & swarm-monitor",
+      "sha": "98621ca7",
+      "bucket": "qoder_window",
+      "lines": 7172
+    },
+    {
+      "date": "2026-09-02",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): trip-coherence gate, honest no-flight verdicts, single-currency ledger",
+      "sha": "c7bc6646",
+      "bucket": "after",
+      "lines": 3244
+    },
+    {
+      "date": "2026-08-29",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): real-arrival re-drive, Gemini liveness, per-plan proposals",
+      "sha": "ddd49539",
+      "bucket": "after",
+      "lines": 3057
+    },
+    {
+      "date": "2026-09-17",
+      "author": "VictorGAYA",
+      "subject": "feat(core): atomic settlement sync, graph sanity invariants, liquid glass optimization, and complete localizations",
+      "sha": "cdc05774",
+      "bucket": "after",
+      "lines": 2911
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): two-phase assess/resolve flow with Gemini liaison and multi-plan carousel",
+      "sha": "0a3c6e4a",
+      "bucket": "qoder_window",
+      "lines": 1833
+    },
+    {
+      "date": "2026-08-22",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): Nexus Swarm real-data overhaul — live Atlas sandbox, all agents wired, rich Trust Layer UX",
+      "sha": "79adf106",
+      "bucket": "qoder_window",
+      "lines": 1791
+    },
+    {
+      "date": "2026-09-17",
+      "author": "VictorGAYA",
+      "subject": "feat(sanity): LLM semantic critic for real-world travel absurdity",
+      "sha": "54c2ba89",
+      "bucket": "after",
+      "lines": 1342
+    },
+    {
+      "date": "2026-08-19",
+      "author": "VictorGAYA",
+      "subject": "feat(hackathon): initial Level-4 Nexus Graph Engine & Trust Layer",
+      "sha": "2ecd4a1a",
+      "bucket": "qoder_window",
+      "lines": 1262
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "Swarm production real-data mode: real trips/settlement, cancel mission, strike+unwell plans, demo rail retirement, UX polish, CI migrations-before-deploy",
+      "sha": "4dda1127",
+      "bucket": "qoder_window",
+      "lines": 1095
+    },
+    {
+      "date": "2026-08-30",
+      "author": "VictorGAYA",
+      "subject": "swarm with proper LLM",
+      "sha": "bd35c271",
+      "bucket": "after",
+      "lines": 559
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): stop inventing flights, repair the hotel rail, order the day",
+      "sha": "cde640d8",
+      "bucket": "after",
+      "lines": 483
+    },
+    {
+      "date": "2026-08-26",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): Trust Layer quality pass — honest plans, carrier names, liveness proof, iOS perf & polish",
+      "sha": "2bb79e18",
+      "bucket": "after",
+      "lines": 456
+    },
+    {
+      "date": "2026-08-24",
+      "author": "VictorGAYA",
+      "subject": "Fix intent hijacking and clean up Trust Layer UI",
+      "sha": "b1b2fe28",
+      "bucket": "qoder_window",
+      "lines": 443
+    },
+    {
+      "date": "2026-08-28",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): honest liaison/flight-search fallbacks, transit routing detail",
+      "sha": "a73ac5d3",
+      "bucket": "after",
+      "lines": 440
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): answer the four missions that had no real answer",
+      "sha": "aad1880f",
+      "bucket": "after",
+      "lines": 415
+    },
+    {
+      "date": "2026-08-26",
+      "author": "VictorGAYA",
+      "subject": "Trust Layer clarity & coverage pass",
+      "sha": "21e5cf54",
+      "bucket": "after",
+      "lines": 372
+    },
+    {
+      "date": "2026-08-26",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): persist full session payload, honest traces, and Atlas-correct currency-aware ledgers",
+      "sha": "fb6634cb",
+      "bucket": "after",
+      "lines": 371
+    },
+    {
+      "date": "2026-08-27",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): activity wall-clock, a11y identifiers, Trust Layer rebuild, post-gen landing, health reachability",
+      "sha": "6dd8a44d",
+      "bucket": "after",
+      "lines": 346
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): a change of planes inside one ticket is a connection, judged as a question",
+      "sha": "90a81227",
+      "bucket": "after",
+      "lines": 336
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): judge the connection instead of calling it a delay",
+      "sha": "d71dcc59",
+      "bucket": "after",
+      "lines": 326
+    },
+    {
+      "date": "2026-08-28",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): honest money, cabin continuity, decision-shaped Trust Layer, iOS CI",
+      "sha": "d7170317",
+      "bucket": "after",
+      "lines": 299
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix(swarm-ios): one flight, one time — wall-clock parity and honest pickers",
+      "sha": "24a378a6",
+      "bucket": "after",
+      "lines": 297
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix(swarm): stop rescheduling real flights, settle fares onto the trip",
+      "sha": "439f3e10",
+      "bucket": "after",
+      "lines": 286
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(sanity): decide what is possible from the venue's own schedule",
+      "sha": "a1e9a00d",
+      "bucket": "after",
+      "lines": 262
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): each plan carries its own flight's fare policy, and a 30-hour detour is not a replacement",
+      "sha": "161ff162",
+      "bucket": "after",
+      "lines": 233
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): the confirm screen takes the live flight fare, and shows both currencies",
+      "sha": "f5efcfc0",
+      "bucket": "after",
+      "lines": 231
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): answering a question keeps your choices, and the money reads in your own currency",
+      "sha": "4f1e4765",
+      "bucket": "after",
+      "lines": 191
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(hotel): a new listing, and the first replacement room the swarm has ever offered",
+      "sha": "975f4754",
+      "bucket": "after",
+      "lines": 184
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(critic): show the model the resulting DAY, not just the engine's edits",
+      "sha": "92a0dba2",
+      "bucket": "after",
+      "lines": 176
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "feat(hotel): one provider, two listings, and the better one back in front",
+      "sha": "cdef5b68",
+      "bucket": "after",
+      "lines": 167
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): decide from the venue's real schedule, not from a guess",
+      "sha": "f64530e9",
+      "bucket": "after",
+      "lines": 166
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the weather rail actually checks the weather, and says so when it cannot",
+      "sha": "c44b25fc",
+      "bucket": "after",
+      "lines": 166
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): Atlas quotes the flight, not the route",
+      "sha": "418c34ba",
+      "bucket": "after",
+      "lines": 145
+    },
+    {
+      "date": "2026-09-02",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): stop the parallel verify.do fan-out that made every rebooking fail",
+      "sha": "f41cf6a8",
+      "bucket": "after",
+      "lines": 127
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix: one clock for transit legs, honest fees, readable Trust Layer",
+      "sha": "47738424",
+      "bucket": "after",
+      "lines": 120
+    },
+    {
+      "date": "2026-09-02",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): cascade the whole day behind a rewritten flight's new arrival",
+      "sha": "37a842ac",
+      "bucket": "after",
+      "lines": 104
+    },
+    {
+      "date": "2026-08-29",
+      "author": "VictorGAYA",
+      "subject": "feat(ios): centered settlement popup, W2 drop rows, date seeding, budget tier",
+      "sha": "3e1231f8",
+      "bucket": "after",
+      "lines": 103
+    },
+    {
+      "date": "2026-08-25",
+      "author": "VictorGAYA",
+      "subject": "Swarm trip-load hardening: 503 session_store_unavailable on store failures, storeHealthy health probe, secret rotation runbook",
+      "sha": "64375e98",
+      "bucket": "qoder_window",
+      "lines": 97
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the platform cancels a continuation at 30 s — the mission now knows the time",
+      "sha": "763502d4",
+      "bucket": "after",
+      "lines": 89
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): hold a Gemini share for the critic, and lead it on a lite tier",
+      "sha": "0a5e9955",
+      "bucket": "after",
+      "lines": 87
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): an airline's new departure time is a fact we can read",
+      "sha": "af41d907",
+      "bucket": "after",
+      "lines": 86
+    },
+    {
+      "date": "2026-08-28",
+      "author": "VictorGAYA",
+      "subject": "fix(health): stop the reachability probes claiming what they cannot know",
+      "sha": "945728d8",
+      "bucket": "after",
+      "lines": 81
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm,ios): advice is not a transaction",
+      "sha": "68fde48b",
+      "bucket": "after",
+      "lines": 79
+    },
+    {
+      "date": "2026-06-27",
+      "author": "VictorGAYA",
+      "subject": "fix variability",
+      "sha": "f567dde3",
+      "bucket": "before",
+      "lines": 76
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): rank plans on what they COST, not on the fare alone",
+      "sha": "3f54fc3c",
+      "bucket": "after",
+      "lines": 73
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the Trust Layer stops showing a room it only looked at, and quoting a policy nobody published",
+      "sha": "1ba627b9",
+      "bucket": "after",
+      "lines": 66
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the engine knows what it cannot do",
+      "sha": "c040df0e",
+      "bucket": "after",
+      "lines": 60
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(ios): show the traveller how to cover the ground",
+      "sha": "f9093445",
+      "bucket": "after",
+      "lines": 60
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): tell a slow mission apart from a dead one",
+      "sha": "f8d582da",
+      "bucket": "after",
+      "lines": 58
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix(swarm): show the real journey on the timeline, and stop the Trust Layer crawling",
+      "sha": "1e3bfca6",
+      "bucket": "after",
+      "lines": 57
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the app ships five languages; the parser understood one",
+      "sha": "6cf92363",
+      "bucket": "after",
+      "lines": 56
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(venue-hours): a square is not a shop — never cancel a walk through one",
+      "sha": "47bad3b1",
+      "bucket": "after",
+      "lines": 53
+    },
+    {
+      "date": "2026-08-24",
+      "author": "VictorGAYA",
+      "subject": "feat(orchestrator): wire OpenWeather and PredictHQ into proactive scenarios",
+      "sha": "71633aed",
+      "bucket": "qoder_window",
+      "lines": 51
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): the two cards the battery produces most, photographed — and what the photos found",
+      "sha": "a89c11ed",
+      "bucket": "after",
+      "lines": 49
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(hotel): the fee we quote is the cancellation one, and only while it is real",
+      "sha": "2ac69e32",
+      "bucket": "after",
+      "lines": 44
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): drop TabView for the plan carousel — that is what made the band",
+      "sha": "86adce7d",
+      "bucket": "after",
+      "lines": 42
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): a flight provider being down cannot block a plan with no flight in it",
+      "sha": "6decee43",
+      "bucket": "after",
+      "lines": 38
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): money that never breaks mid-figure, and a bottom that lines up",
+      "sha": "ecf0d648",
+      "bucket": "after",
+      "lines": 35
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(critic): a proof may cancel, an opinion may only move",
+      "sha": "e7d335a2",
+      "bucket": "after",
+      "lines": 31
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the deterministic rail can lighten a day, not just re-space it",
+      "sha": "a24165f4",
+      "bucket": "after",
+      "lines": 30
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): the plan carousel's dots, and the floating actions' margins",
+      "sha": "ef9aafe0",
+      "bucket": "after",
+      "lines": 29
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "feat(swarm): a broken ride gets its own branch, not the activity rail",
+      "sha": "a7c0ca7a",
+      "bucket": "after",
+      "lines": 28
+    },
+    {
+      "date": "2026-08-28",
+      "author": "VictorGAYA",
+      "subject": "fix(trip): point the cabin preference at the field the schema actually has",
+      "sha": "f61b99e0",
+      "bucket": "after",
+      "lines": 28
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "obs(swarm): record what the critic's MODEL said, before the merge",
+      "sha": "4551f05b",
+      "bucket": "after",
+      "lines": 24
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): apply the critic's verdict on the flight-less rail",
+      "sha": "268126b0",
+      "bucket": "after",
+      "lines": 22
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): a mission heading leaves room for the plan",
+      "sha": "aa026dae",
+      "bucket": "after",
+      "lines": 22
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): dots in the band under the card, and an end-of-page margin that is derived",
+      "sha": "8a06c25f",
+      "bucket": "after",
+      "lines": 22
+    },
+    {
+      "date": "2026-08-23",
+      "author": "VictorGAYA",
+      "subject": "Implemented E2E",
+      "sha": "f8ab79ec",
+      "bucket": "qoder_window",
+      "lines": 21
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): the page reaches the bottom edge — the \"veil\" was the plan stopping short",
+      "sha": "0a32a70c",
+      "bucket": "after",
+      "lines": 21
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ai): give the scarce model pool an owner, and stop lying about which quota ran out",
+      "sha": "840b1990",
+      "bucket": "after",
+      "lines": 19
+    },
+    {
+      "date": "2026-09-26",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the reorganizer priced itself out of its own mission",
+      "sha": "73127437",
+      "bucket": "after",
+      "lines": 19
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): a refusal reads like a sentence, not a status code",
+      "sha": "1a1d48a5",
+      "bucket": "after",
+      "lines": 19
+    },
+    {
+      "date": "2026-09-02",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): split TripDetailView.body — the type-checker gave up on it",
+      "sha": "d3b7a162",
+      "bucket": "after",
+      "lines": 18
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): the deterministic routing flag was inert in production",
+      "sha": "c96086c6",
+      "bucket": "after",
+      "lines": 15
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): keep the plan inside the sheet's own edge — that sliver was the sheet's border",
+      "sha": "ace906a3",
+      "bucket": "after",
+      "lines": 14
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): give the sheet the page's own ground — the band was the sheet showing through",
+      "sha": "e386b280",
+      "bucket": "after",
+      "lines": 12
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): a weather check that fails cannot take the mission with it",
+      "sha": "2988cde6",
+      "bucket": "after",
+      "lines": 9
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix(swarm-ios): make the settled trip visible — safe apply, real hairlines, always-shown flight",
+      "sha": "9d01c976",
+      "bucket": "after",
+      "lines": 9
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): a strike answers about tomorrow, and moves nothing at random",
+      "sha": "0188e708",
+      "bucket": "after",
+      "lines": 8
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(ground): a Tokyo departure is not nine hours earlier than it looks",
+      "sha": "27affa37",
+      "bucket": "after",
+      "lines": 8
+    },
+    {
+      "date": "2026-09-26",
+      "author": "VictorGAYA",
+      "subject": "fix(swarm): a dropped activity no longer blames a negative day",
+      "sha": "b76ec7cc",
+      "bucket": "after",
+      "lines": 7
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): an advisory plan stops claiming a price it never quoted",
+      "sha": "54655022",
+      "bucket": "after",
+      "lines": 7
+    },
+    {
+      "date": "2026-08-27",
+      "author": "Claude",
+      "subject": "fix(swarm): render a refund without a charge's plus sign; clean typecheck",
+      "sha": "faa4c603",
+      "bucket": "after",
+      "lines": 5
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "revert(ios): the Trust Layer is a drawer again",
+      "sha": "a7a166e6",
+      "bucket": "after",
+      "lines": 3
+    },
+    {
+      "date": "2026-07-03",
+      "author": "VictorGAYA",
+      "subject": "new database push",
+      "sha": "a4ec3c74",
+      "bucket": "before",
+      "lines": 2
+    },
+    {
+      "date": "2026-07-05",
+      "author": "VictorGAYA",
+      "subject": "notifications & iOS support",
+      "sha": "a15db091",
+      "bucket": "before",
+      "lines": 2
+    },
+    {
+      "date": "2026-09-18",
+      "author": "VictorGAYA",
+      "subject": "fix(critic): the model's findings were labelled as rules, so they could cancel",
+      "sha": "00d3b652",
+      "bucket": "after",
+      "lines": 1
+    },
+    {
+      "date": "2026-09-19",
+      "author": "VictorGAYA",
+      "subject": "chore(ios): carry the two Combine imports that were sitting uncommitted",
+      "sha": "c531c266",
+      "bucket": "after",
+      "lines": 1
+    },
+    {
+      "date": "2026-07-12",
+      "author": "VictorGAYA",
+      "subject": "fix for iOS functions",
+      "sha": "479370cf",
+      "bucket": "before",
+      "lines": 1
+    },
+    {
+      "date": "2026-09-20",
+      "author": "VictorGAYA",
+      "subject": "fix(ios): the countdown sits against the panel again",
+      "sha": "df160fd9",
+      "bucket": "after",
+      "lines": 1
+    }
+  ]
+}

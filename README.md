@@ -16,6 +16,12 @@ instead of pretending.
 
 Extracted from [GlobePlanner](https://globeplanner.app), where it ships in the iOS app.
 
+**How it was built:** the engine was created with Qoder (Quest mode with experts)
+between 19 and 25 August 2026. A blame census puts **99.61% of it inside that
+window**, measured at a fixed commit and re-runnable from git.
+See **[docs/PROVENANCE.md](docs/PROVENANCE.md)** — including what the repository
+can prove and what rests on attestation.
+
 > **⚠️ Flights run against Atlas's SANDBOX, not production.** `AtlasFlightProvider`
 > talks to `sandbox.atriptech.com` with a bearer credential. Atlas's own documentation
 > describes this environment as test inventory for rehearsing the booking flow, not real

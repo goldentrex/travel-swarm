@@ -439,12 +439,16 @@ describe("resolveDisruptionMulti — per-plan activity rederive", () => {
     const outcome = await orchestrator.resolveDisruptionMulti(makeEvent());
 
     expect(outcome.plans).toHaveLength(5);
+    // Cheapest first, and "cheapest" now means CONVERTED: the fixture mixes
+    // EUR and USD, and comparing 75 USD against 70 EUR as bare numbers put
+    // them the wrong way round. 75 USD is ~69 EUR, so ATL-3 comes before
+    // ATL-1.
     expect(outcome.plans.map((plan) => plan.proposed_resolution.new_flight?.id)).toEqual([
       "ATL-2",
       "ATL-4",
       "ATL-5",
-      "ATL-1",
       "ATL-3",
+      "ATL-1",
     ]);
 
     // One reorg run in the shared pipeline (best candidate = ATL-2, arrival

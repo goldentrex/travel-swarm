@@ -1,0 +1,148 @@
+{
+ "status": true,
+ "message": "Success",
+ "data": {
+  "hotel_id": 88498,
+  "hotel_name": "Boutique Hotel Campo de' Fiori",
+  "currency_code": "EUR",
+  "latitude": 41.895594482587,
+  "longitude": 12.4728955328465,
+  "block": [
+   {
+    "room_name": "Double Room",
+    "refundable": 1,
+    "refundable_until": "2026-11-17 23:59:59 +0100",
+    "paymentterms": {
+     "prepayment": {
+      "type_translation": "SECURE YOUR BOOKING – pay now",
+      "type": "full_prepayment",
+      "timeline": {
+       "u_currency_code": "USD",
+       "currency_code": "EUR",
+       "policygroup_instance_id": "34/166/-",
+       "stages": [
+        {
+         "limit_from_raw": "2026-09-18 14:03:59",
+         "u_fee_pretty": "US$ 335",
+         "u_fee": 334.93,
+         "fee_rounded": 292,
+         "fee_remaining_pretty": "&#x20AC; 0",
+         "limit_from_time": "2:03 PM",
+         "current_stage": 1,
+         "u_stage_fee": "334.93",
+         "effective_number": 0,
+         "is_free": 0,
+         "b_number": 0,
+         "stage_fee_pretty": "&#x20AC; 292",
+         "limit_until_time": "2:03 PM",
+         "amount_pretty": "US$ 335",
+         "limit_timezone": "Rome",
+         "limit_from": "September 18, 2026 2:03 PM",
+         "limit_until_raw": "2026-09-18 14:03:59",
+         "limit_from_date": "September 18, 2026",
+         "text": "Before you stay you'll pay",
+         "limit_until_date": "September 18, 2026",
+         "u_fee_remaining": "0.00",
+         "fee": 291.6,
+         "amount": "334.93",
+         "b_state": "NONREF",
+         "is_effective": 1,
+         "fee_pretty": "&#x20AC; 291",
+         "limit_until": "September 18, 2026 2:03 PM",
+         "stage_fee": 291.6,
+         "fee_remaining": 0,
+         "u_fee_remaining_pretty": "US$ 0",
+         "u_stage_fee_pretty": "US$ 335"
+        }
+       ],
+       "nr_stages": 1
+      }
+     },
+     "cancellation": {
+      "type_translation": "Free cancellation",
+      "non_refundable_anymore": 0,
+      "type": "free_cancellation",
+      "timeline": {
+       "nr_stages": 2,
+       "stages": [
+        {
+         "fee": 0,
+         "date_until": "2026-11-17 23:59:59 +0100",
+         "u_fee_remaining": "334.93",
+         "limit_until_date": "November 17, 2026",
+         "text": "Free cancellation until 11:59 PM on Nov 17",
+         "text_refundable": "You'll get a full refund if you cancel before 11:59 PM on November 17, 2026.",
+         "u_stage_fee_pretty": "US$ 0",
+         "u_fee_remaining_pretty": "US$ 334",
+         "limit_until": "November 17, 2026 11:59 PM",
+         "fee_remaining": 291.6,
+         "stage_fee": 0,
+         "fee_pretty": "&#x20AC; 0",
+         "is_effective": 1,
+         "b_state": "FREE",
+         "stage_translation": "Free to cancel",
+         "stage_fee_pretty": "&#x20AC; 0",
+         "b_number": 0,
+         "is_free": 1,
+         "effective_number": 0,
+         "u_stage_fee": "0.00",
+         "current_stage": 1,
+         "fee_remaining_pretty": "&#x20AC; 291",
+         "limit_from_time": "2:03 PM",
+         "fee_rounded": 0,
+         "u_fee_pretty": "US$ 0",
+         "u_fee": "0.00",
+         "limit_from_raw": "2026-09-18 14:03:59",
+         "limit_from_date": "September 18, 2026",
+         "limit_until_raw": "2026-11-17 23:59:59",
+         "limit_from": "September 18, 2026 2:03 PM",
+         "limit_timezone": "Rome",
+         "limit_until_time": "11:59 PM"
+        },
+        {
+         "u_fee": "334.93",
+         "u_fee_pretty": "US$ 335",
+         "limit_from_raw": "2026-11-18 00:00:00",
+         "fee_rounded": 292,
+         "fee_remaining_pretty": "&#x20AC; 0",
+         "limit_from_time": "12:00 AM",
+         "u_stage_fee": "334.93",
+         "current_stage": 0,
+         "stage_fee_pretty": "&#x20AC; 292",
+         "b_number": 1,
+         "is_free": 0,
+         "effective_number": 1,
+         "limit_until_time": "12:00 AM",
+         "amount_pretty": "US$ 335",
+         "limit_timezone": "Rome",
+         "limit_until_raw": "2026-11-18 00:00:00",
+         "limit_from": "November 18, 2026 12:00 AM",
+         "limit_from_date": "November 18, 2026",
+         "limit_until_date": "November 18, 2026",
+         "text": "After 12:00 AM on Nov 18",
+         "u_fee_remaining": "0.00",
+         "fee": 291.6,
+         "date_from": "2026-11-18 00:00:00 +0100",
+         "amount": 334.93,
+         "b_state": "NONREF",
+         "stage_translation": "No refund if you cancel",
+         "is_effective": 1,
+         "fee_pretty": "&#x20AC; 291",
+         "limit_until": "November 18, 2026 12:00 AM",
+         "stage_fee": 291.6,
+         "fee_remaining": 0,
+         "text_refundable": "If you cancel after 12:00 AM on November 18, 2026, you won't be eligible for a refund.",
+         "u_stage_fee_pretty": "US$ 335",
+         "u_fee_remaining_pretty": "US$ 0"
+        }
+       ],
+       "policygroup_instance_id": "34/166/-",
+       "u_currency_code": "USD",
+       "currency_code": "EUR"
+      }
+     }
+    }
+   }
+  ]
+ }
+}

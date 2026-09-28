@@ -105,6 +105,30 @@ export interface FlightRebookingAssessment {
 const FARE_PRICING_DEADLINE_MS = 4_000;
 /** Only the cheapest N search results are priced — bounds the provider fan-out. */
 const MAX_PRICED_CANDIDATES = 5;
+
+/**
+ * How much longer than the quickest way home a replacement may be before it
+ * stops being a replacement at all.
+ *
+ * Ranking used to be `sort((a, b) => a.price - b.price)` and nothing else, so
+ * the cheapest routing won whatever it cost in hours. Live Atlas sandbox,
+ * SIN→HND on 2026-11-12: a €46 VietJet routing via Saigon at ~30 hours beat
+ * every AirAsia routing via Kuala Lumpur — on the day someone's flight fell
+ * over, that answer spends their trip to save a fare. Nobody rebooking a
+ * missed flight wants a day and a half in airports.
+ *
+ * The ceiling is relative (the quickest usable option is the reference) plus
+ * an absolute allowance, so a short hop is not judged by a long-haul's
+ * standard and vice versa.
+ */
+const SANE_JOURNEY_MULTIPLE = 2;
+const SANE_JOURNEY_SLACK_MINUTES = 4 * 60;
+/**
+ * However strict the ceiling, the traveller is always shown a choice: the
+ * quickest and the cheapest of what survives, which are usually two different
+ * flights. One option is not a decision, it is an instruction.
+ */
+const MIN_RANKED_CANDIDATES = 2;
 /**
  * Retained as a compatibility/export constant for trace consumers. It is no
  * longer an eligibility veto: a late viable flight is preferable to stranding
@@ -205,6 +229,77 @@ function withDeadline<T>(promise: Promise<T>, deadlineMs: number): Promise<T> {
       },
     );
   });
+}
+
+/** Elapsed journey time, from the provider's own figure or the two clocks. */
+function journeyMinutes(option: FlightOption): number | null {
+  if (typeof option.durationMinutes === "number" && option.durationMinutes > 0) {
+    return option.durationMinutes;
+  }
+  const depart = Date.parse(option.departureTime);
+  const arrive = Date.parse(option.arrivalTime);
+  if (!Number.isFinite(depart) || !Number.isFinite(arrive) || arrive <= depart) return null;
+  return Math.round((arrive - depart) / 60_000);
+}
+
+/**
+ * Choose which replacements are worth pricing, and in what order.
+ *
+ * Two things a traveller weighs on the day their flight falls over: what it
+ * costs and what it costs them in hours. The old ranking only knew the first.
+ *
+ *   1. Drop the journeys nobody would accept — more than
+ *      `SANE_JOURNEY_MULTIPLE` × the quickest option (plus a slack allowance).
+ *      An option whose provider publishes no times at all is KEPT: silence
+ *      about a duration is not evidence of a bad one.
+ *   2. Never return a single choice. The quickest survivor and the cheapest
+ *      survivor are both kept, even when the cap is tight, so the carousel can
+ *      offer a real decision rather than one flight and no alternative.
+ *   3. Fill the rest cheapest-first, as before.
+ *
+ * Exported for its tests: this is a product rule, and it deserves to be read
+ * and argued with directly rather than through a whole mission.
+ */
+export function rankReplacements(options: FlightOption[], cap: number): FlightOption[] {
+  if (cap <= 0 || options.length === 0) return [];
+
+  const durations = new Map<FlightOption, number | null>();
+  for (const option of options) durations.set(option, journeyMinutes(option));
+  const known = [...durations.values()].filter((value): value is number => value !== null);
+  const quickest = known.length > 0 ? Math.min(...known) : null;
+
+  const sane =
+    quickest === null
+      ? [...options]
+      : options.filter((option) => {
+          const minutes = durations.get(option) ?? null;
+          if (minutes === null) return true; // unknown ≠ unreasonable
+          return (
+            minutes <=
+            Math.max(quickest * SANE_JOURNEY_MULTIPLE, quickest + SANE_JOURNEY_SLACK_MINUTES)
+          );
+        });
+
+  // A ceiling that leaves nothing has told us nothing: fall back to the whole
+  // usable set rather than reporting "no flights" over a strict rule of ours.
+  const pool = sane.length > 0 ? sane : [...options];
+
+  const byPrice = [...pool].sort((a, b) => a.price - b.price);
+  const byDuration = [...pool].sort((a, b) => {
+    const left = durations.get(a) ?? Number.POSITIVE_INFINITY;
+    const right = durations.get(b) ?? Number.POSITIVE_INFINITY;
+    return left === right ? a.price - b.price : left - right;
+  });
+
+  const picked: FlightOption[] = [];
+  const take = (option: FlightOption | undefined) => {
+    if (option && !picked.includes(option) && picked.length < cap) picked.push(option);
+  };
+  // The two the traveller is owed first, then price order fills the rest.
+  take(byPrice[0]);
+  if (cap >= MIN_RANKED_CANDIDATES) take(byDuration[0]);
+  for (const option of byPrice) take(option);
+  return picked;
 }
 
 /**
@@ -457,10 +552,10 @@ export class FlightAgent {
     const usableOptions = [...search.options].filter((option) =>
       isUsableReplacement(option, routeContext),
     );
-    const options = usableOptions
-      // Cap the fan-out at the cheapest options by published fare.
-      .sort((a, b) => a.price - b.price)
-      .slice(0, Math.max(0, Math.trunc(this.maxPricedCandidates)));
+    const options = rankReplacements(
+      usableOptions,
+      Math.max(0, Math.trunc(this.maxPricedCandidates)),
+    );
 
     // SEQUENTIAL, not a fan-out. Verified against the live Atlas sandbox on
     // 2026-09-02: five concurrent `verify.do` calls return HTTP 429 — all five
@@ -602,8 +697,7 @@ export class FlightAgent {
       // Dates the provider actually LOOKED at. `searchedDates` counts dates we
       // ASKED about, and the two diverge whenever Atlas declines — which is
       // precisely when a coverage claim would be wrong.
-      const answeredDates =
-        windowAnsweredDates ?? (search.searchWasAnswered === false ? 0 : 1);
+      const answeredDates = windowAnsweredDates ?? (search.searchWasAnswered === false ? 0 : 1);
       if (answeredDates === 0) {
         noReplacementReason = "search_declined";
       } else if (providerOptionCount === 0) {

@@ -7,6 +7,7 @@
  *
  *   model                  RPM    RPD     observed
  *   gemini-3.7-flash        5      20     4/5,  12/20   capable, tiny daily cap
+ *                                                 (NOT ours — generation owns the flash pool)
  *   gemini-3.5-flash-lite  15     500     2/500         barely touched
  *   gemini-3.1-flash-lite  15     500     70/500        plenty of headroom
  *   gemini-3.6-flash        5      20     5/5,  32/20   EXHAUSTED
@@ -24,11 +25,25 @@
  * model is skipped until its window is likely to have rolled over.
  */
 
-/** Ordered by capability; every entry after the first is a working fallback. */
+/**
+ * Ordered by capability; every entry after the first is a working fallback.
+ *
+ * ALL LITE, DELIBERATELY. This used to open on `gemini-3.7-flash`, a tier with
+ * twenty requests A DAY, which is also the tier trip generation depends on.
+ * On 2026-09-19 a run of 56 swarm missions emptied that pool and the app could
+ * not generate a trip for the rest of the day: the cheapest rail in the
+ * product had starved the most expensive one.
+ *
+ * The swarm does not need a flagship. Its three model tasks — translating
+ * trade-off answers, resequencing a day, reviewing a plan for nonsense — all
+ * have a deterministic rail behind them, and every one of them degrades
+ * safely. So it lives entirely on the lite tiers, whose allowance is 500 a
+ * day EACH, and leaves the flash pool to the one call a traveller waits on.
+ */
 export const GEMINI_MODEL_CASCADE = [
-  "gemini-3.7-flash",
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
+  "gemini-2.5-flash-lite",
 ] as const;
 
 /** First cooldown after a 429. An RPM ceiling clears well inside this. */

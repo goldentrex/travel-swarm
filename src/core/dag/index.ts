@@ -10,6 +10,7 @@ export type {
   DisruptionResult,
   Duration,
   FlightNode,
+  FlightHop,
   HotelCheckInNode,
   ItineraryNode,
   ItineraryNodeBase,

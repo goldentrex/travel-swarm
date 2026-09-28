@@ -5,6 +5,7 @@
  * (fetch-mocked exactly like geminiLiaison.test.ts).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { GeminiCallBudget } from "@/agents/geminiUsage";
 import {
   BUFFER_MINUTES,
   ARRIVAL_TRANSIT_MARGIN_MINUTES,
@@ -650,3 +651,155 @@ describe("discretionary drops on a lighten-my-day mission", () => {
   });
 });
 
+
+describe("the deterministic rail can lighten a day, not just re-space it", () => {
+  /** London's real day from the 2026-09-18 battery: a dinner and a stroll. */
+  const londonDay = {
+    date: "2026-12-14",
+    activities: [
+      {
+        nodeId: "activity-5-0",
+        name: "Rules Restaurant",
+        time: "2026-12-14T18:00:00.000Z",
+        durationMinutes: 120,
+      },
+      {
+        nodeId: "activity-5-1",
+        name: "Evening Stroll around Covent Garden Piazza",
+        time: "2026-12-14T20:10:00.000Z",
+        durationMinutes: 60,
+      },
+    ],
+  };
+
+  it("keeps the meal and drops the rest when the mission asked for fewer", () => {
+    // Live on 2026-09-18, Gemini degraded on 11 of 42 missions and this rail
+    // served the answer. London came back with BOTH items kept and merely
+    // moved: the traveller who said they were ill got a full day with new
+    // times, which is the request answered backwards.
+    const decisions = resequenceDeterministically({
+      ...londonDay,
+      allowDiscretionaryDrops: true,
+    });
+    const stroll = decisions.find((d) => d.nodeId === "activity-5-1");
+    expect(stroll?.action).toBe("drop");
+    expect(stroll?.reason).toMatch(/lighter day/i);
+    // You still eat when you are unwell.
+    expect(decisions.find((d) => d.nodeId === "activity-5-0")?.action).toBe("retime");
+  });
+
+  it("drops nothing discretionary on an ordinary delay", () => {
+    // The strict rule exists to stop a schedule being made easier by deleting
+    // something. It still holds everywhere the mission did not ask.
+    const decisions = resequenceDeterministically(londonDay);
+    expect(decisions.every((d) => d.action === "retime")).toBe(true);
+  });
+
+  it("never empties a day that is all meals", () => {
+    const decisions = resequenceDeterministically({
+      date: "2026-12-14",
+      activities: [
+        { nodeId: "a", name: "Trattoria Da Enzo", time: "2026-12-14T12:00:00.000Z", durationMinutes: 90 },
+        { nodeId: "b", name: "Osteria da Zi' Umberto", time: "2026-12-14T19:00:00.000Z", durationMinutes: 90 },
+      ],
+      allowDiscretionaryDrops: true,
+    });
+    expect(decisions.every((d) => d.action === "retime")).toBe(true);
+  });
+});
+
+describe("the drop reason a traveller actually reads", () => {
+  /** Landing after the day's own closing bound: the remaining window is
+   *  negative, which is exactly the missed-flight case the swarm exists for. */
+  function landsAfterTheDayIsOver(): DayReorgRequest {
+    return {
+      date: DATE,
+      newArrivalTime: `${DATE}T23:30:00.000Z`,
+      activities: [
+        activity("a-surf", "Surf Lesson", `${DATE}T10:00:00.000Z`, 90),
+        activity("a-museum", "Ocean Museum Visit", `${DATE}T14:00:00.000Z`, 90),
+      ],
+    };
+  }
+
+  it("never quotes a negative number of hours left in the day", () => {
+    const drops = resequenceDeterministically(landsAfterTheDayIsOver()).filter(
+      (d) => d.action === "drop",
+    );
+    expect(drops.length).toBeGreaterThan(0);
+    for (const drop of drops) {
+      expect(drop.reason).not.toMatch(/-\d/);
+      expect(drop.reason).not.toContain("holds only -");
+    }
+  });
+
+  it("says the day is over instead, and still names the activity", () => {
+    const drops = resequenceDeterministically(landsAfterTheDayIsOver()).filter(
+      (d) => d.action === "drop",
+    );
+    for (const drop of drops) {
+      expect(drop.reason).toContain("land after this day is over");
+    }
+    expect(drops.map((d) => d.reason).join(" ")).toContain("Surf Lesson");
+  });
+
+  it("still quotes the window when there genuinely is one left", () => {
+    const drops = resequenceDeterministically(infeasibleRequest()).filter(
+      (d) => d.action === "drop",
+    );
+    expect(drops.length).toBeGreaterThan(0);
+    expect(drops.some((d) => /holds only \d/.test(d.reason ?? ""))).toBe(true);
+  });
+});
+
+describe("the reorganizer must fit in the mission it arrives in", () => {
+  /**
+   * Regression for 26 September: the agent declared a 20s per-attempt deadline,
+   * `GeminiCallBudget.tryReserve` treats that as the headroom a call needs, and
+   * the reorganizer runs LAST — so it habitually arrived with ~13s of the 27s
+   * continuation budget left and was refused before being asked. Eight of the
+   * last twelve live missions degraded that way, on a model measured at 1.5–3.3s.
+   */
+  it("still reaches the model with 13 seconds left on the mission clock", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      geminiResponse(
+        JSON.stringify({
+          decisions: [
+            { nodeId: "a-surf", action: "retime", newTime: `${DATE}T18:15:00.000Z` },
+            { nodeId: "a-museum", action: "drop" },
+          ],
+        }),
+      ),
+    );
+    const budget = new GeminiCallBudget(5, 0, Date.now() + 13_000);
+    const agent = new DayReorganizer({
+      apiKey: "test-key",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sharedBudget: budget,
+    });
+    const outcome = await agent.reorganizeDay(infeasibleRequest());
+    // The point is that it was ASKED. Whether this particular mocked answer
+    // survives the validator is another test's business; being refused on the
+    // clock is what the 20s headroom caused and what must not come back.
+    expect(fetchImpl).toHaveBeenCalled();
+    expect(budget.callsUsed).toBeGreaterThan(0);
+    expect(outcome.degradeReason).not.toBe("timeout");
+  });
+
+  it("still declines, and still resequences, when there is no time for one call", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(geminiResponse(JSON.stringify({ decisions: [] })));
+    const budget = new GeminiCallBudget(5, 0, Date.now() + 2_000);
+    const agent = new DayReorganizer({
+      apiKey: "test-key",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sharedBudget: budget,
+    });
+    const outcome = await agent.reorganizeDay(infeasibleRequest());
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(outcome.source).toBe("deterministic");
+    expect(outcome.degradeReason).toBe("timeout");
+    // The day still comes back resequenced: the traveller never pays for the
+    // model being unavailable.
+    expect(outcome.decisions.length).toBeGreaterThan(0);
+  });
+});

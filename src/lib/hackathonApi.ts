@@ -115,6 +115,7 @@ import {
   DayReorganizer,
   FlightAgent,
   GEMINI_CALLS_PER_MISSION,
+  GEMINI_CRITIC_RESERVED_CALLS,
   GEMINI_QUOTA_RETRIES,
   GeminiLiaisonAgent,
   HotelAgent,
@@ -176,10 +177,28 @@ import type { SettlementEffects, SettlementFollowUp } from "./swarmTripContext";
 import {
   AIRPORTS,
   SemanticCritic,
+  VenueHours,
   arrivalBuffer,
   classifyItem,
   unstayedNights,
 } from "@/core/sanity";
+import {
+  describeConnection,
+  findConnections,
+  isConnectionMission,
+  judgeConnection,
+  pickConnection,
+} from "@/core/sanity/connections";
+import {
+  GroundLink,
+  describeGround,
+  isGroundMission,
+  modesWorthAsking,
+  namesAirport,
+  nextGroundCommitment,
+  viableOptions,
+} from "@/core/ground";
+import { rateFromEurOf, type Currency } from "@/lib/i18n/translations";
 import { checkTripAccess, resolveSwarmActor, USER_TOKEN_HEADER } from "./swarmAuth";
 import { buildBookingPreview, type PreviewLineRequest } from "./swarmBookingPreview";
 import { hotelQuotaNote } from "@/providers/rapidapi/hotelQuota";
@@ -737,8 +756,8 @@ export async function handleHackathonRequest(
  * POST /api/hackathon/booking-preview — real provider data for the trust layer.
  *
  * The client sends the lines its own checklist derived; this answers with what
- * Booking.com and Viator actually say about them. Read-only: nothing is booked,
- * nothing is charged, and the trip is not written to.
+ * Atlas, Booking.com and Viator actually say about them. Read-only: nothing is
+ * booked, nothing is charged, and the trip is not written to.
  */
 async function handleBookingPreview(request: Request): Promise<Response> {
   const body = await readJsonObject(request);
@@ -778,6 +797,14 @@ async function handleBookingPreview(request: Request): Promise<Response> {
       ...(typeof record.date === "string" ? { date: record.date } : {}),
       ...(typeof record.estimate === "number" ? { estimate: record.estimate } : {}),
       ...(typeof record.currency === "string" ? { currency: record.currency } : {}),
+      // Flights: what Atlas needs to recognise THIS flight among everything it
+      // sells on the route that day. Whitelisted like every other field — a
+      // line that omits them is simply not looked up.
+      ...(typeof record.origin === "string" ? { origin: record.origin } : {}),
+      ...(typeof record.destination === "string" ? { destination: record.destination } : {}),
+      ...(typeof record.carrier === "string" ? { carrier: record.carrier } : {}),
+      ...(typeof record.flightNumber === "string" ? { flightNumber: record.flightNumber } : {}),
+      ...(typeof record.departDate === "string" ? { departDate: record.departDate } : {}),
     });
   }
 
@@ -901,7 +928,9 @@ async function handleApproveResolution(request: Request): Promise<Response> {
         `planIndex ${planIndex} is out of range for session "${resolutionId}".`,
       );
     }
-    if (pending.degraded) {
+    // "Degraded" means the FLIGHT provider was unreachable — see
+    // `degradedPlanIsHonourable` for what that may and may not block.
+    if (pending.degraded && !degradedPlanIsHonourable(pendingSelected)) {
       return errorResponse(
         409,
         "degraded_plan_not_bookable",
@@ -950,8 +979,13 @@ async function handleApproveResolution(request: Request): Promise<Response> {
     );
   }
   // Degraded plans propose the provider fallback flight (XY999) — they must
-  // never reach the real sandbox booking API.
-  if (entry.degraded) {
+  // never reach the real sandbox booking API. What that may NOT block is in
+  // `degradedPlanIsHonourable`.
+  const degradedSelected = selectPlan(entry);
+  if (
+    entry.degraded &&
+    !degradedPlanIsHonourable(degradedSelected === "out_of_range" ? null : degradedSelected)
+  ) {
     return errorResponse(
       409,
       "degraded_plan_not_bookable",
@@ -1036,7 +1070,9 @@ async function handleApproveResolution(request: Request): Promise<Response> {
       const settled = await settlePlanOnTrip(entry.trip_id, tripLoad.trip.nodeRefs, plan, {
         ...plan.operational,
         bookingCode,
-        ...(flightDisruption ? { booking_status: booking.status === "confirmed" ? "confirmed" : "recorded" } : {}),
+        ...(flightDisruption
+          ? { booking_status: booking.status === "confirmed" ? "confirmed" : "recorded" }
+          : {}),
       });
       if (settled && "updatedContent" in settled) {
         // "Updated" means something actually LANDED — not merely that the
@@ -1073,7 +1109,9 @@ async function handleApproveResolution(request: Request): Promise<Response> {
 
   const needsFollowUp =
     settlementFollowUps.length > 0 ||
-    plan.proposed_resolution.hotel_adjustments?.some(adjustment => adjustment.requires_confirmation === true) === true ||
+    plan.proposed_resolution.hotel_adjustments?.some(
+      (adjustment) => adjustment.requires_confirmation === true,
+    ) === true ||
     conflictSkipped ||
     flightRewriteSkipped ||
     !tripUpdated ||
@@ -1095,8 +1133,12 @@ async function handleApproveResolution(request: Request): Promise<Response> {
         ? {
             note: "The itinerary result does not confirm ticket issuance. Check the provider outcome before making another reservation.",
           }
-        : plan.proposed_resolution.hotel_adjustments?.some(adjustment => adjustment.requires_confirmation)
-          ? { note: "Hotel terms remain unverified. Contact the property to confirm availability, late arrival and any fees." }
+        : plan.proposed_resolution.hotel_adjustments?.some(
+              (adjustment) => adjustment.requires_confirmation,
+            )
+          ? {
+              note: "Hotel terms remain unverified. Contact the property to confirm availability, late arrival and any fees.",
+            }
           : {}),
       trip_updated: tripUpdated,
       changes: settlementChanges,
@@ -1163,8 +1205,18 @@ interface SwarmRunOptions {
   origin: "reactive" | "proactive";
   /** Owning trip (SPEC §3.2 DisruptionEvent.tripId) — always a real uuid. */
   tripId: string;
+  /**
+   * The TRAVELLER's own Supabase token, forwarded so the swarm can ask
+   * `place-hours` whether a venue is open at a re-planned slot. They are
+   * asking about their own trip's venues, so it is their token that asks.
+   * Absent ⇒ the venue rail stays dark and nothing is decided from hours.
+   */
+  userToken?: string;
   /** Weather hint for proactive missions (drives outdoor→indoor swaps). */
   weatherHint?: "clear" | "rain" | "storm" | "extreme_heat";
+  /** The flight the swarm PICKED when the intent named none — disclosed as
+   *  its own Activity Stream row, never as part of the headline. */
+  targetNote?: string;
   /** Explicit evidence (real-trip missions); falls back to the weather auto-evidence. */
   evidence?: {
     kind: "weather" | "event" | "user_report";
@@ -1318,6 +1370,22 @@ function buildSwarmOrchestrator(
     pushTrace("orchestrator", "skipped", "local event tracking unavailable");
   }
 
+  // Venue schedules — the one source that can say categorically whether a
+  // door is open at 21:15 next Tuesday. Absent token or config ⇒ null, and the
+  // engine simply never decides anything from hours.
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const anonKey =
+    process.env.SUPABASE_PUBLISHABLE_KEY ??
+    process.env.SUPABASE_ANON_KEY ??
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const venueHours =
+    options.userToken && supabaseUrl && anonKey
+      ? new VenueHours({ supabaseUrl, anonKey, userToken: options.userToken })
+      : null;
+  if (!venueHours) {
+    pushTrace("orchestrator", "skipped", "venue opening hours unavailable — no schedule checks");
+  }
+
   const orchestrator = new OrchestratorAgent(
     graph,
     // Live-Atlas config (longer fare deadline — real verify.do pricing takes
@@ -1333,8 +1401,157 @@ function buildSwarmOrchestrator(
     eventProvider,
     dayReorganizer,
     semanticCritic,
+    venueHours,
   );
   return { orchestrator, graph, fareRule };
+}
+
+/**
+ * The connection verdict for a mission that asked about one.
+ *
+ * Pure and free: the gap is arithmetic over the traveller's own booked times,
+ * and the minimum is the itinerary's own — the same one the graph's
+ * propagation already enforces. No provider, no model, no network.
+ */
+function resolveConnection(
+  options: SwarmRunOptions,
+  plannedItinerary: ItineraryGraph,
+  pushTrace: (agent: string, action: string, detail: string) => void,
+): NonNullable<ResolutionPresentation["connection"]> | undefined {
+  if (!isConnectionMission(options.description)) return undefined;
+  const connections = findConnections(plannedItinerary.getNodes());
+  // The same choice the intent parser made: the airport the traveller named,
+  // then the leg the mission targets, then the next change ahead of them.
+  const at = pickConnection(connections, {
+    text: options.description,
+    nodeId: options.nodeId,
+    nowMs: Date.now(),
+  });
+  if (!at) {
+    pushTrace("orchestrator", "connection_none", "no change of planes on this trip");
+    return undefined;
+  }
+  const verdict = judgeConnection(at);
+  pushTrace(
+    "orchestrator",
+    "connection_check",
+    `${at.fromLabel} → ${at.toLabel}: ${at.gapMinutes} min against ${at.requiredMinutes} required — ${verdict.kind}` +
+      // Which change was judged, so a human read of the trace can tell a
+      // stop inside a ticket from a change between two of them.
+      (at.hop !== null
+        ? ` (stop ${at.hop + 1} inside ${at.journey ?? at.toId})`
+        : " (between two legs)"),
+  );
+  return {
+    route: `${at.fromLabel} → ${at.toLabel}`,
+    verdict: verdict.kind,
+    detail: describeConnection(at, verdict),
+  };
+}
+
+/**
+ * Real ground options for a mission whose problem is COVERING GROUND.
+ *
+ * Runs once per mission — never once per carousel plan — because it spends a
+ * paid Routes lookup and because every plan should quote the same durations.
+ * Returns undefined whenever anything is missing: no token, no configuration,
+ * a journey the trip cannot place on the map, or a provider that answered
+ * nothing. Silence is the correct outcome there; a guessed travel time to an
+ * airport is how somebody misses a flight.
+ */
+async function resolveGroundPlan(
+  options: SwarmRunOptions,
+  plannedItinerary: ItineraryGraph,
+  pushTrace: (agent: string, action: string, detail: string) => void,
+): Promise<NonNullable<ResolutionPresentation["ground_plan"]> | undefined> {
+  if (!isGroundMission(options.description)) return undefined;
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const anonKey =
+    process.env.SUPABASE_PUBLISHABLE_KEY ??
+    process.env.SUPABASE_ANON_KEY ??
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!options.userToken || !supabaseUrl || !anonKey) {
+    pushTrace("orchestrator", "skipped", "ground options unavailable — no traveller token");
+    return undefined;
+  }
+  const commitment = nextGroundCommitment(plannedItinerary.getNodes(), Date.now(), {
+    mustBeAirportRun: namesAirport(options.description),
+    disruptedNodeId: options.nodeId,
+  });
+  if (!commitment) {
+    pushTrace(
+      "orchestrator",
+      "ground_unplaceable",
+      "no upcoming commitment this trip can place on a map — ground options not offered",
+    );
+    return undefined;
+  }
+  // Price the journey for roughly the hour it would be made: the moment they
+  // must BE there, which is the flight's own departure minus the published
+  // check-in floor. Both numbers come from the trip, so nothing here is
+  // invented — and a 17:00 airport run is costed against 17:00 traffic rather
+  // than an average.
+  //
+  // This is WALL-CLOCK LOCAL, the app's storage convention, and it is sent as
+  // such: `ground-options` resolves the destination's real UTC offset from
+  // Places before handing it to Routes. Clamping it to "not in the past" here
+  // would be comparing a wall-clock to an instant, which is exactly the
+  // confusion the function now exists to resolve.
+  const anchorMs = commitment.arriveByMs - commitment.bufferMinutes * 60_000;
+  const link = new GroundLink({ supabaseUrl, anonKey, userToken: options.userToken });
+  const modes = await link.options(
+    commitment.from,
+    commitment.to,
+    anchorMs,
+    modesWorthAsking(commitment),
+  );
+  const lines = describeGround(modes, commitment.arriveByMs, commitment.bufferMinutes);
+  if (lines.length === 0) {
+    pushTrace("orchestrator", "ground_unknown", "no ground option could be priced — none offered");
+    return undefined;
+  }
+  const viable = viableOptions(modes);
+  pushTrace(
+    "orchestrator",
+    "ground_options",
+    `${commitment.fromLabel} → ${commitment.toLabel}: ${
+      viable.length > 0 ? viable.map((o) => o.mode).join(", ") : "nothing viable"
+    }`,
+  );
+  return {
+    route: `${commitment.fromLabel} → ${commitment.toLabel}`,
+    because: options.description,
+    options: lines,
+    deadline: commitment.deadlineLabel,
+  };
+}
+
+/**
+ * Can a DEGRADED plan still be honoured?
+ *
+ * "Degraded" means the flight provider was unreachable, and the gate built on
+ * it used to refuse every such session outright. Caught in the settlement
+ * battery of 2026-09-18: a weather mission on the Bali trip — swap an outdoor
+ * activity for an indoor one, no flight anywhere in it — was refused 409
+ * "cannot be booked" because Atlas happened to be down. There was nothing to
+ * book. The plan moves activities on the traveller's own itinerary, needs no
+ * provider at all, and blocking it left them unable to act on advice we had
+ * already given them.
+ *
+ * A replacement FLIGHT we could not verify is a different matter and stays
+ * refused. So does a plan with nothing in it: a mission whose target vanished
+ * from the trip proposes no change, and answering "applied" to that would be
+ * a lie of a quieter kind.
+ */
+function degradedPlanIsHonourable(plan: ResolutionPlan | null | undefined): boolean {
+  const resolution = plan?.proposed_resolution;
+  if (!resolution) return false;
+  if (resolution.new_flight != null) return false;
+  const movesActivities = (resolution.rescheduled_activities ?? []).length > 0;
+  const movesHotel = (resolution.hotel_adjustments ?? []).some(
+    (adjustment) => adjustment.action !== "none",
+  );
+  return movesActivities || movesHotel;
 }
 
 /** Shared DisruptionEvent assembly for every swarm rail (legacy + two-phase). */
@@ -1366,6 +1583,15 @@ function buildDisruptionEvent(
     ...(options.category === "unwell" || options.category === "activity_cancelled"
       ? { allowsActivityDrops: true }
       : {}),
+    // "Lighten my day" is about TODAY. Without this the synthesis asks for a
+    // slot 24–48h out and the day the traveller is actually living through is
+    // left exactly as heavy as it was.
+    ...(options.category === "unwell" ? { lightenDay: true } : {}),
+    // A broken ride changes how you travel, not what you booked.
+    ...(isGroundMission(options.description) ? { groundOnly: true } : {}),
+    // A question about a connection changes nothing at all: the verdict is
+    // the answer, and no rail may go and rebook a flight nobody missed.
+    ...(isConnectionMission(options.description) ? { adviceOnly: true } : {}),
     ...(evidence ? { evidence } : {}),
     // Hydrated-trip context scopes the specialist provider searches.
     ...(options.hydrated
@@ -1510,12 +1736,16 @@ function usesSyntheticRecovery(assessment: FlightRebookingAssessment | null): bo
 
 function markSyntheticPlan(plan: ResolutionPlan): ResolutionPlan {
   const canary = "(simulated — flight provider unavailable)";
-  const marked = plan.incident.includes(canary) ? plan : { ...plan, incident: `${plan.incident} ${canary}` };
+  const marked = plan.incident.includes(canary)
+    ? plan
+    : { ...plan, incident: `${plan.incident} ${canary}` };
   // An estimate nobody sold was compared against nothing: "cheapest" and
   // "earliest arrival" are claims about real inventory it never saw. Only the
   // descriptive tags (non-stop, same day) survive.
   const comparative = new Set(["cheapest", "fastest", "balanced"]);
-  const kept = (marked.badges ?? (marked.badge ? [marked.badge] : [])).filter((b) => !comparative.has(b));
+  const kept = (marked.badges ?? (marked.badge ? [marked.badge] : [])).filter(
+    (b) => !comparative.has(b),
+  );
   const { badge: _badge, badges: _badges, ...rest } = marked;
   return {
     ...rest,
@@ -1627,6 +1857,7 @@ async function runSwarmResolution(
       // being judged.
       const plannedItinerary = graph.clone();
       pushTrace("orchestrator", "dispatch", disruptionDispatchDetail(options));
+      if (options.targetNote) pushTrace("orchestrator", "target_choice", options.targetNote);
       const {
         plan,
         disruption,
@@ -1635,6 +1866,11 @@ async function runSwarmResolution(
         activityProposals,
         policyVerdict,
       } = await orchestrator.resolveDisruption(buildDisruptionEvent(options, fareRule));
+      // Resolved once, against the itinerary as PLANNED: a ground question is
+      // about the journey the traveller still has to make, not about whatever
+      // the propagation has just done to the schedule.
+      const groundPlan = await resolveGroundPlan(options, plannedItinerary, pushTrace);
+      const connectionCheck = resolveConnection(options, plannedItinerary, pushTrace);
       // The disrupted node's route labels the additive flex_date_search trace.
       const sourceNode = graph.getNode(options.nodeId);
       if (validateResolutionPlan(plan)) {
@@ -1733,6 +1969,8 @@ async function runSwarmResolution(
           activityProposals,
           graph: plannedItinerary,
           disruptedId: options.nodeId,
+          ...(groundPlan ? { ground: groundPlan } : {}),
+          ...(connectionCheck ? { connection: connectionCheck } : {}),
           ...(() => {
             const r = noFlightReasonFor(
               rebookingAssessment ?? null,
@@ -1871,6 +2109,25 @@ export function buildOperational(
   // Hotel actions: impacted check-in nodes (re-timed by the graph propagation),
   // joined with the HotelAgent's adjustment verdict when available.
   const hotelActions: NonNullable<OperationalSettlement["hotel_actions"]> = [];
+  /**
+   * The property itself failed — the room is GONE, not merely reached late.
+   *
+   * This distinction decides the fallback below, and getting it wrong was
+   * visible in the live battery on 2026-09-18: "My hotel is overbooked"
+   * produced "Hotel Gracery Shinjuku: late check-in at 21:30". Arriving late
+   * is not a remedy for a room that will not exist at any hour, and the
+   * sentence reassures a traveller who should be looking for another bed.
+   */
+  const roomIsGone = /overbook/i.test(options.description);
+  /**
+   * What to do at a hotel when NO agent verdict is available (provider
+   * unconfigured, out of quota, or the agent never ran).
+   *
+   * It used to be `"late_check_in"` — an unverified promise that the property
+   * will hold the room, asserted precisely when we know least. "none" is the
+   * truthful default: we changed nothing, and the note says why.
+   */
+  const unverifiedHotelAction = roomIsGone ? "none" : "late_check_in";
   // The graph propagates the NOMINAL delay, so every carousel plan inherited
   // the same check-in (23:40 for a flight landing 20:10 and one landing
   // 20:40). A late check-in belongs to the flight actually chosen: the room is
@@ -1889,14 +2146,18 @@ export function buildOperational(
     const newCheckInMs = Number.isFinite(readyInCityMs)
       ? Math.max(report.previousScheduledTime, readyInCityMs)
       : report.newScheduledTime;
-    if (newCheckInMs !== undefined && newCheckInMs <= report.previousScheduledTime && Number.isFinite(readyInCityMs)) {
+    if (
+      newCheckInMs !== undefined &&
+      newCheckInMs <= report.previousScheduledTime &&
+      Number.isFinite(readyInCityMs)
+    ) {
       // The chosen flight still gets the traveller there before check-in:
       // nothing to change at the hotel for THIS plan.
       continue;
     }
     hotelActions.push({
       nodeId: report.nodeId,
-      action: adjustment?.action ?? "late_check_in",
+      action: adjustment?.action ?? unverifiedHotelAction,
       note: report.reason,
       ...(newCheckInMs !== undefined ? { newCheckIn: new Date(newCheckInMs).toISOString() } : {}),
     });
@@ -1911,7 +2172,7 @@ export function buildOperational(
     if (sourceNode && sourceNode.type === "hotel_check_in") {
       hotelActions.push({
         nodeId: options.nodeId,
-        action: adjustment?.action ?? "late_check_in",
+        action: adjustment?.action ?? unverifiedHotelAction,
         note: "Disrupted hotel check-in resolved at the source.",
         newCheckIn: new Date(sourceNode.scheduledTime).toISOString(),
       });
@@ -1923,16 +2184,24 @@ export function buildOperational(
 }
 
 /**
- * W2 — the honest cancellation-policy quote stamped on drop markers
- * (Viator standard 24h heuristic, mirrored from the ActivityAgent's
- * penalty math: penalty 0 ⇒ outside the 24h window). The affiliate tier is
- * quote-only — the actual cancellation happens on the traveler's own Viator
- * booking page, so the note is a policy quote, never transactional wording.
+ * What the traveller needs to know about dropping this item — and NOTHING
+ * when there is nothing to know.
+ *
+ * This used to stamp "free cancellation until 24h before start" on every
+ * dropped item. Two things were wrong with that. It quoted Viator's standard
+ * policy over a dinner reservation and a bar crawl, which nobody booked
+ * through Viator and for which we never fetched any policy at all — the exact
+ * shape of invention this engine exists to avoid. And where it was harmless it
+ * was useless: cancelling costs nothing, so stating the deadline by which it
+ * would have cost nothing tells a traveller who is cancelling right now
+ * precisely nothing.
+ *
+ * So the note survives only when there is a real consequence: a fee. Silence
+ * is the honest default, and the change line then reads "X cancelled".
  */
-function activityCancellationNote(proposal: ActivityRescheduleProposal): string {
-  return proposal.penalty === 0
-    ? "free cancellation until 24h before start"
-    : `cancellation inside 24h of start — ${proposal.penalty} ${proposal.currency} fee applies`;
+function activityCancellationNote(proposal: ActivityRescheduleProposal): string | undefined {
+  if (proposal.penalty <= 0) return undefined;
+  return `cancelling now costs ${proposal.penalty} ${proposal.currency}`;
 }
 
 /**
@@ -2118,6 +2387,36 @@ function formatSignedAmount(amount: number, currency: string | undefined): strin
 }
 
 /**
+ * The same amount in the money the traveller actually counts in, appended.
+ *
+ * Every line of this ledger is quoted in the currency its PROVIDER used —
+ * that is the truthful record and it stays. But a Singapore traveller reading
+ * "+€40.15" over "+€187.88" over a headline of "SGD 23.40" is being asked to
+ * do the conversion in their head before they can weigh the decision. So each
+ * line carries both, exactly as the timeline does.
+ *
+ * Returns the text unchanged when there is nothing to add: same currency, no
+ * display currency, or a rate we do not hold (converting through a rate of 1
+ * would invent a number, which is worse than saying nothing).
+ */
+function withDisplayAmount(
+  text: string,
+  amount: number,
+  currency: string | undefined,
+  display: string | undefined,
+): string {
+  if (!currency || !display) return text;
+  const from = currency.toUpperCase();
+  const to = display.toUpperCase();
+  if (from === to) return text;
+  const fromRate = rateFromEurOf(from as Currency);
+  const toRate = rateFromEurOf(to as Currency);
+  if (!(fromRate > 0) || !(toRate > 0)) return text;
+  const converted = (Math.abs(amount) / fromRate) * toRate;
+  return `${text} (≈ ${currencySymbol(to)}${converted.toFixed(2)})`;
+}
+
+/**
  * B3 — assemble the additive, display-only `presentation` block in ONE place
  * from the validated specialist outputs. Never feeds the ledger math; every
  * field is optional and tolerant. Returns undefined when nothing presentable
@@ -2202,7 +2501,12 @@ function mirrorOperationalHotels(
   };
 }
 
-function buildPresentation(input: {
+/**
+ * Exported for `hackathonApi.presentation.test.ts` — the hotel block's rule is
+ * the kind that is far cheaper to pin directly than to reproduce through a
+ * whole mission.
+ */
+export function buildPresentation(input: {
   plan: ResolutionPlan;
   best: RebookingCandidate | null;
   hotelAdjustments: HotelAdjustment[];
@@ -2215,9 +2519,27 @@ function buildPresentation(input: {
   noFlight?: NonNullable<ResolutionPresentation["no_flight_reason"]>;
   /** Dry-run of the settlement itself — what approving will really do. */
   preview?: SettlementPreview;
+  /** Real ground options for a broken connection — resolved once per mission. */
+  ground?: NonNullable<ResolutionPresentation["ground_plan"]>;
+  /** Whether a booked change of planes survives its own minimum. */
+  connection?: NonNullable<ResolutionPresentation["connection"]>;
 }): ResolutionPresentation | undefined {
-  const { plan, best, hotelAdjustments, activityProposals, graph, disruptedId, noFlight, preview } = input;
+  const {
+    plan,
+    best,
+    hotelAdjustments,
+    activityProposals,
+    graph,
+    disruptedId,
+    noFlight,
+    preview,
+    ground,
+    connection,
+  } = input;
   const currency = plan.currency;
+  // What the traveller counts in. Every money line below is quoted in its
+  // provider's own currency AND annotated with this one.
+  const displayCurrency = plan.financial_delta.display?.currency;
   // Flight-less plans (hotel/activity/transfer missions) carry NO new_flight
   // — the presentation must tolerate that (map points simply stay empty).
   const newFlight = plan.proposed_resolution.new_flight ?? null;
@@ -2226,6 +2548,18 @@ function buildPresentation(input: {
   // Why there is no replacement flight — surfaced where the traveller decides.
   if (noFlight) {
     presentation.no_flight_reason = noFlight;
+  }
+
+  // How to cover the ground when the planned way of covering it has gone.
+  // Resolved once for the whole mission, so every plan on a carousel carries
+  // the same real durations rather than each spending its own lookup.
+  if (ground) {
+    presentation.ground_plan = ground;
+  }
+
+  // Whether the change of planes they already booked actually works.
+  if (connection) {
+    presentation.connection = connection;
   }
 
   // What this plan costs the REST of the trip.
@@ -2265,17 +2599,25 @@ function buildPresentation(input: {
       // The settlement dry-run is the authority on what survives: an item it
       // re-times is not lost, and an item it cancels IS, whatever the purely
       // temporal evaluator concluded.
-      for (const title of preview?.effects.moved ?? []) rescheduledNames.add(title.trim().toLowerCase());
+      for (const title of preview?.effects.moved ?? [])
+        rescheduledNames.add(title.trim().toLowerCase());
       const cancelledNames = new Set(
         (preview?.effects.cancelled ?? []).map((item) => item.title.trim().toLowerCase()),
       );
       const survivedByReschedule = (label: string) =>
-        rescheduledNames.has(label.trim().toLowerCase()) && !cancelledNames.has(label.trim().toLowerCase());
+        rescheduledNames.has(label.trim().toLowerCase()) &&
+        !cancelledNames.has(label.trim().toLowerCase());
       const trulyLost = consequence.lost.filter((item) => !survivedByReschedule(item.label));
       for (const node of graph.getNodes()) {
-        if (node.type !== "activity" || !cancelledNames.has(node.name.trim().toLowerCase())) continue;
+        if (node.type !== "activity" || !cancelledNames.has(node.name.trim().toLowerCase()))
+          continue;
         if (trulyLost.some((item) => item.nodeId === node.id)) continue;
-        trulyLost.push({ nodeId: node.id, type: node.type, label: node.name, scheduledTime: node.scheduledTime });
+        trulyLost.push({
+          nodeId: node.id,
+          type: node.type,
+          label: node.name,
+          scheduledTime: node.scheduledTime,
+        });
       }
       const isMeal = (label: string) => classifyItem({ title: label }) === "meal";
       const transfersLost = Math.max(
@@ -2285,8 +2627,10 @@ function buildPresentation(input: {
       const adjusted = {
         ...consequence,
         lost: trulyLost,
-        activitiesLost: trulyLost.filter((item) => item.type === "activity" && !isMeal(item.label)).length,
-        mealsLost: trulyLost.filter((item) => item.type === "activity" && isMeal(item.label)).length,
+        activitiesLost: trulyLost.filter((item) => item.type === "activity" && !isMeal(item.label))
+          .length,
+        mealsLost: trulyLost.filter((item) => item.type === "activity" && isMeal(item.label))
+          .length,
         transfersLost,
         nightsLost: trulyLost.filter((item) => item.type === "hotel_check_in").length,
       };
@@ -2306,11 +2650,18 @@ function buildPresentation(input: {
     }
   }
 
-  // Hotel block: prefer the adjustment that carries a provider alternative;
-  // otherwise fall back to the first non-"none" action.
-  const adjustment =
-    hotelAdjustments.find((a) => a.alternative !== undefined) ??
-    hotelAdjustments.find((a) => a.action !== "none");
+  // Hotel block: ONLY an adjustment that actually changes the booking.
+  //
+  // The old order asked for an alternative FIRST and an action second, so a
+  // verdict of `action: "none"` still filled "YOUR NEW PLAN" with a different
+  // property — name, photos and nightly rate — while the change list two
+  // panels up said "Hotel Gracery Shinjuku: no change needed". That happens on
+  // the ordinary degraded path: `HotelAgent` returns `keep_as_is` when the
+  // POLICY lookup fails, yet the alternatives search beside it succeeded, so
+  // the assessment carries rooms it never recommended. A room we merely looked
+  // at must never be presented as the traveller's new hotel.
+  const changing = hotelAdjustments.filter((a) => a.action !== "none");
+  const adjustment = changing.find((a) => a.alternative !== undefined) ?? changing[0];
   if (adjustment) {
     const alt = adjustment.alternative;
     presentation.hotel = {
@@ -2376,7 +2727,14 @@ function buildPresentation(input: {
   const fareCharge = fare ? (fare.direction === "refund" ? -fare.amount : fare.amount) : 0;
   const fareCurrency = fare?.currency ?? currency;
   if (fare && fareCharge > 0) {
-    lines.push(`You pay now — new ticket: ${formatSignedAmount(fareCharge, fareCurrency)}`);
+    lines.push(
+      withDisplayAmount(
+        `You pay now — new ticket: ${formatSignedAmount(fareCharge, fareCurrency)}`,
+        fareCharge,
+        fareCurrency,
+        displayCurrency,
+      ),
+    );
     // Honest basis note: without a true fare-delta basis the amount is the
     // FULL re-priced ticket, not a delta against the original booking.
     //
@@ -2401,13 +2759,20 @@ function buildPresentation(input: {
   const changeFee = policyVerdict?.changeFee;
   if (best && typeof changeFee === "number" && changeFee > 0) {
     lines.push(
-      `You pay now — change fee: ${formatSignedAmount(changeFee, policyVerdict?.currency ?? currency)}`,
+      withDisplayAmount(
+        `You pay now — change fee: ${formatSignedAmount(changeFee, policyVerdict?.currency ?? currency)}`,
+        changeFee,
+        policyVerdict?.currency ?? currency,
+        displayCurrency,
+      ),
     );
-    // The figure above is a conversion so the panel reads in ONE currency;
-    // say plainly what the carrier will put on the card.
+    // The figure above is OUR conversion, so the panel can read in one
+    // currency; the carrier's own figure is the exact one. The old wording
+    // ("Approximate — the carrier bills VND 1100000") put the word
+    // "approximate" in front of the only exact number on the line.
     if (policyVerdict?.billedCurrency && typeof policyVerdict.billedChangeFee === "number") {
       lines.push(
-        `Approximate — the carrier bills ${formatSignedAmount(
+        `Converted at today's rate — the carrier charges exactly ${formatSignedAmount(
           policyVerdict.billedChangeFee,
           policyVerdict.billedCurrency,
         ).replace(/^\+/, "")}`,
@@ -2417,25 +2782,47 @@ function buildPresentation(input: {
   for (const hotel of hotelAdjustments) {
     if (hotel.fee > 0) {
       lines.push(
-        `You pay now — hotel change (${hotel.hotel_name}): ${formatSignedAmount(hotel.fee, currency)}`,
+        withDisplayAmount(
+          `You pay now — hotel change (${hotel.hotel_name}): ${formatSignedAmount(hotel.fee, currency)}`,
+          hotel.fee,
+          currency,
+          displayCurrency,
+        ),
       );
     }
   }
   for (const proposal of activityProposals) {
     if (proposal.penalty > 0) {
       lines.push(
-        `You pay now — activity change: ${formatSignedAmount(proposal.penalty, currency)}`,
+        withDisplayAmount(
+          `You pay now — activity change: ${formatSignedAmount(proposal.penalty, currency)}`,
+          proposal.penalty,
+          currency,
+          displayCurrency,
+        ),
       );
     }
     if (proposal.swap && proposal.swap.priceDelta > 0) {
       lines.push(
-        `You pay now — activity swap (${proposal.swap.replacementName}): ${formatSignedAmount(proposal.swap.priceDelta, currency)}`,
+        withDisplayAmount(
+          `You pay now — activity swap (${proposal.swap.replacementName}): ${formatSignedAmount(proposal.swap.priceDelta, currency)}`,
+          proposal.swap.priceDelta,
+          currency,
+          displayCurrency,
+        ),
       );
     }
   }
   const requote = plan.proposed_resolution.transfer_requote;
   if (requote && requote.amount > 0) {
-    lines.push(`You pay now — transfer re-quote: ${formatSignedAmount(requote.amount, currency)}`);
+    lines.push(
+      withDisplayAmount(
+        `You pay now — transfer re-quote: ${formatSignedAmount(requote.amount, currency)}`,
+        requote.amount,
+        currency,
+        displayCurrency,
+      ),
+    );
   }
   const netAmountLine = (value: number, curr: string | undefined) =>
     `${currencySymbol(curr)}${Math.abs(value).toFixed(2)}`;
@@ -2443,7 +2830,14 @@ function buildPresentation(input: {
     // Unsigned, like the total-refund line below: every "+" in this ledger
     // means money leaving the traveler's account, so "+€12.00" under "You get
     // back" read as a charge.
-    lines.push(`You get back — refund: ${netAmountLine(fareCharge, fareCurrency)}`);
+    lines.push(
+      withDisplayAmount(
+        `You get back — refund: ${netAmountLine(fareCharge, fareCurrency)}`,
+        fareCharge,
+        fareCurrency,
+        displayCurrency,
+      ),
+    );
   }
   const netBuckets = plan.financial_delta.by_currency ?? [];
   if (netBuckets.length > 0) {
@@ -2457,23 +2851,42 @@ function buildPresentation(input: {
     if (payable.length > 0) {
       lines.push(
         `Total due now: ${payable
-          .map((bucket) => netAmountLine(bucket.net_payable, bucket.currency))
+          .map((bucket) =>
+            withDisplayAmount(
+              netAmountLine(bucket.net_payable, bucket.currency),
+              bucket.net_payable,
+              bucket.currency,
+              displayCurrency,
+            ),
+          )
           .join(" + ")}`,
       );
     }
     if (refunded.length > 0) {
       lines.push(
         `You get back — total refund: ${refunded
-          .map((bucket) => netAmountLine(bucket.net_payable, bucket.currency))
+          .map((bucket) =>
+            withDisplayAmount(
+              netAmountLine(bucket.net_payable, bucket.currency),
+              bucket.net_payable,
+              bucket.currency,
+              displayCurrency,
+            ),
+          )
           .join(" + ")}`,
       );
     }
   } else if (plan.financial_delta.net_payable !== 0) {
     const net = plan.financial_delta.net_payable;
     lines.push(
-      net > 0
-        ? `Total due now: ${netAmountLine(net, currency)}`
-        : `You get back — total refund: ${netAmountLine(net, currency)}`,
+      withDisplayAmount(
+        net > 0
+          ? `Total due now: ${netAmountLine(net, currency)}`
+          : `You get back — total refund: ${netAmountLine(net, currency)}`,
+        net,
+        currency,
+        displayCurrency,
+      ),
     );
   }
   presentation.ledger_summary = lines;
@@ -2526,8 +2939,20 @@ async function handleMission(request: Request, ctx?: HackathonContext): Promise<
   if (parsed.kind === "error") {
     return errorResponse(parsed.status, parsed.code, parsed.message);
   }
-  const { kind: _missionCategory, ...missionBase } = parsed.mission;
-  const mission: SwarmRunOptions = { ...missionBase, tripId, hydrated };
+  // The category is what tells the pipeline that "lighten my day" wants FEWER
+  // activities and that an overbooking is not a late arrival. Dropping it here
+  // (this rail used to) left the sync rail treating every mission alike, while
+  // the two-phase rail a few hundred lines below kept it — the same intent got
+  // two different engines depending on which door it came through.
+  const { kind: category, ...missionBase } = parsed.mission;
+  const mission: SwarmRunOptions = {
+    ...missionBase,
+    category,
+    tripId,
+    hydrated,
+    // Forwarded so the venue rail can ask about the traveller's OWN venues.
+    ...(userTokenOf(request) ? { userToken: userTokenOf(request)! } : {}),
+  };
   return await runMission(mission, tripId, ctx);
 }
 
@@ -2694,12 +3119,21 @@ function parseDisplayCurrency(value: unknown): string | undefined {
   return /^[A-Za-z]{3}$/.test(raw) ? raw.toUpperCase() : undefined;
 }
 
+/** The traveller's Supabase access token, as the client sends it. */
+function userTokenOf(request: Request): string | undefined {
+  const raw = request.headers.get(USER_TOKEN_HEADER) ?? "";
+  const token = raw.replace(/^Bearer\s+/i, "").trim();
+  return token.length > 0 ? token : undefined;
+}
+
 /** Shared intent parsing for the two-phase rails — real-trip only. */
 async function parseMissionForTwoPhase(
   intent: string,
   explicitRaw: unknown,
   tripId: string,
   displayCurrency?: string,
+  /** The traveller's own token, for the venue-schedule lookups. */
+  userToken?: string,
 ): Promise<{ mission: SwarmRunOptions } | { response: Response }> {
   if (tripId.length === 0) {
     return {
@@ -2734,6 +3168,7 @@ async function parseMissionForTwoPhase(
       ...missionBase,
       tripId,
       hydrated,
+      ...(userToken ? { userToken } : {}),
       category,
       ...(displayCurrency ? { displayCurrency } : {}),
     },
@@ -2763,6 +3198,7 @@ async function runSwarmAssessment(
   if (built) {
     try {
       pushTrace("orchestrator", "dispatch", disruptionDispatchDetail(options));
+      if (options.targetNote) pushTrace("orchestrator", "target_choice", options.targetNote);
       const assessment = await built.orchestrator.assessDisruption(
         buildDisruptionEvent(options, built.fareRule),
       );
@@ -2894,6 +3330,9 @@ async function runMultiResolution(
         "impact_recheck",
         `${outcome.disruption.affected.length} downstream nodes affected (rechecked)`,
       );
+      // Once for the whole carousel: every plan quotes the same real durations.
+      const groundPlan = await resolveGroundPlan(options, plannedItinerary, pushTrace);
+      const connectionCheck = resolveConnection(options, plannedItinerary, pushTrace);
       if (outcome.policyVerdict) {
         pushTrace(
           "policy",
@@ -2927,6 +3366,17 @@ async function runMultiResolution(
             "critic",
             "gemini_degraded",
             `semantic critic degraded (${verdict.degradeReason}) — deterministic sanity rules only`,
+          );
+        }
+        // What the MODEL itself said, separately from what survived the merge.
+        // "The model found nothing" and "the model spoke and the rules had
+        // already ruled those nodes" are different problems with opposite
+        // fixes, and three live batteries could not tell them apart.
+        if (verdict.source === "gemini") {
+          pushTrace(
+            "critic",
+            "model_findings",
+            `the model returned ${verdict.modelCriticisms ?? 0} finding(s) before the merge`,
           );
         }
         if (verdict.criticisms.length === 0) {
@@ -2976,6 +3426,8 @@ async function runMultiResolution(
           best: chosen,
           hotelAdjustments: outcome.hotelAdjustments,
           activityProposals: planProposals,
+          ...(groundPlan ? { ground: groundPlan } : {}),
+          ...(connectionCheck ? { connection: connectionCheck } : {}),
           graph: plannedItinerary,
           disruptedId: options.nodeId,
           ...(() => {
@@ -3111,6 +3563,7 @@ async function handleMissionAssess(request: Request): Promise<Response> {
     body.nodeId,
     tripId,
     parseDisplayCurrency(body.displayCurrency),
+    userTokenOf(request),
   );
   if ("response" in parsed) return parsed.response;
   const mission = parsed.mission;
@@ -3347,7 +3800,22 @@ async function handleMissionResolve(request: Request, ctx?: HackathonContext): P
   }
 
   const stillProcessing = async () => (await getSwarmSession(resolutionId))?.state === "processing";
-  const geminiBudget = new GeminiCallBudget(GEMINI_CALLS_PER_MISSION);
+  // Two of the mission's Gemini calls are HELD for the semantic critic. It is
+  // asked after the liaison and the day reorganizer, so without a reserve it
+  // simply never runs: 4 of 17 live missions degraded it on `quota_429` and it
+  // contributed nothing. The other consumers keep their full allowance —
+  // the ceiling is raised by the reserve rather than shared out of it.
+  //
+  // The budget is also the mission's clock. On Workers the continuation
+  // below runs inside `ctx.waitUntil`, which the platform cancels 30 s after
+  // the ack — silently. A model call that cannot finish before that instant
+  // is refused and its deterministic rail answers, so the final save always
+  // lands. Anchored HERE, before the ack, so the margin is real.
+  const geminiBudget = new GeminiCallBudget(
+    GEMINI_CALLS_PER_MISSION + GEMINI_CRITIC_RESERVED_CALLS,
+    GEMINI_CRITIC_RESERVED_CALLS,
+    Date.now() + CONTINUATION_MODEL_CUTOFF_MS,
+  );
 
   // ── Async rail: ack + ctx.waitUntil continuation ─────────────────────────
   if (ctx) {
@@ -3578,6 +4046,42 @@ const PLAN_VISIBLE_STATES = new Set<string>([
  * GET /api/hackathon/swarm-status/{resolution_id} (SPEC §4.3) — polled by the
  * client (~1.5 s while processing) to render the Swarm Activity Stream.
  */
+/**
+ * How long a mission may sit in `processing` before we say so.
+ *
+ * There was no cap at all. Measured across the two 42-mission batteries of
+ * 2026-09-18 (84 real missions): median 13s, p90 22s, p95 27s, and exactly
+ * ONE run above 60s — which reached 269s and was still working when the
+ * harness gave up on it. A traveller stuck at an airport was watching a
+ * spinner with no way to tell a slow mission from a dead one.
+ *
+ * 90s sits above every healthy mission observed and well under the point
+ * where a person concludes the app is broken. It does NOT abort the
+ * pipeline — the work continues and a later poll still sees the plan if it
+ * lands. It only stops the client waiting in silence.
+ */
+const MISSION_STALL_MS = 90_000;
+
+/**
+ * The instant after the resolve ack by which every model call must have
+ * FINISHED. A call is refused when its own per-attempt deadline would run
+ * past it, so with 10 s attempts nothing starts later than 17 s in.
+ *
+ * Cloudflare: "ctx.waitUntil() can extend execution for up to 30 seconds
+ * after the response is sent … If any Promises have not settled after 30
+ * seconds, they are canceled." Three seconds are left for the ledger, the
+ * presentation and the final save, which the traces put inside one second.
+ */
+const CONTINUATION_MODEL_CUTOFF_MS = 27_000;
+
+/**
+ * A `processing` session this long after its resolve ack is DEAD, not slow:
+ * the platform cancelled the continuation at 30 s and nothing can still be
+ * writing to it. Distinct from MISSION_STALL_MS, which is measured from
+ * creation and covers the case where no ack row exists.
+ */
+const CONTINUATION_DEAD_MS = 40_000;
+
 async function handleSwarmStatus(request: Request, resolutionId: string): Promise<Response> {
   if (!resolutionId) {
     return errorResponse(404, "unknown_resolution", "No resolution id provided.");
@@ -3607,6 +4111,21 @@ async function handleSwarmStatus(request: Request, resolutionId: string): Promis
       : ("session_store_memory" as const)
     : undefined;
   const operation = settlementOperation(session);
+  // A mission still working long past every healthy one is reported as
+  // stalled. The pipeline is not cancelled: if it finishes, a later poll
+  // still sees the plan. This only lets the client stop waiting blind.
+  const processingMs =
+    session.state === "processing" ? Date.now() - Date.parse(session.created_at) : 0;
+  // The resolve ack is the instant the platform's 30 s clock started. A
+  // session still `processing` well past it is not slow — its continuation
+  // was cancelled and nothing can still be writing to it. The client gets
+  // the opposite advice from a merely slow mission: start again.
+  const ackAt = [...session.trace].reverse().find((row) => row.step === "resolve_received")?.at;
+  const sinceAckMs =
+    session.state === "processing" && ackAt ? Date.now() - Date.parse(ackAt) : Number.NaN;
+  const continuationDead = Number.isFinite(sinceAckMs) && sinceAckMs > CONTINUATION_DEAD_MS;
+  const stalled =
+    continuationDead || (Number.isFinite(processingMs) && processingMs > MISSION_STALL_MS);
   const body: Record<string, unknown> = {
     ...(operation?.receipt ? { receipt: operation.receipt } : {}),
     ...(operation && !operation.receipt ? { settlement_pending: true } : {}),
@@ -3619,6 +4138,13 @@ async function handleSwarmStatus(request: Request, resolutionId: string): Promis
     trace: session.trace,
     degraded: session.degraded,
     ...(degradedReason ? { degraded_reason: degradedReason } : {}),
+    ...(stalled
+      ? {
+          stalled: true,
+          stalled_seconds: Math.round((continuationDead ? sinceAckMs : processingMs) / 1000),
+          ...(continuationDead ? { stalled_reason: "continuation_cancelled" as const } : {}),
+        }
+      : {}),
   };
   if (session.plan && PLAN_VISIBLE_STATES.has(session.state)) {
     body.plan = session.plan;

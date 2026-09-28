@@ -24,6 +24,7 @@
 
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { ItineraryGraph } from "@/core/dag";
+import type { FlightHop } from "@/core/dag";
 import type { ResolutionPlan, OperationalSettlement } from "@/agents";
 import {
   airportInfo,
@@ -192,6 +193,14 @@ function parseEpoch(value: unknown): number | null {
 }
 
 /** "YYYY-MM-DD" (UTC) of an epoch-ms instant. */
+/** A venue's own coordinate, when the trip carries one. */
+function coordinatesOf(item: unknown): { lat: number; lng: number } | null {
+  const coords = asRecord(asRecord(item)?.coordinates);
+  const lat = asFiniteNumber(coords?.lat);
+  const lng = asFiniteNumber(coords?.lng);
+  return lat !== null && lng !== null ? { lat, lng } : null;
+}
+
 function isoDateOf(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -354,6 +363,76 @@ export function findTransitRestatements(content: unknown): TransitRestatement[] 
 // --------------------------------------------------------------- hydration
 
 /**
+ * The hop-by-hop routing of a leg that changes planes, or null.
+ *
+ * `generate-trip` describes a one-stop ticket as ONE leg whose `segments`
+ * carry the two flown hops, each with the airport it leaves from and lands
+ * at and its own wall-clock times. The change of planes lives between those
+ * hops — inside the leg — and the connection check has to be able to see it
+ * there, or every "my connection at Doha is too tight" on a normal one-stop
+ * ticket is answered with "we can't find a change of planes on this trip".
+ *
+ * Same rule as the generator's own sanitiser: a half-described journey is
+ * dropped WHOLE. Every hop needs both airports and both times, the chain
+ * must be contiguous (each hop leaves from where the last one landed, the
+ * first from the leg's origin, the last into its destination) and
+ * chronological. Anything less and the leg is treated as if it had described
+ * no routing at all — which is what the app renders for it, too.
+ */
+function hydrateSegments(
+  raw: unknown,
+  legOrigin: unknown,
+  legDestination: unknown,
+): FlightHop[] | null {
+  if (!Array.isArray(raw) || raw.length < 2) return null;
+  const endpoint = (value: unknown): string | null => {
+    if (typeof value === "string") return value.trim() || null;
+    const record = asRecord(value);
+    return asString(record?.code)?.trim() || asString(record?.city)?.trim() || null;
+  };
+  const same = (a: string, b: string) => a.toUpperCase() === b.toUpperCase();
+  // The leg's own ends, every way the content may have named them: a chain
+  // of codes on a leg whose endpoint carries only a city is still the same
+  // journey, and must not be dropped for a difference of spelling.
+  const namesOf = (value: unknown): string[] => {
+    if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+    const record = asRecord(value);
+    return [asString(record?.code)?.trim(), asString(record?.city)?.trim()].filter(
+      (name): name is string => Boolean(name),
+    );
+  };
+  const matchesEnd = (name: string, end: unknown) => namesOf(end).some((candidate) => same(candidate, name));
+  const hops: FlightHop[] = [];
+  for (const value of raw) {
+    const seg = asRecord(value);
+    if (!seg) return null;
+    const from = endpoint(seg.from);
+    const to = endpoint(seg.to);
+    const departureTime = parseEpoch(seg.depart);
+    const arrivalTime = parseEpoch(seg.arrive);
+    if (!from || !to || departureTime === null || arrivalTime === null) return null;
+    if (arrivalTime <= departureTime) return null;
+    const previous = hops[hops.length - 1];
+    if (previous && (!same(previous.to, from) || departureTime < previous.arrivalTime)) return null;
+    const reference = asString(seg.reference)?.trim();
+    const carrier = asString(seg.carrier)?.trim();
+    hops.push({
+      from,
+      to,
+      departureTime,
+      arrivalTime,
+      ...(reference ? { reference } : {}),
+      ...(carrier ? { carrier } : {}),
+    });
+  }
+  if (!matchesEnd(hops[0].from, legOrigin) || !matchesEnd(hops[hops.length - 1].to, legDestination)) {
+    return null;
+  }
+  return hops;
+}
+
+
+/**
  * Pure builder behind {@link loadSwarmTrip}: maps one trip's content_json to
  * an ItineraryGraph + nodeRefs. Deterministic mapping rules:
  *
@@ -454,6 +533,9 @@ export function hydrateTripFromContent(
       // downgrading a business-class ticket and quoting a fare difference
       // against the wrong product.
       const legCabin = normalizeCabin(leg.cabin);
+      // The hops of a one-stop ticket, so a change of planes INSIDE this leg
+      // is a fact the graph holds rather than one it cannot see.
+      const legSegments = hydrateSegments(leg.segments, leg.origin, leg.destination);
       const id = `flight-${idx}`;
       graph.addNode({
         id,
@@ -473,6 +555,7 @@ export function hydrateTripFromContent(
         ...(legFare ? { fare: legFare } : {}),
         ...(legTravelers !== null ? { travelers: legTravelers } : {}),
         ...(legCabin !== null ? { cabin: legCabin } : {}),
+        ...(legSegments ? { segments: legSegments } : {}),
       });
       nodeRefs[id] = {
         kind: "flight",
@@ -507,6 +590,10 @@ export function hydrateTripFromContent(
     // flight lands — IATA code only. Transfers without a flight dependency
     // omit the field entirely (they can never trigger the DAG spatial check).
     const pickupLocationId = matchingFlights[matchingFlights.length - 1]?.destinationCode;
+    // The leg's own endpoints: what a transit strike actually breaks, and the
+    // only way the swarm can ask how else this ground could be covered.
+    const legFrom = coordinatesOf(origin);
+    const legTo = coordinatesOf(destination);
     graph.addNode({
       id,
       type: "transfer",
@@ -515,6 +602,10 @@ export function hydrateTripFromContent(
       status: "on_track",
       dependsOn,
       ...(pickupLocationId ? { pickupLocationId } : {}),
+      ...(legFrom ? { from: legFrom } : {}),
+      ...(legTo ? { to: legTo } : {}),
+      ...(originCode ? { fromLabel: originCode } : {}),
+      ...(destCode ? { toLabel: destCode } : {}),
     });
     nodeRefs[id] = {
       kind: "transfer",
@@ -580,6 +671,7 @@ export function hydrateTripFromContent(
               scheduledTime,
               status: "on_track",
               dependsOn,
+              ...(coordinatesOf(item) ? { coordinates: coordinatesOf(item)! } : {}),
             }),
         });
         return;
@@ -604,6 +696,10 @@ export function hydrateTripFromContent(
               scheduledTime,
               status: "on_track",
               dependsOn,
+              // Carried through so the swarm can ask the venue's own schedule
+              // about a re-planned slot. A name on its own resolves to the
+              // wrong entity too often to cancel anything on.
+              ...(coordinatesOf(item) ? { coordinates: coordinatesOf(item)! } : {}),
             }),
         });
       }
@@ -1384,10 +1480,14 @@ function resortDay(day: Record<string, unknown> | null | undefined): void {
           category: classifyItem({ type: asString(droppedItem.type), title: textOf(droppedItem.title) || ref.label }),
         });
       }
+      // No note ⇒ nothing to disclose: the item leaves the plan and costs
+      // nothing to drop. The old fallback appended "free cancellation until
+      // 24h before start" to EVERY cancelled item — a policy nobody published,
+      // over restaurants and bars that were never booked through anyone.
       changes.push(
         move.cancellationNote
           ? `${ref.label} cancelled — ${move.cancellationNote}`
-          : `${ref.label} cancelled — free cancellation until 24h before start`,
+          : `${ref.label} cancelled`,
       );
       continue;
     }

@@ -1,0 +1,487 @@
+{
+ "status": true,
+ "message": "Success",
+ "data": {
+  "hotels": [
+   {
+    "hotel_id": 13835869,
+    "accessibilityLabel": "Circle6 Rome.\n4 out of 5 stars.\nThis is a Preferred property.\n9.3 Wonderful 410 reviews.\n‎Spagna‬ • ‎0.8 km from downtown‬.\nLate Escape Deal.\n Hotel room : 1 bed.\nPrice for 1 night, 2 adults.\nOriginal price 483 EUR. Current price 333 EUR..\n+48 EUR taxes and charges.\nWe have 2 left at this price.",
+    "property": {
+     "ufi": -126693,
+     "reviewScore": 9.3,
+     "priceBreakdown": {
+      "excludedPrice": {
+       "value": 48.2991000000001,
+       "currency": "EUR"
+      },
+      "benefitBadges": [
+       {
+        "text": "Late Escape Deal",
+        "variant": "constructive",
+        "identifier": "Late Escape Campaign",
+        "explanation": "Late Escape Deal"
+       }
+      ],
+      "grossPrice": {
+       "currency": "EUR",
+       "amountRounded": "€ 333",
+       "value": 332.9909
+      },
+      "taxExceptions": [],
+      "strikethroughPrice": {
+       "amountRounded": "€ 483",
+       "currency": "EUR",
+       "value": 482.6
+      }
+     },
+     "checkin": {
+      "fromTime": "14:00",
+      "untilTime": "23:00"
+     },
+     "name": "Circle6 Rome",
+     "position": 0,
+     "checkout": {
+      "untilTime": "11:00",
+      "fromTime": "01:00"
+     },
+     "propertyClass": 4,
+     "rankingPosition": 0,
+     "checkinDate": "2026-10-18",
+     "reviewScoreWord": "Wonderful",
+     "accuratePropertyClass": 4,
+     "wishlistName": "Rome",
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/734444951.jpg?k=11818350696624721503c9702d10bf18377996fbe2479b45a9403709ec9b3346&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/734444951.jpg?k=11818350696624721503c9702d10bf18377996fbe2479b45a9403709ec9b3346&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/734444951.jpg?k=11818350696624721503c9702d10bf18377996fbe2479b45a9403709ec9b3346&o="
+     ],
+     "id": 13835869,
+     "reviewCount": 410,
+     "isFirstPage": true,
+     "latitude": 41.9028498,
+     "checkoutDate": "2026-10-19",
+     "isPreferred": true,
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 0,
+     "qualityClass": 0,
+     "countryCode": "it",
+     "recommendedUnitsConfigurationLabel": "<b>Hotel room</b>: 1 bed",
+     "blockIds": [
+      "1383586901_410419339_2_2_0"
+     ],
+     "mainPhotoId": 734444951,
+     "longitude": 12.4852291
+    }
+   },
+   {
+    "hotel_id": 1831505,
+    "accessibilityLabel": "Orazio Palace Hotel.\n4 out of 5 stars.\nThis is a Preferred property.\n9.0 Wonderful 1102 reviews.\n‎Vaticano Prati‬ • ‎1.8 km from downtown‬.\nBreakfast included.\n1 bed.\nPrice for 1 night, 2 adults.\n270 EUR.\n+25 EUR taxes and charges.",
+    "property": {
+     "propertyClass": 4,
+     "rankingPosition": 1,
+     "checkinDate": "2026-10-18",
+     "ufi": -126693,
+     "reviewScore": 9,
+     "checkin": {
+      "fromTime": "15:00",
+      "untilTime": "00:00"
+     },
+     "priceBreakdown": {
+      "excludedPrice": {
+       "value": 25.4744907186001,
+       "currency": "EUR"
+      },
+      "benefitBadges": [],
+      "grossPrice": {
+       "amountRounded": "€ 270",
+       "currency": "EUR",
+       "value": 269.7544840824
+      },
+      "taxExceptions": []
+     },
+     "name": "Orazio Palace Hotel",
+     "position": 1,
+     "checkout": {
+      "fromTime": "00:00",
+      "untilTime": "11:00"
+     },
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 0,
+     "countryCode": "it",
+     "recommendedUnitsConfigurationLabel": "1 bed",
+     "qualityClass": 0,
+     "blockIds": [
+      "0_0_2_1_0"
+     ],
+     "isTPI": true,
+     "mainPhotoId": 325134559,
+     "longitude": 12.4665325,
+     "reviewScoreWord": "Wonderful",
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/325134559.jpg?k=1a71ed64baccea069b9b5e238333db0fe63f50425c197029f8bb6eef1e60eddf&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/325134559.jpg?k=1a71ed64baccea069b9b5e238333db0fe63f50425c197029f8bb6eef1e60eddf&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/325134559.jpg?k=1a71ed64baccea069b9b5e238333db0fe63f50425c197029f8bb6eef1e60eddf&o="
+     ],
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 4,
+     "reviewCount": 1102,
+     "id": 1831505,
+     "latitude": 41.9072021,
+     "isFirstPage": true,
+     "isPreferred": true,
+     "checkoutDate": "2026-10-19"
+    }
+   },
+   {
+    "hotel_id": 15027905,
+    "accessibilityLabel": "Hotel Santa Maria Maggiore.\n3 out of 5 stars.\nThis is a Preferred property.\n8.7 Excellent 299 reviews.\n‎Rione Monti‬ • ‎1.4 km from downtown‬.\n Hotel room : 1 bed.\nPrice for 1 night, 2 adults.\n217 EUR.\n+34 EUR taxes and charges.\nWe have 2 left at this price.",
+    "property": {
+     "rankingPosition": 2,
+     "propertyClass": 3,
+     "checkinDate": "2026-10-18",
+     "ufi": -126693,
+     "reviewScore": 8.7,
+     "priceBreakdown": {
+      "benefitBadges": [],
+      "grossPrice": {
+       "value": 216.8364,
+       "amountRounded": "€ 217",
+       "currency": "EUR"
+      },
+      "taxExceptions": [],
+      "excludedPrice": {
+       "currency": "EUR",
+       "value": 33.6836000000001
+      }
+     },
+     "checkin": {
+      "untilTime": "00:00",
+      "fromTime": "15:00"
+     },
+     "checkout": {
+      "untilTime": "11:00",
+      "fromTime": "01:00"
+     },
+     "position": 2,
+     "name": "Hotel Santa Maria Maggiore",
+     "qualityClass": 0,
+     "countryCode": "it",
+     "recommendedUnitsConfigurationLabel": "<b>Hotel room</b>: 1 bed",
+     "optOutFromGalleryChanges": 1,
+     "currency": "EUR",
+     "blockIds": [
+      "1502790502_427288144_0_2_0"
+     ],
+     "longitude": 12.4989677,
+     "mainPhotoId": 842422523,
+     "reviewScoreWord": "Excellent",
+     "accuratePropertyClass": 3,
+     "wishlistName": "Rome",
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/842422523.jpg?k=7ad9127f196e5eed0af708ca2754ebb1bddbdf3a64b23e9d38065672c2b34f1f&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/842422523.jpg?k=7ad9127f196e5eed0af708ca2754ebb1bddbdf3a64b23e9d38065672c2b34f1f&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/842422523.jpg?k=7ad9127f196e5eed0af708ca2754ebb1bddbdf3a64b23e9d38065672c2b34f1f&o="
+     ],
+     "isFirstPage": true,
+     "latitude": 41.8963925,
+     "id": 15027905,
+     "reviewCount": 299,
+     "checkoutDate": "2026-10-19",
+     "isPreferred": true
+    }
+   },
+   {
+    "hotel_id": 12930,
+    "accessibilityLabel": "Maison Roma Piazza di Spagna UNA Esperienze.\n4 out of 5 stars.\nThis is a Preferred property.\n8.7 Excellent 535 reviews.\n‎Spagna‬ • ‎1.3 km from downtown‬.\nBreakfast included.\n Hotel room : 1 bed.\nPrice for 1 night, 2 adults.\n713 EUR.\n+71 EUR taxes and charges.",
+    "property": {
+     "reviewScore": 8.7,
+     "ufi": -126693,
+     "name": "Maison Roma Piazza di Spagna UNA Esperienze",
+     "position": 3,
+     "checkout": {
+      "untilTime": "12:00",
+      "fromTime": "00:00"
+     },
+     "priceBreakdown": {
+      "excludedPrice": {
+       "value": 71.3129027601001,
+       "currency": "EUR"
+      },
+      "benefitBadges": [],
+      "grossPrice": {
+       "value": 713.1029088477,
+       "currency": "EUR",
+       "amountRounded": "€ 713"
+      },
+      "taxExceptions": []
+     },
+     "checkin": {
+      "untilTime": "00:00",
+      "fromTime": "14:00"
+     },
+     "propertyClass": 4,
+     "rankingPosition": 3,
+     "checkinDate": "2026-10-18",
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 4,
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/544789294.jpg?k=7f8d0b0daa3cc43b242762b6f56337535613e1c9792f0176ee8e77c2ec762882&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/544789294.jpg?k=7f8d0b0daa3cc43b242762b6f56337535613e1c9792f0176ee8e77c2ec762882&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/544789294.jpg?k=7f8d0b0daa3cc43b242762b6f56337535613e1c9792f0176ee8e77c2ec762882&o="
+     ],
+     "reviewScoreWord": "Excellent",
+     "checkoutDate": "2026-10-19",
+     "isPreferred": true,
+     "id": 12930,
+     "reviewCount": 535,
+     "isFirstPage": true,
+     "latitude": 41.90774674525,
+     "blockIds": [
+      "1293060_0_2_1_0"
+     ],
+     "isTPI": true,
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 0,
+     "qualityClass": 0,
+     "recommendedUnitsConfigurationLabel": "<b>Hotel room</b>: 1 bed",
+     "countryCode": "it",
+     "longitude": 12.4805787205696,
+     "mainPhotoId": 544789294
+    }
+   },
+   {
+    "hotel_id": 558347,
+    "accessibilityLabel": "Leonardo Boutique Hotel Rome Monti.\n4 out of 5 stars.\nThis is a Preferred property.\n8.6 Excellent 1321 reviews.\n‎Rione Monti‬ • ‎0.8 km from downtown‬\n‎Sustainability certification‬.\n Hotel room : 1 bed.\nPrice for 1 night, 2 adults.\n317 EUR.\n+47 EUR taxes and charges.",
+    "property": {
+     "rankingPosition": 4,
+     "propertyClass": 4,
+     "checkinDate": "2026-10-18",
+     "reviewScore": 8.6,
+     "ufi": -126693,
+     "checkout": {
+      "fromTime": "07:00",
+      "untilTime": "11:00"
+     },
+     "name": "Leonardo Boutique Hotel Rome Monti",
+     "position": 4,
+     "checkin": {
+      "untilTime": "00:00",
+      "fromTime": "15:00"
+     },
+     "priceBreakdown": {
+      "excludedPrice": {
+       "currency": "EUR",
+       "value": 46.7003309004001
+      },
+      "taxExceptions": [],
+      "benefitBadges": [],
+      "grossPrice": {
+       "value": 317.0555463087,
+       "currency": "EUR",
+       "amountRounded": "€ 317"
+      }
+     },
+     "isTPI": true,
+     "blockIds": [
+      "55834736_0_2_0_0"
+     ],
+     "countryCode": "it",
+     "recommendedUnitsConfigurationLabel": "<b>Hotel room</b>: 1 bed",
+     "qualityClass": 0,
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 1,
+     "mainPhotoId": 821356721,
+     "longitude": 12.4917054079692,
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/821356721.jpg?k=6004948ea627f06d250e46beaa6119c834c70a38b15beaa37b7401e1368e0d86&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/821356721.jpg?k=6004948ea627f06d250e46beaa6119c834c70a38b15beaa37b7401e1368e0d86&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/821356721.jpg?k=6004948ea627f06d250e46beaa6119c834c70a38b15beaa37b7401e1368e0d86&o="
+     ],
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 4,
+     "reviewScoreWord": "Excellent",
+     "isPreferred": true,
+     "checkoutDate": "2026-10-19",
+     "latitude": 41.8987900056016,
+     "isFirstPage": true,
+     "reviewCount": 1321,
+     "id": 558347
+    }
+   },
+   {
+    "hotel_id": 12827588,
+    "accessibilityLabel": "Cozy Luxury Room Pantheon.\n4 out of 5 for property rating.\nThis is a Preferred property.\n8.7 Excellent 476 reviews.\n‎Pantheon‬ • ‎350 m from downtown‬.\n Private room : 1 bed.\nPrice for 1 night, 2 adults.\n200 EUR.\n+30 EUR taxes and charges.\nWe have 2 left at this price.",
+    "property": {
+     "propertyClass": 0,
+     "rankingPosition": 5,
+     "checkinDate": "2026-10-18",
+     "ufi": -126693,
+     "reviewScore": 8.7,
+     "checkin": {
+      "fromTime": "14:00",
+      "untilTime": "19:00"
+     },
+     "priceBreakdown": {
+      "excludedPrice": {
+       "value": 30.0000000000001,
+       "currency": "EUR"
+      },
+      "taxExceptions": [],
+      "grossPrice": {
+       "value": 200,
+       "currency": "EUR",
+       "amountRounded": "€ 200"
+      },
+      "benefitBadges": []
+     },
+     "position": 5,
+     "name": "Cozy Luxury Room Pantheon",
+     "checkout": {
+      "fromTime": "08:00",
+      "untilTime": "10:00"
+     },
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 0,
+     "recommendedUnitsConfigurationLabel": "<b>Private room</b>: 1 bed",
+     "countryCode": "it",
+     "qualityClass": 4,
+     "blockIds": [
+      "1282758805_401193180_0_0_0"
+     ],
+     "mainPhotoId": 598345026,
+     "longitude": 12.4791665,
+     "reviewScoreWord": "Excellent",
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/598345026.jpg?k=46b13cd66d74ddd73ca4e3d0f946ef80d92326a39641f9d3c9c9de9f9c893ba0&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/598345026.jpg?k=46b13cd66d74ddd73ca4e3d0f946ef80d92326a39641f9d3c9c9de9f9c893ba0&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/598345026.jpg?k=46b13cd66d74ddd73ca4e3d0f946ef80d92326a39641f9d3c9c9de9f9c893ba0&o="
+     ],
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 0,
+     "reviewCount": 476,
+     "id": 12827588,
+     "latitude": 41.8976624,
+     "isFirstPage": true,
+     "isPreferred": true,
+     "checkoutDate": "2026-10-19"
+    }
+   },
+   {
+    "hotel_id": 340380,
+    "accessibilityLabel": "Ergife Palace Hotel.\n4 out of 5 stars.\n8.0 Very Good 3047 reviews.\n‎Aurelio‬ • ‎5.2 km from downtown‬.\nBreakfast included.\n Hotel room : Beds: 1 double or 2 twins.\nPrice for 1 night, 2 adults.\n201 EUR.\n+35 EUR taxes and charges.",
+    "property": {
+     "checkinDate": "2026-10-18",
+     "propertyClass": 4,
+     "rankingPosition": 6,
+     "name": "Ergife Palace Hotel",
+     "position": 6,
+     "checkout": {
+      "untilTime": "12:00",
+      "fromTime": "07:00"
+     },
+     "priceBreakdown": {
+      "excludedPrice": {
+       "value": 35.0909000000001,
+       "currency": "EUR"
+      },
+      "grossPrice": {
+       "value": 200.9091,
+       "currency": "EUR",
+       "amountRounded": "€ 201"
+      },
+      "benefitBadges": [],
+      "taxExceptions": []
+     },
+     "checkin": {
+      "fromTime": "15:00",
+      "untilTime": "00:00"
+     },
+     "reviewScore": 8,
+     "ufi": -126693,
+     "longitude": 12.4192929267883,
+     "mainPhotoId": 204367472,
+     "blockIds": [
+      "34038002_88457138_0_1_0"
+     ],
+     "currency": "EUR",
+     "optOutFromGalleryChanges": 0,
+     "qualityClass": 0,
+     "recommendedUnitsConfigurationLabel": "<b>Hotel room</b>: Beds: 1 double or 2 twins",
+     "countryCode": "it",
+     "checkoutDate": "2026-10-19",
+     "id": 340380,
+     "reviewCount": 3047,
+     "isFirstPage": true,
+     "latitude": 41.8933876352433,
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 4,
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/204367472.jpg?k=badf8fc5e39d2aa8bfb4e198758e4f5333ef50bf8c570b2943e26ce06ccdaa42&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/204367472.jpg?k=badf8fc5e39d2aa8bfb4e198758e4f5333ef50bf8c570b2943e26ce06ccdaa42&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/204367472.jpg?k=badf8fc5e39d2aa8bfb4e198758e4f5333ef50bf8c570b2943e26ce06ccdaa42&o="
+     ],
+     "reviewScoreWord": "Very Good"
+    }
+   },
+   {
+    "hotel_id": 81378,
+    "accessibilityLabel": "Hotel Viminale.\n4 out of 5 stars.\nThis is a Preferred property.\n9.3 Wonderful 2004 reviews.\n‎Rione Monti‬ • ‎1.1 km from downtown‬.\nBreakfast included.\n3 beds.\nPrice for 1 night, 2 adults.\n379 EUR.\n+50 EUR taxes and charges.",
+    "property": {
+     "reviewScore": 9.3,
+     "ufi": -126693,
+     "name": "Hotel Viminale",
+     "position": 7,
+     "checkout": {
+      "untilTime": "11:00",
+      "fromTime": "01:00"
+     },
+     "checkin": {
+      "untilTime": "00:00",
+      "fromTime": "14:00"
+     },
+     "priceBreakdown": {
+      "benefitBadges": [],
+      "grossPrice": {
+       "value": 379.0005228852,
+       "currency": "EUR",
+       "amountRounded": "€ 379"
+      },
+      "taxExceptions": [],
+      "excludedPrice": {
+       "value": 49.8868188030001,
+       "currency": "EUR"
+      }
+     },
+     "propertyClass": 4,
+     "rankingPosition": 7,
+     "checkinDate": "2026-10-18",
+     "photoUrls": [
+      "https://cf.bstatic.com/xdata/images/hotel/square500/829527024.jpg?k=19e81d85d5a3273fc5472c944e0ff015f220c438b43cc1fe36d1b8172ef51002&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square1024/829527024.jpg?k=19e81d85d5a3273fc5472c944e0ff015f220c438b43cc1fe36d1b8172ef51002&o=",
+      "https://cf.bstatic.com/xdata/images/hotel/square2000/829527024.jpg?k=19e81d85d5a3273fc5472c944e0ff015f220c438b43cc1fe36d1b8172ef51002&o="
+     ],
+     "wishlistName": "Rome",
+     "accuratePropertyClass": 4,
+     "reviewScoreWord": "Wonderful",
+     "isPreferred": true,
+     "checkoutDate": "2026-10-19",
+     "reviewCount": 2004,
+     "id": 81378,
+     "latitude": 41.8982942424988,
+     "isFirstPage": true,
+     "blockIds": [
+      "0_0_2_1_0"
+     ],
+     "isTPI": true,
+     "optOutFromGalleryChanges": 1,
+     "currency": "EUR",
+     "recommendedUnitsConfigurationLabel": "3 beds",
+     "countryCode": "it",
+     "qualityClass": 0,
+     "longitude": 12.495059967041,
+     "mainPhotoId": 829527024
+    }
+   }
+  ]
+ }
+}

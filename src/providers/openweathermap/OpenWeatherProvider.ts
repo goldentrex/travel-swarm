@@ -2,17 +2,28 @@
  * OpenWeatherProvider — {@link WeatherContextProvider} backed by
  * OpenWeatherMap (spec §2.3: weather context for the proactive monitor).
  *
+ * WHICH ENDPOINT, AND WHY IT CHANGED. This asked One Call 3.0 for hourly
+ * steps. One Call is a SEPARATE paid subscription, so the key answered `401`
+ * on every call and the weather rail was dark from the day it shipped —
+ * measured live on 2026-09-18. The same key answers `200` on the free
+ * `/data/2.5/forecast`: 40 steps of three hours, five days out, each with the
+ * precipitation probability and weather family this provider already reads.
+ * The trade is resolution, and it is stated rather than hidden: a window is
+ * now three hours wide at best, so a shower between 14:00 and 15:00 is
+ * reported as 12:00–15:00. For "should we move the outdoor activity", that is
+ * the same answer.
+ *
  * Configuration (read from environment at construction time):
  * - `OPENWEATHER_API_KEY`  — required; constructor throws if absent
  *   (check {@link openWeatherConfigured} first to degrade gracefully).
  * - `OPENWEATHER_BASE_URL` — optional override, defaults to the public API.
  * - `OPENWEATHER_TIMEOUT_MS` — optional per-request timeout, defaults 10000.
  *
- * Rain detection is deterministic: One Call 3.0 hourly steps with
- * precipitation probability ≥ 0.5 (or a rain-family `weather.main`) are merged
- * into contiguous {@link RainWindow}s. Error contract mirrors
- * AtlasFlightProvider: every failure surfaces as a structured
- * {@link WeatherApiError} with `kind` / `retryable`, never raw exceptions.
+ * Rain detection is deterministic: forecast steps with precipitation
+ * probability ≥ 0.5 (or a rain-family `weather.main`) are merged into
+ * contiguous {@link RainWindow}s. Error contract mirrors AtlasFlightProvider:
+ * every failure surfaces as a structured {@link WeatherApiError} with `kind` /
+ * `retryable`, never raw exceptions.
  */
 
 import type { WeatherContextProvider } from "../interfaces/ContextProviders";
@@ -21,10 +32,12 @@ import type { RainForecastResult, RainWindow } from "../interfaces/types";
 const DEFAULT_OPENWEATHER_BASE_URL = "https://api.openweathermap.org";
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_HORIZON_HOURS = 48;
-/** Hourly precipitation probability at/above which a step counts as rain. */
+/** Precipitation probability at/above which a step counts as rain. */
 const RAIN_PROBABILITY_THRESHOLD = 0.5;
-/** One Call `weather.main` families treated as rain regardless of `pop`. */
+/** `weather.main` families treated as rain regardless of `pop`. */
 const RAIN_WEATHER_MAINS = new Set(["rain", "drizzle", "thunderstorm"]);
+/** The 5-day forecast is published in three-hour steps. */
+const FORECAST_STEP_MS = 3 * 60 * 60 * 1000;
 
 const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
@@ -115,14 +128,13 @@ export class OpenWeatherProvider implements WeatherContextProvider {
     const params = new URLSearchParams({
       lat: String(latitude),
       lon: String(longitude),
-      exclude: "current,minutely,daily,alerts",
       appid: this.config.apiKey,
     });
-    const body = await this.request("GET", `/data/3.0/onecall?${params}`);
-    if (!isRecord(body) || !Array.isArray(body.hourly)) {
+    const body = await this.request("GET", `/data/2.5/forecast?${params}`);
+    if (!isRecord(body) || !Array.isArray(body.list)) {
       throw new WeatherApiError({
         kind: "invalid_response",
-        message: 'OpenWeatherMap One Call response is missing the "hourly" array.',
+        message: 'OpenWeatherMap forecast response is missing the "list" array.',
       });
     }
 
@@ -134,15 +146,22 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       60 *
       1000;
     const nowMs = Date.now();
+    const horizonEndMs = nowMs + horizonMs;
     const windows: RainWindow[] = [];
     let open: { startMs: number; endMs: number; probability: number; description: string } | null =
       null;
 
-    const steps = body.hourly.filter(isRecord).sort((a, b) => Number(a.dt) - Number(b.dt));
+    const steps = body.list.filter(isRecord).sort((a, b) => Number(a.dt) - Number(b.dt));
+    /** How far the published forecast actually reaches. */
+    let lastStepEndMs = 0;
     for (const rawStep of steps) {
       if (!isRecord(rawStep)) continue;
       const dt = typeof rawStep.dt === "number" ? rawStep.dt * 1000 : NaN;
-      if (!Number.isFinite(dt) || dt >= nowMs + horizonMs || dt + 3_600_000 <= nowMs) continue;
+      if (!Number.isFinite(dt)) continue;
+      lastStepEndMs = Math.max(lastStepEndMs, dt + FORECAST_STEP_MS);
+      // A step covers the three hours that FOLLOW its stamp: one that ended
+      // before now is past, one that starts after the horizon is beyond it.
+      if (dt >= horizonEndMs || dt + FORECAST_STEP_MS <= nowMs) continue;
       const pop =
         typeof rawStep.pop === "number" && Number.isFinite(rawStep.pop)
           ? Math.min(1, Math.max(0, rawStep.pop))
@@ -156,7 +175,7 @@ export class OpenWeatherProvider implements WeatherContextProvider {
       const isRain = pop >= RAIN_PROBABILITY_THRESHOLD || RAIN_WEATHER_MAINS.has(main);
 
       if (isRain) {
-        const stepEnd = Math.min(dt + 60 * 60 * 1000, nowMs + horizonMs);
+        const stepEnd = Math.min(dt + FORECAST_STEP_MS, horizonEndMs);
         if (open && dt <= open.endMs) {
           open.endMs = Math.max(open.endMs, stepEnd);
           open.probability = Math.max(open.probability, pop);
@@ -169,11 +188,21 @@ export class OpenWeatherProvider implements WeatherContextProvider {
     }
     if (open) windows.push(toRainWindow(open));
 
+    // An empty `windows` means two very different things, and the caller
+    // decides opposite ways on them. "We looked and it is dry" lets the swarm
+    // tell the traveller their plans are fine. "The forecast does not reach
+    // that far" is not knowledge at all, and presenting it as clear skies
+    // would be the invention this engine exists to refuse. The free forecast
+    // publishes five days; anyone raising the horizon past that must see the
+    // difference rather than a confident empty answer.
+    const coversHorizon = lastStepEndMs >= horizonEndMs;
+
     return {
       latitude,
       longitude,
       windows,
-      source: "openweathermap:onecall-3.0",
+      coversHorizon,
+      source: "openweathermap:forecast-2.5",
     };
   }
 

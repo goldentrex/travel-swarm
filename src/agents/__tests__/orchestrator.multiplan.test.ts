@@ -651,7 +651,7 @@ describe("OrchestratorAgent.resolveDisruptionMulti — constraints, pinning & ec
     ).toBe(false);
   });
 
-  it("prefer_nonstop filters the pool down to direct candidates", async () => {
+  it("prefer_nonstop puts the direct first WITHOUT taking the alternatives away", async () => {
     // The cheapest option flies with a stop; the direct sibling costs more.
     const candidates = [
       withStops(makeCandidate("ATL-S", 40, "2026-08-22T16:00:00Z", "2026-08-22T13:30:00Z"), 1),
@@ -663,14 +663,18 @@ describe("OrchestratorAgent.resolveDisruptionMulti — constraints, pinning & ec
     });
 
     expect(
-      outcome.trace.some((note) => note === "prefer_direct — kept 1 non-stop candidate(s)"),
+      outcome.trace.some((note) =>
+        note.startsWith("prefer_direct — 1 non-stop candidate(s) come first"),
+      ),
     ).toBe(true);
-    // One member left ⇒ the honest single-plan rail.
-    expect(outcome.plans.length).toBe(1);
-    expect(outcome.plans[0]?.proposed_resolution.new_flight?.id).toBe("ATL-D");
-    // The surviving direct candidate is measured, not stamped — `nonstop` is
-    // precisely the tag it earned by surviving this filter.
-    expect(outcome.plans[0]?.badges).toEqual(["cheapest", "fastest", "nonstop", "same_day"]);
+    // Answering the trade-off question ORDERS the carousel; it does not empty
+    // it. The traveller said "direct" — they did not say "and never show me
+    // anything else".
+    expect(outcome.plans.map((plan) => plan.proposed_resolution.new_flight?.id)).toEqual([
+      "ATL-D",
+      "ATL-S",
+    ]);
+    expect(outcome.plans[0]?.badges).toContain("nonstop");
   });
 
   it("prefer_same_day pins the same-day candidate to the front and echoes it", async () => {

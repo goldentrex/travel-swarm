@@ -24,7 +24,7 @@ afterEach(() => {
 });
 
 for (const [name, run, empty] of [
-  ["weather", weather, { hourly: [] }],
+  ["weather", weather, { list: [] }],
   ["events", events, { results: [] }],
 ] as const) {
   describe(`${name} provider contract`, () => {
@@ -77,6 +77,10 @@ it("weather errors do not include query credentials", async () => {
 });
 
 it("sorts rain steps, excludes past rain and respects the requested horizon", async () => {
+  // The free 5-day forecast publishes THREE-hour steps, so a step stamped two
+  // hours ago is still raining now and a step stamped 15:00 covers 15:00–18:00.
+  // The window that comes out is three hours wide at best; the merge, the
+  // horizon and the past-step rule are what this pins.
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-15T12:00:00Z"));
   const base = Date.now() / 1000;
@@ -84,23 +88,56 @@ it("sorts rain steps, excludes past rain and respects the requested horizon", as
     "fetch",
     vi.fn().mockResolvedValue(
       Response.json({
-        hourly: [
-          { dt: base + 3600, pop: 0.8 },
-          { dt: base - 7200, pop: 1 },
-          { dt: base, pop: 0.6 },
-          { dt: base + 3 * 3600, pop: 1 },
+        list: [
+          // Out of order on purpose: sorted before anything is decided.
+          { dt: base + 3 * 3600, pop: 0.8, weather: [{ main: "Rain", description: "light rain" }] },
+          // 08:00–11:00: over before now, so not the traveller's problem.
+          { dt: base - 4 * 3600, pop: 1, weather: [{ main: "Rain", description: "heavy rain" }] },
+          { dt: base, pop: 0.6, weather: [{ main: "Rain", description: "moderate rain" }] },
+          // Tomorrow midday: past the 12-hour horizon this call asked for.
+          { dt: base + 24 * 3600, pop: 1, weather: [{ main: "Rain", description: "heavy rain" }] },
         ],
       }),
     ),
   );
-  expect((await weather()).windows).toEqual([
+  const result = await new OpenWeatherProvider({
+    apiKey: "test-secret",
+    baseUrl: "https://weather.invalid",
+  }).getRainForecast(48, 2, 12);
+  expect(result.windows).toEqual([
     {
       start: "2026-09-15T12:00:00.000Z",
-      end: "2026-09-15T14:00:00.000Z",
+      end: "2026-09-15T18:00:00.000Z",
       probability: 0.8,
-      description: "",
+      description: "moderate rain",
     },
   ]);
+  expect(result.source).toBe("openweathermap:forecast-2.5");
+  // The published forecast runs past the horizon, so an empty answer here
+  // would have been a real "it is dry".
+  expect(result.coversHorizon).toBe(true);
+});
+
+it("says when the forecast stops before the window it was asked about", async () => {
+  // "We looked and it is dry" and "the forecast does not reach that far" are
+  // not the same fact, and only the first may be shown as clear skies. The
+  // free endpoint publishes five days; asking for seven must not come back as
+  // a confident empty answer.
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-09-15T12:00:00Z"));
+  const base = Date.now() / 1000;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({ list: [{ dt: base + 3600, pop: 0, weather: [{ main: "Clouds" }] }] }),
+    ),
+  );
+  const result = await new OpenWeatherProvider({
+    apiKey: "test-secret",
+    baseUrl: "https://weather.invalid",
+  }).getRainForecast(48, 2, 168);
+  expect(result.windows).toEqual([]);
+  expect(result.coversHorizon).toBe(false);
 });
 
 it("ignores malformed events and retains valid provider evidence", async () => {

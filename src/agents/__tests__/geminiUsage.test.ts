@@ -231,6 +231,94 @@ describe("opt-in deterministic constraint routing", () => {
     expect(agent.lastConstraintRoute).toBe("deterministic");
     expect(agent.lastDegradeReason).toBeUndefined();
   });
+  /**
+   * The question set a real missed-flight assess actually asks.
+   *
+   * Captured live 2026-09-20 from the QA Japan itinerary: the swarm asks TWO
+   * questions, the airport buffer FIRST and the travel day second. The older
+   * test above used a stops/day pair the product never emits, so it passed
+   * while the allowlist was missing both airport ids — and because the gate is
+   * all-or-nothing, that one unlisted id sent every real mission to the model.
+   * The routing flag was switched on in production and changed nothing.
+   *
+   * This test is written from the captured payload for that reason: it fails
+   * if the allowlist and the shipped questions ever drift apart again.
+   */
+  it("takes the local route for the questions a real missed-flight mission asks", async () => {
+    const fetchImpl = vi.fn();
+    const agent = new GeminiLiaisonAgent({
+      apiKey: "test",
+      constraintRouting: "deterministic_known",
+      fetchImpl,
+    });
+    const constraints = await agent.translateAnswersToConstraints(
+      [
+        {
+          id: "airport-arrival",
+          question: "How soon can you be at the airport?",
+          options: [
+            { id: "airport_now", label: "I'm already here" },
+            { id: "need_time", label: "I need time (3h+)" },
+          ],
+        },
+        {
+          id: "flight-day",
+          question: "Travel the same day, or save on a later day?",
+          options: [
+            { id: "same_day", label: "Same day" },
+            { id: "cheaper_later", label: "Cheaper later" },
+          ],
+        },
+      ],
+      [
+        { question_id: "airport-arrival", option_id: "need_time" },
+        { question_id: "flight-day", option_id: "same_day" },
+      ],
+    );
+
+    // The buffer the question's own detail text promised — "at least 3 hours".
+    expect(constraints).toMatchObject({
+      min_departure_delay_hours: 3,
+      prefer_same_day: true,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(agent.lastConstraintRoute).toBe("deterministic");
+  });
+
+  it("keeps the whole payload on the model when one answer is unfamiliar", async () => {
+    // All-or-nothing on purpose: a mission that mixes a known routing answer
+    // with an activity arbitration must not have half its preferences read by
+    // a table that does not understand the other half.
+    const fetchImpl = vi.fn(async () =>
+      Response.json({ candidates: [{ content: { parts: [{ text: "{}" }] } }] }),
+    );
+    const agent = new GeminiLiaisonAgent({
+      apiKey: "test",
+      constraintRouting: "deterministic_known",
+      fetchImpl,
+    });
+    await agent.translateAnswersToConstraints(
+      [
+        {
+          id: "airport-arrival",
+          question: "How soon can you be at the airport?",
+          options: [{ id: "airport_now", label: "Already here" }],
+        },
+        {
+          id: "activities",
+          question: "Which one matters more?",
+          options: [{ id: "keep_anne_frank_house", label: "Anne Frank House" }],
+        },
+      ],
+      [
+        { question_id: "airport-arrival", option_id: "airport_now" },
+        { question_id: "activities", option_id: "keep_anne_frank_house" },
+      ],
+    );
+    expect(agent.lastConstraintRoute).toBe("model");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("does not ask a model to infer preferences when no answers were given", async () => {
     const fetchImpl = vi.fn();
     const agent = new GeminiLiaisonAgent({
@@ -262,5 +350,58 @@ describe("opt-in deterministic constraint routing", () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(agent.lastConstraintRoute).toBe("model");
+  });
+});
+
+describe("the shared budget is also the mission's clock", () => {
+  // Cloudflare cancels a `ctx.waitUntil` continuation 30 s after the ack,
+  // silently. Measured 2026-09-18: three missions in five batteries had
+  // their last trace row 18–26 s after the ack and never reached the final
+  // save. Every model stage has a deterministic rail behind it, so a call
+  // that cannot finish before the cut-off is not started.
+  it("refuses a call whose own deadline would run past the cut-off", () => {
+    const budget = new GeminiCallBudget(5, 0, Date.now() + 8_000);
+    expect(budget.tryReserve(false, 10_000)).toBe(false);
+    expect(budget.lastRefusal).toBe("deadline");
+    expect(budget.deadlineRefusals).toBe(1);
+    // No slot was spent on the refusal.
+    expect(budget.callsUsed).toBe(0);
+  });
+
+  it("lets a call through while it can still finish, and counts it", () => {
+    const budget = new GeminiCallBudget(5, 0, Date.now() + 20_000);
+    expect(budget.tryReserve(false, 10_000)).toBe(true);
+    expect(budget.lastRefusal).toBeNull();
+    expect(budget.callsUsed).toBe(1);
+    expect(budget.msLeft).toBeGreaterThan(15_000);
+  });
+
+  it("without a deadline the clock never refuses anything", () => {
+    const budget = new GeminiCallBudget(1, 0);
+    expect(budget.msLeft).toBe(Number.POSITIVE_INFINITY);
+    expect(budget.tryReserve(false, 999_999)).toBe(true);
+    expect(budget.tryReserve(false, 0)).toBe(false);
+    expect(budget.lastRefusal).toBe("calls");
+    expect(budget.deadlineRefusals).toBe(0);
+  });
+
+  it("a caller past the cut-off degrades as `timeout`, never as a quota problem", async () => {
+    // The taxonomy stays frozen at six values; "there was no time for this
+    // call" is what `timeout` means, and mislabelling it `quota_429` would
+    // sideline a healthy model with a cooldown it did not earn.
+    const fetchSpy = vi.fn();
+    const budget = new GeminiCallBudget(5, 0, Date.now() + 1_000);
+    const reorganizer = new DayReorganizer({
+      apiKey: "test",
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+      sharedBudget: budget,
+    });
+    await reorganizer.reorganizeDay(request);
+    // Never reached the network, and the reason says why in the taxonomy's
+    // own words.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(reorganizer.lastDegradeReason).toBe("timeout");
+    expect(budget.deadlineRefusals).toBe(1);
+    expect(budget.callsUsed).toBe(0);
   });
 });

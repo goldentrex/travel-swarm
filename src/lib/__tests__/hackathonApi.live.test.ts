@@ -429,12 +429,20 @@ describe("mixed-currency fare segregation (USD fare, EUR plan)", () => {
     // printed the same label twice, which reads as two competing totals
     // rather than one bill payable in two currencies. Still segregated —
     // the amounts are never summed or converted into each other.
+    //
+    // Each line may ALSO carry "(≈ …)" in the traveller's own display
+    // currency: a conversion shown beside the provider's figure, never
+    // instead of it, and never folded into the segregated totals. Asserted
+    // with startsWith so the quoted half stays pinned exactly.
     const lines =
       (body.plan.presentation as ResolutionPresentation | undefined)?.ledger_summary ?? [];
-    expect(lines).toContain("You pay now — new ticket: +$150.00");
-    expect(lines).toContain("You pay now — change fee: +€25.00");
-    expect(lines).toContain("Total due now: €25.00 + $150.00");
-    expect(lines.filter((line) => line.startsWith("Total due now"))).toHaveLength(1);
+    const line = (prefix: string) => lines.find((entry) => entry.startsWith(prefix));
+    expect(line("You pay now — new ticket: +$150.00")).toBeDefined();
+    expect(line("You pay now — change fee: +€25.00")).toBeDefined();
+    expect(line("Total due now: €25.00 + $150.00")).toBeDefined();
+    expect(lines.filter((entry) => entry.startsWith("Total due now"))).toHaveLength(1);
+    // The two currencies are still two: nothing summed them into one figure.
+    expect(lines.some((entry) => entry.includes("$175") || entry.includes("€175"))).toBe(false);
   });
 });
 

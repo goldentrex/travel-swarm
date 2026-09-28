@@ -356,6 +356,42 @@ export interface ResolutionPresentation {
     changes: string[];
     follow_ups: Array<{ kind: string; message: string }>;
   };
+  /**
+   * Whether a change of planes the traveller has already booked survives its
+   * own itinerary's minimum — the gap, what it is measured against, and what
+   * we cannot know about it.
+   *
+   * Absent unless the mission asked about a connection. It never promises the
+   * connection will work: we hold no airport minimum connection times, and a
+   * pass here read as a guarantee would be our fault.
+   */
+  connection?: {
+    /** "SQ334 SIN → CDG → AF1024 CDG → LIS". */
+    route: string;
+    /** `below_minimum` is the one that means "this does not work as booked". */
+    verdict: "below_minimum" | "clears_minimum";
+    /** One line per fact, ending with what we cannot tell them. */
+    detail: string[];
+  };
+  /**
+   * How to cover the ground when the planned way of covering it has gone.
+   *
+   * The swarm could re-plan flights, hotels and activities and nothing else,
+   * so the two most ordinary emergencies a traveller has — the metro is on
+   * strike, the taxi never came — had no answer at all. Every line here is
+   * derived from real provider durations and the traveller's own schedule;
+   * the block is absent whenever nothing could be priced.
+   */
+  ground_plan?: {
+    /** "Kyoto Granvia → Osaka Kansai (KIX)". */
+    route: string;
+    /** What has gone, in the traveller's own words. */
+    because: string;
+    /** One line per mode: how long, and when to set off. */
+    options: string[];
+    /** What is at stake: "Flight NH 175 departs 17:05". */
+    deadline?: string;
+  };
 }
 
 /** The frozen plan-badge vocabulary (W1 additively widened: the per-candidate
@@ -690,6 +726,33 @@ function isResolutionPresentation(value: unknown): value is ResolutionPresentati
       !isRecord(impact) ||
       !isOptionalFiniteNumber(impact.transfers_lost) ||
       !isOptionalFiniteNumber(impact.meals_lost)
+    ) {
+      return false;
+    }
+  }
+  if (value.connection !== undefined) {
+    const connection = value.connection;
+    if (
+      !isRecord(connection) ||
+      typeof connection.route !== "string" ||
+      connection.route.trim().length === 0 ||
+      (connection.verdict !== "below_minimum" && connection.verdict !== "clears_minimum") ||
+      !isStringArray(connection.detail) ||
+      connection.detail.length === 0
+    ) {
+      return false;
+    }
+  }
+  if (value.ground_plan !== undefined) {
+    const ground = value.ground_plan;
+    if (
+      !isRecord(ground) ||
+      typeof ground.route !== "string" ||
+      ground.route.trim().length === 0 ||
+      typeof ground.because !== "string" ||
+      !isStringArray(ground.options) ||
+      ground.options.length === 0 ||
+      !isOptionalString(ground.deadline)
     ) {
       return false;
     }

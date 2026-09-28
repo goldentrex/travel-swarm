@@ -502,8 +502,10 @@ describe("parseMissionIntentForTrip", () => {
     expect(parsed.kind).toBe("mission");
     if (parsed.kind !== "mission") return;
     expect(parsed.mission.nodeId).toBe("flight-0"); // tomorrow < +4 days
-    expect(parsed.mission.description).toContain("TP437");
-    expect(parsed.mission.description.toLowerCase()).toContain("upcoming");
+    // The choice is disclosed — as its own note, not as the headline.
+    expect(parsed.mission.targetNote).toContain("TP437");
+    expect(parsed.mission.targetNote?.toLowerCase()).toContain("upcoming");
+    expect(parsed.mission.description).not.toMatch(/chosen as the disruption target/);
   });
 
   it("routes weather intents to the first OUTDOOR activity (proactive)", () => {
@@ -567,7 +569,7 @@ describe("parseMissionIntentForTrip", () => {
     const unknown = parseMissionIntentForTrip("reroute", hydrateFixture(), "nope-1");
     expect(unknown).toMatchObject({ kind: "error", status: 404 });
     const noTarget = parseMissionIntentForTrip("just wondering about stuff", hydrateFixture());
-    expect(noTarget).toMatchObject({ kind: "mission", mission: { kind: "custom" } });
+    expect(noTarget).toMatchObject({ kind: "error", status: 400, code: "out_of_scope" });
   });
 });
 
@@ -1006,8 +1008,11 @@ describe("applySettlementToContent", () => {
     const everyTitle = itinerary.flatMap((d: any) => d.items.map((i: any) => i.title));
     expect(everyTitle).not.toContain("Surf Lesson");
     expect(changes.some((c) => c.includes("Surf Lesson cancelled"))).toBe(true);
-    // Default honest policy wording (penalty 0 heuristic).
-    expect(changes.some((c) => c.includes("free cancellation until 24h before start"))).toBe(true);
+    // With no note supplied there is nothing to disclose, so the line says what
+    // happened and stops. It must NOT append a cancellation policy: none was
+    // ever fetched for this item, and the engine never invents one.
+    expect(changes.some((c) => c.includes("free cancellation"))).toBe(false);
+    expect(changes.find((c) => c.includes("Surf Lesson cancelled"))).toBe("Surf Lesson cancelled");
   });
 
   it("prefers the settlement-supplied cancellationNote wording", () => {
@@ -1788,5 +1793,156 @@ describe("leg stamps are read and written as wall clock", () => {
     const hydrated = hydrateTripFromContent("t", "", "Lisbon", content);
     // 09:00 as WRITTEN, not 00:00 UTC — an offset must not move the leg.
     expect(hydrated!.nodeRefs["flight-0"].time).toBe(Date.parse(`${day1Date}T09:00:00Z`));
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// A one-stop ticket: the change of planes lives INSIDE the leg.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("hydrateTripFromContent — a leg that changes planes", () => {
+  /** Wall-clock stamps the way generate-trip stores them: no zone, no seconds. */
+  const stamp = (dayStartMs: number, hh: number, mm: number) => at(dayStartMs, hh, mm).slice(0, 16);
+  const endpoint = (code: string, city: string) => ({ code, city, coordinates: { lat: 0, lng: 0 } });
+
+  /** QA corpus trip #7 as stored: SIN → FCO via Doha out, FCO → SIN via
+   *  Istanbul back — one leg each way, two hops per leg. */
+  function viaHubs(mutate?: (legs: Array<Record<string, unknown>>) => void) {
+    const out = day1Start;
+    const back = day1Start + 4 * DAY_MS;
+    const legs: Array<Record<string, unknown>> = [
+      {
+        id: "tg0",
+        method: "flight",
+        origin: endpoint("SIN", "Singapore"),
+        destination: endpoint("FCO", "Rome"),
+        carrier: "Qatar Airways",
+        reference: "QR943",
+        depart: stamp(out, 20, 30),
+        arrive: stamp(out + DAY_MS, 7, 15),
+        stops: 1,
+        stop_airports: ["DOH"],
+        segments: [
+          { reference: "QR943", carrier: "Qatar Airways", from: endpoint("SIN", "Singapore"), to: endpoint("DOH", "Doha"), depart: stamp(out, 20, 30), arrive: stamp(out, 23, 30) },
+          { reference: "QR115", carrier: "Qatar Airways", from: endpoint("DOH", "Doha"), to: endpoint("FCO", "Rome"), depart: stamp(out + DAY_MS, 2, 0), arrive: stamp(out + DAY_MS, 7, 15) },
+        ],
+      },
+      {
+        id: "tg1",
+        method: "flight",
+        origin: endpoint("FCO", "Rome"),
+        destination: endpoint("SIN", "Singapore"),
+        carrier: "Turkish Airlines",
+        reference: "TK1862",
+        depart: stamp(back, 21, 45),
+        arrive: stamp(back + DAY_MS, 18, 30),
+        stops: 1,
+        stop_airports: ["IST"],
+        segments: [
+          { reference: "TK1862", carrier: "Turkish Airlines", from: endpoint("FCO", "Rome"), to: endpoint("IST", "Istanbul"), depart: stamp(back, 21, 45), arrive: stamp(back + DAY_MS, 2, 15) },
+          { reference: "TK54", carrier: "Turkish Airlines", from: endpoint("IST", "Istanbul"), to: endpoint("SIN", "Singapore"), depart: stamp(back + DAY_MS, 3, 20), arrive: stamp(back + DAY_MS, 18, 30) },
+        ],
+      },
+    ];
+    mutate?.(legs);
+    const content = {
+      title: { en: "Rome via the Gulf" },
+      destination: { en: "Rome" },
+      local_currency_code: "EUR",
+      transit_groups: legs,
+      itinerary: [
+        {
+          day: 1,
+          date: isoDate(out + DAY_MS),
+          place: "Rome",
+          items: [{ type: "stay", title: "Hotel Monti", check_in: isoDate(out + DAY_MS) }],
+        },
+      ],
+    };
+    const hydrated = hydrateTripFromContent("77777777-2222-3333-4444-555555555555", "Rome via the Gulf", "Rome", content);
+    expect(hydrated).not.toBeNull();
+    return hydrated!;
+  }
+
+  function flightOf(hydrated: ReturnType<typeof viaHubs>, id: string) {
+    const node = hydrated.graph.getNode(id);
+    expect(node?.type).toBe("flight");
+    if (node?.type !== "flight") throw new Error("not a flight");
+    return node;
+  }
+
+  it("carries the hops of a one-stop leg, on the app's wall-clock convention", () => {
+    const flight = flightOf(viaHubs(), "flight-0");
+    expect(flight.segments).toHaveLength(2);
+    const [first, second] = flight.segments!;
+    expect(first).toMatchObject({ reference: "QR943", carrier: "Qatar Airways", from: "SIN", to: "DOH" });
+    expect(second).toMatchObject({ reference: "QR115", from: "DOH", to: "FCO" });
+    // "YYYY-MM-DDTHH:MM" → that clock with a Z, exactly as the leg's own times.
+    expect(first.departureTime).toBe(Date.parse(at(day1Start, 20, 30)));
+    expect(first.arrivalTime).toBe(Date.parse(at(day1Start, 23, 30)));
+    expect(second.departureTime).toBe(Date.parse(at(day1Start + DAY_MS, 2, 0)));
+    // The leg itself is untouched: one node, one fare, one journey.
+    expect(flight.origin).toBe("SIN");
+    expect(flight.destination).toBe("FCO");
+    expect(flight.departureTime).toBe(first.departureTime);
+    expect(flight.arrivalTime).toBe(second.arrivalTime);
+  });
+
+  it("omits the field for a non-stop leg and for a single-hop routing", () => {
+    expect(flightOf(hydrateFixture(), "flight-0").segments).toBeUndefined();
+    const single = viaHubs((legs) => {
+      legs[0].segments = [(legs[0].segments as unknown[])[0]];
+    });
+    expect(flightOf(single, "flight-0").segments).toBeUndefined();
+  });
+
+  it("drops a half-described journey WHOLE rather than keep a guess", () => {
+    // A hop that does not leave from where the last one landed.
+    const brokenChain = viaHubs((legs) => {
+      (legs[0].segments as Array<Record<string, unknown>>)[1].from = endpoint("DXB", "Dubai");
+    });
+    expect(flightOf(brokenChain, "flight-0").segments).toBeUndefined();
+    // A chain whose last hop lands somewhere other than the leg's destination.
+    const wrongEnd = viaHubs((legs) => {
+      (legs[0].segments as Array<Record<string, unknown>>)[1].to = endpoint("MXP", "Milan");
+    });
+    expect(flightOf(wrongEnd, "flight-0").segments).toBeUndefined();
+    // A hop that leaves before the previous one has landed.
+    const backwards = viaHubs((legs) => {
+      (legs[0].segments as Array<Record<string, unknown>>)[1].depart = stamp(day1Start, 22, 0);
+    });
+    expect(flightOf(backwards, "flight-0").segments).toBeUndefined();
+    // A hop with no usable time at all.
+    const undated = viaHubs((legs) => {
+      (legs[0].segments as Array<Record<string, unknown>>)[0].arrive = "later";
+    });
+    expect(flightOf(undated, "flight-0").segments).toBeUndefined();
+    // The OTHER leg is judged on its own facts and keeps its hops.
+    expect(flightOf(brokenChain, "flight-1").segments).toHaveLength(2);
+  });
+
+  it("the intent parser finds the change the traveller named, inside the ticket", () => {
+    const hydrated = viaHubs();
+    const out = parseMissionIntentForTrip("my connection at Doha is too tight, I'll never make the second flight", hydrated);
+    expect(out.kind).toBe("mission");
+    if (out.kind !== "mission") return;
+    expect(out.mission.nodeId).toBe("flight-0");
+    expect(out.mission.delayMinutes).toBe(0);
+    expect(out.mission.description).toBe("Connection at DOH — QR115 DOH → FCO");
+
+    // The other hub, in another language: the return leg, not the first one.
+    const back = parseMissionIntentForTrip("ma correspondance à Istanbul est trop courte", hydrated);
+    expect(back.kind).toBe("mission");
+    if (back.kind !== "mission") return;
+    expect(back.mission.nodeId).toBe("flight-1");
+    expect(back.mission.description).toBe("Connection at IST — TK54 IST → SIN");
+  });
+
+  it("still says so, honestly, when no flight lists a stop", () => {
+    const out = parseMissionIntentForTrip("my connection is too tight", hydrateFixture());
+    expect(out.kind).toBe("error");
+    if (out.kind !== "error") return;
+    expect(out.code).toBe("no_connection_found");
+    expect(out.message).toMatch(/no flight lists a stop/);
   });
 });

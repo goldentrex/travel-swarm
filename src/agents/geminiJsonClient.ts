@@ -38,6 +38,12 @@ import { GEMINI_CALLS_PER_MISSION, type GeminiCallResult, type GeminiDegradeReas
 export interface GeminiJsonClientConfig {
   /** Log prefix, e.g. "liaison" ⇒ `[liaison] …`. */
   label: string;
+  /**
+   * May this caller spend the shared budget's RESERVE? Held for the semantic
+   * critic, which is asked last and therefore starved first — see
+   * {@link GeminiCallBudget}.
+   */
+  privileged?: boolean;
   /** Explicit key; falls back to `process.env.GEMINI_API_KEY`. */
   apiKey?: string;
   model?: string;
@@ -79,6 +85,7 @@ export class GeminiJsonClient {
   private readonly retryDelayMs: number;
   private readonly callBudget: number;
   private readonly onDegrade: GeminiJsonClientConfig["onDegrade"];
+  private readonly privileged: boolean;
 
   private callsUsedCount = 0;
 
@@ -98,6 +105,7 @@ export class GeminiJsonClient {
     this.retryDelayMs = config.retryDelayMs ?? 1_500;
     this.callBudget = config.callBudget ?? GEMINI_CALLS_PER_MISSION;
     this.onDegrade = config.onDegrade;
+    this.privileged = config.privileged === true;
     // Workers' `fetch` is brand-checked against its receiver: storing the bare
     // function and later calling it as `this.fetchImpl(...)` invokes it with
     // `this` = the client, which Cloudflare's runtime rejects as "Illegal
@@ -131,11 +139,24 @@ export class GeminiJsonClient {
     const attempt = async (model: string): Promise<GeminiCallResult> => {
       // Recheck AFTER any retry backoff: another concurrent day can consume
       // the last slot while this call is waiting. Reserve before the next await.
-      if (
-        this.callsUsedCount >= this.callBudget ||
-        (this.sharedBudget && !this.sharedBudget.tryReserve())
-      ) {
+      if (this.callsUsedCount >= this.callBudget) {
         budgetExhausted = true;
+        return { ok: false, reason: "quota_429" };
+      }
+      // The shared budget is also the mission's CLOCK: a call that cannot
+      // finish before the runtime cancels the continuation is not started.
+      // `timeout` is the honest taxonomy value — there was no time for it —
+      // and it is what a call that did start and overran would have reported.
+      if (this.sharedBudget && !this.sharedBudget.tryReserve(this.privileged, this.timeoutMs)) {
+        budgetExhausted = true;
+        if (this.sharedBudget.lastRefusal === "deadline") {
+          this.onDegrade?.(
+            "timeout",
+            `Gemini call skipped — ${Math.max(0, Math.round(this.sharedBudget.msLeft / 1000))} s left ` +
+              "before the runtime cancels this mission, less than one call needs",
+          );
+          return { ok: false, reason: "timeout" };
+        }
         return { ok: false, reason: "quota_429" };
       }
       const controller = new AbortController();

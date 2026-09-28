@@ -1,0 +1,157 @@
+{
+ "result": [
+  {
+   "hotel_id": 11781711,
+   "currency_code": "EUR",
+   "hotel_name": "Sweet House Campo de’ Fiori",
+   "min_total_price": 250.2,
+   "checkout": {
+    "from": "08:00",
+    "until": "11:00"
+   },
+   "is_free_cancellable": 0,
+   "checkin": {
+    "until": "21:00",
+    "from": "15:00"
+   },
+   "id": "property_card_11781711",
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/728755598.jpg?k=298a66fb747f45183cb2d3119193191b03a7f1d583f32209376bdc62d6a6efb6&o=",
+   "longitude": 12.4723172543251,
+   "latitude": 41.8953435219656
+  },
+  {
+   "hotel_id": 12946449,
+   "hotel_name": "Vista su Campo de Fiori",
+   "currency_code": "EUR",
+   "checkout": {
+    "from": "08:00",
+    "until": "10:00"
+   },
+   "min_total_price": 867,
+   "checkin": {
+    "from": "14:00",
+    "until": "22:00"
+   },
+   "is_free_cancellable": 0,
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/605076302.jpg?k=d5d352848e25d609bfc0e4e8690609f1e52ab05f56214e0aad71ca4b7c15307e&o=",
+   "id": "property_card_12946449",
+   "longitude": 12.4721749981476,
+   "latitude": 41.8958302569883
+  },
+  {
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/897285633.jpg?k=456ad423cc7deeb2304e79187d4f9a0794c785b6a07e5245b13e1ab173b0889c&o=",
+   "hotel_name": "Cappellari Luxury Suite - 1 min from Campo de Fiori",
+   "currency_code": "EUR",
+   "id": "property_card_15529077",
+   "checkout": {
+    "from": "",
+    "until": "10:00"
+   },
+   "min_total_price": 299.2,
+   "longitude": 12.4726571901001,
+   "latitude": 41.8952199496179,
+   "hotel_id": 15529077,
+   "checkin": {
+    "from": "15:00",
+    "until": "22:00"
+   },
+   "is_free_cancellable": 0
+  },
+  {
+   "hotel_id": 15848888,
+   "is_free_cancellable": 0,
+   "checkin": {
+    "until": "00:00",
+    "from": "15:00"
+   },
+   "currency_code": "EUR",
+   "id": "property_card_15848888",
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/849057551.jpg?k=6134d780057a94a0111e969e4a0e534c57c4ccd60ab292214029b34c5a64885e&o=",
+   "hotel_name": "La Torre del Biscione - Campo dè Fiori by RHR",
+   "latitude": 41.8955852,
+   "min_total_price": 331.08,
+   "longitude": 12.4728126,
+   "checkout": {
+    "until": "10:00",
+    "from": "03:00"
+   }
+  },
+  {
+   "checkin": {
+    "from": "15:00",
+    "until": "23:30"
+   },
+   "is_free_cancellable": 0,
+   "hotel_id": 576752,
+   "checkout": {
+    "until": "10:00",
+    "from": "02:00"
+   },
+   "longitude": 12.472857311368,
+   "min_total_price": 124.5,
+   "latitude": 41.8953749811921,
+   "hotel_name": "Flowers Apartments Rome City Center",
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/49162014.jpg?k=783b63f471e3ad408d46c7ab2d76e3c0e90c6487d713833e11f9a5b04cb52b25&o=",
+   "id": "property_card_576752",
+   "currency_code": "EUR"
+  },
+  {
+   "is_free_cancellable": 1,
+   "checkin": {
+    "until": "00:00",
+    "from": "14:00"
+   },
+   "hotel_id": 88498,
+   "latitude": 41.895594482587,
+   "longitude": 12.4728955328465,
+   "min_total_price": 306.6,
+   "checkout": {
+    "from": "07:00",
+    "until": "11:00"
+   },
+   "id": "property_card_88498",
+   "currency_code": "EUR",
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/20951418.jpg?k=a1ba524100401585b9884ffb80a682c4060b57716c1f3625285b99c2bc629ee5&o=",
+   "hotel_name": "Boutique Hotel Campo de' Fiori"
+  },
+  {
+   "id": "property_card_14253097",
+   "currency_code": "EUR",
+   "hotel_name": "Terrace 34",
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/689395154.jpg?k=d938c77c0efa70c8714b0831d52178d74fe0f8becbc35ba1677d60da0e900478&o=",
+   "latitude": 41.8958182,
+   "longitude": 12.4727492,
+   "min_total_price": 279.68,
+   "checkout": {
+    "until": "11:00",
+    "from": "08:00"
+   },
+   "hotel_id": 14253097,
+   "is_free_cancellable": 1,
+   "checkin": {
+    "from": "15:00",
+    "until": "23:00"
+   }
+  },
+  {
+   "checkin": {
+    "until": "00:00",
+    "from": "14:00"
+   },
+   "is_free_cancellable": 0,
+   "hotel_id": 11255106,
+   "checkout": {
+    "from": "00:00",
+    "until": "10:00"
+   },
+   "longitude": 12.472082,
+   "min_total_price": 374.69,
+   "latitude": 41.895959,
+   "main_photo_url": "https://cf.bstatic.com/xdata/images/hotel/square60/514560410.jpg?k=5fee9a37fcb5572f6ee9b9327ae5d36d1de13b68ecb8fb7744ed142e347ec07f&o=",
+   "hotel_name": "Campo de Fiori Charming Accommodation",
+   "id": "property_card_11255106",
+   "currency_code": "EUR"
+  }
+ ],
+ "count": 7123
+}

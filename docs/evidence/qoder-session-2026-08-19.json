@@ -1,0 +1,15 @@
+{
+  "_what_this_is": "Fields copied verbatim from .qoder/repowiki/en/meta/repowiki-metadata.json in the private source repository \u2014 the index Qoder writes when it maps a codebase. It is presented as machine evidence that the TOOL ran on this repository during specific hours. It does NOT name a model; see docs/PROVENANCE.md section 4.",
+  "_source_path": ".qoder/repowiki/en/meta/repowiki-metadata.json",
+  "session_id": "5f12d794-a983-4dd1-ac06-8e44c601b786",
+  "repository_name": "AIGlobePlanner",
+  "session_created": "2026-08-19T17:22:13.641824+08:00",
+  "session_completed": "2026-08-19T19:43:38.309605+08:00",
+  "progress_status": "completed",
+  "wiki_present_status": "COMPLETED",
+  "recovery_checkpoint": "wiki_generation_completed",
+  "wiki_items": 194,
+  "wiki_catalogs": 194,
+  "knowledge_relations": 183,
+  "_note_last_commit_id": "Recorded as all zeroes: Qoder indexes a working tree, not a commit. The session window is therefore established by the timestamps, and cross-checked against the git history of the source repository."
+}
